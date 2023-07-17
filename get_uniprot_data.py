@@ -1,28 +1,9 @@
 from bioservices import UniProt
 import argparse
-import io
 import pandas as pd
 import numpy as np
-import subprocess
-import os
-import glob
-import re
-import sys
-import itertools
-import shutil
 import pandas as pd
 from pathlib import Path
-from Bio.PDB import *
-from Bio.PDB import PDBList
-from concurrent.futures import ThreadPoolExecutor
-from multiprocessing import Pool
-from tqdm import tqdm
-import openmm
-from pdbfixer import PDBFixer
-from simtk.openmm.app import PDBFile
-from Bio import PDB
-import warnings
-warnings.filterwarnings("ignore")
 
 def checkgenes(gene_path, in_csv):
     # Open the file containing the words to search for
