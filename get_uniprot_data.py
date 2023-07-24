@@ -4,6 +4,7 @@ import pandas as pd
 import numpy as np
 import pandas as pd
 from pathlib import Path
+import re
 
 def checkgenes(gene_path, in_csv):
     # Open the file containing the words to search for
