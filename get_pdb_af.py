@@ -11,6 +11,8 @@ from tqdm import tqdm
 from Bio import PDB
 from prody import *
 import glob
+import warnings
+warnings.filterwarnings("ignore")
 
 def download_pdb(df, out_path):
     
@@ -181,15 +183,19 @@ def extract_required_chains(final_df, out_path):
     ent_files = glob.glob(out_path+'/**/*.cif', recursive=True)
 
     for ent_file in ent_files:
-        pdb_code = os.path.splitext(os.path.basename(ent_file))[0]
-        syst = parseMMCIF(ent_file)
+        try:
+            pdb_code = os.path.splitext(os.path.basename(ent_file))[0]
+            syst = parseMMCIF(ent_file)
 
-        final_df_pdb = final_df[final_df['PDB'] == pdb_code.upper()]
-        chain = final_df_pdb['Chain ID'].values[0]
-        uniprot_id = final_df_pdb['UniProt ID'].values[0]
+            final_df_pdb = final_df[final_df['PDB'] == pdb_code.upper()]
+            chain = final_df_pdb['Chain ID'].values[0]
+            uniprot_id = final_df_pdb['UniProt ID'].values[0]
 
-        syst_chain = syst.select('chain %s' % chain)
-        writePDB(os.path.join(out_path,uniprot_id,pdb_code+'_'+chain+'.pdb'), syst_chain)
+            syst_chain = syst.select('chain %s' % chain)
+            writePDB(os.path.join(out_path,uniprot_id,pdb_code+'_'+chain+'.pdb'), syst_chain)
+        except Exception as e:
+            print(f"An error occurred while processing file {ent_file}: {e}")
+            continue
                              
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Query PDB and AF2 structure database for protein structures of genes found in input dataframe')
