@@ -195,6 +195,11 @@ def extract_required_chains(final_df, out_path):
             writePDB(os.path.join(out_path,uniprot_id,pdb_code+'_'+chain+'.pdb'), syst_chain)
         except Exception as e:
             print(f"An error occurred while processing file {ent_file}: {e}")
+            # delete the error file
+            os.remove(ent_file)
+            # save the name of the deleted file in a text file
+            with open('deleted_files.txt', 'a') as f:
+                f.write(os.path.basename(ent_file) + '\n')
             continue
                              
 if __name__ == "__main__":

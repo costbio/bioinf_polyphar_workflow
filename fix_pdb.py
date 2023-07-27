@@ -18,26 +18,34 @@ def pdbfixer(out_path, in_path, ph=7.0):
     if not os.path.exists(out_path):
         os.makedirs(out_path)
         
-    # Loop over the list of PDB file paths    
     for pdb_path in pdb_list:
-        # Create a PDBFixer instance for the current file
-        fixer = PDBFixer(filename=pdb_path)
-        # Do something with the fixer instance, such as adding missing atoms
-        fixer.findMissingResidues()
-        fixer.findMissingAtoms()
-        fixer.addMissingAtoms()
-        fixer.addMissingHydrogens(ph)
-        fixer.removeHeterogens(keepWater=False)
-        #fixer.removeChains(indices)
-        # Get the protein directory relative to the protein_path
-        protein_dir = os.path.dirname(os.path.relpath(pdb_path, in_path))
-        # Construct the output file path
-        output_path = os.path.join(out_path, protein_dir,  os.path.basename(pdb_path))
-        # Make sure the directory exists
-        os.makedirs(os.path.dirname(output_path), exist_ok=True)
-        # Save the fixed PDB file
-        with open(output_path, 'w') as outfile:
-            PDBFile.writeFile(fixer.topology, fixer.positions, outfile)
+        try:
+            # Create a PDBFixer instance for the current file
+            fixer = PDBFixer(filename=pdb_path)
+            # Do something with the fixer instance, such as adding missing atoms
+            fixer.findMissingResidues()
+            fixer.findMissingAtoms()
+            fixer.addMissingAtoms()
+            fixer.addMissingHydrogens(ph)
+            fixer.removeHeterogens(keepWater=False)
+            #fixer.removeChains(indices)
+            # Get the protein directory relative to the protein_path
+            protein_dir = os.path.dirname(os.path.relpath(pdb_path, in_path))
+            # Construct the output file path
+            output_path = os.path.join(out_path, protein_dir,  os.path.basename(pdb_path))
+            # Make sure the directory exists
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
+            # Save the fixed PDB file
+            with open(output_path, 'w') as outfile:
+                PDBFile.writeFile(fixer.topology, fixer.positions, outfile)
+        except Exception as e:
+            print(f"An error occurred while processing file {pdb_path}: {e}")
+            # delete the error file
+            os.remove(pdb_path)
+            # save the name of the deleted file in a text file
+            with open('fixer_deleted_files.txt', 'a') as f:
+                f.write(os.path.basename(pdb_path) + '\n')
+            continue
 
 if __name__ == '__main__':
     # Define the command line arguments
