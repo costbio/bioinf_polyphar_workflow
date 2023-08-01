@@ -7,7 +7,7 @@ The scripts should be run in the given order.
 
 The operations performed by each of them are described below:
 
-1. **get_uniprot_data.py:**
-2. **get_pdb_af.py:**
-3. **fix_pdb.py:**
-4. **get_pockets.py:**
+1. **get_uniprot_data.py:** TO-DO
+2. **get_pdb_af.py:** TO-DO
+3. **fix_pdb.py:** TO-DO
+4. **get_pockets.py:** TO-DO
