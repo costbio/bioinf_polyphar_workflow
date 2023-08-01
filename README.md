@@ -1,6 +1,6 @@
 # Bioinformatics-based polypharmacology workflow
 
-This repository contains Python scripts to start a workflow for computational prediction of binding pocket similarities using PocketMatch 2.0 
+This repository contains Python scripts to start a workflow for computational prediction of binding pocket similarities using <a href="https://github.com/1337deepesh/PocketMatch_v2.0">PocketMatch 2.0</a>
 between protein structures of a list of genes provided as input.
 
 The scripts should be run in the given order. 
