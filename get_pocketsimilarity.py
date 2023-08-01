@@ -56,9 +56,21 @@ def getPMsimilarities(df_path,final_path, out_path,pm_path,run_path, pockets_pat
         except Exception as e:
             print(f'Error deleting {file_path}: {e}')
     
-    
-    
-    df = pd.read_table('PocketMatch_score.txt',header=None,delimiter=' ',on_bad_lines='skip') 
+    with open('PocketMatch_score.txt', 'r') as f:
+        valid_lines = []
+        bad_lines = []
+        for i, line in enumerate(f):
+            try:
+                fields = line.strip().split(' ')
+                # Process the fields here
+                # ...
+                valid_lines.append(fields)
+            except:
+                # If there's a parsing error, store the bad line in a separate list
+                bad_lines.append(line)
+        # Convert the lists to dataframes
+        df= pd.DataFrame(valid_lines)
+
     df = df[[0,1,2,3]]
     df.columns = ['Pocket1','Pocket2','Pmin','Pmax']
     df = df.convert_dtypes()
@@ -77,6 +89,18 @@ def getPMsimilarities(df_path,final_path, out_path,pm_path,run_path, pockets_pat
     #delete_col=["1","2"]
     #df=df.drop(delete_col, axis=1)
     
+    # Remove trailing underscores from pocket filenames.
+    df['Pocket1'] = df['Pocket1'].str.rstrip('_')
+    df['Pocket2'] = df['Pocket2'].str.rstrip('_')
+    # Define a lambda function that extracts the pocket path from the pockets list based on pocket name
+    get_pocket_path = lambda pocket_name: next((pocket for pocket in pockets if pocket_name in pocket), None)
+    df['Pocket_Path'] = df['Pocket1'].apply(get_pocket_path)
+    df['Pocket_Path_2'] = df['Pocket2'].apply(get_pocket_path)
+    col = df.pop('Pocket_Path')
+    df.insert(1, 'Pocket_Path', col)
+    col = df.pop('Pocket_Path_2')
+    df.insert(3, 'Pocket_Path_2', col)
+
     # Read df_pdb_af from pdb_path
     df_pdb_af = pd.read_csv(os.path.join(df_path,'Protein_info.csv'))
 
@@ -84,10 +108,12 @@ def getPMsimilarities(df_path,final_path, out_path,pm_path,run_path, pockets_pat
     dfa=df.sort_values(by='Pmax',ascending=False)
     df1 = dfa[['Pocket1']].copy()
     df1['UniProt ID'] = df1['Pocket1'].apply(lambda x: x.split('_', 1)[0] if '_' in x and not x.startswith('AF') else '')
+    df1 = dfa[['Pocket1']].copy()
+    df1['UniProt ID'] = df1['Pocket1'].apply(lambda x: x.split('_', 1)[0] if '_' in x and not x.startswith('AF') else '')
     df1['Pocket'] = df1['Pocket1'].apply(lambda x: x.split('_', 1)[1] if '_' in x and not x.startswith('AF') else x)
     df1 = df1[['UniProt ID', 'Pocket']]
     dfa = dfa.join(df1)
-    dfa = dfa.reindex(columns=['UniProt ID', "Pocket","Pocket1","Pocket2","Pmin","Pmax"])
+    dfa = dfa.reindex(columns=['UniProt ID', "Pocket","Pocket_Path","Pocket1","Pocket2","Pocket_Path_2","Pmin","Pmax"])
     dfa=dfa.drop("Pocket1", axis=1)
     df2 = dfa[['Pocket2']].copy()
     df2['UniProt ID_2'] = df2['Pocket2'].apply(lambda x: x.split('_', 1)[0] if '_' in x and not x.startswith('AF') else '')
@@ -95,9 +121,9 @@ def getPMsimilarities(df_path,final_path, out_path,pm_path,run_path, pockets_pat
     df2 = df2[['UniProt ID_2', 'Pocket_2']]
     dfa = dfa.join(df2)
     col = dfa.pop('UniProt ID_2')
-    dfa.insert(2, 'UniProt ID_2', col)
+    dfa.insert(3, 'UniProt ID_2', col)
     col = dfa.pop('Pocket_2')
-    dfa.insert(3, 'Pocket_2', col)
+    dfa.insert(4, 'Pocket_2', col)
     dfa=dfa.drop("Pocket2", axis=1)
     a1=dfa[["Protein","Pocket"]]= dfa['Pocket'].str.split(".", n=1, expand=True)
     col = dfa.pop('Protein')
@@ -108,7 +134,7 @@ def getPMsimilarities(df_path,final_path, out_path,pm_path,run_path, pockets_pat
     dfa['Protein'] = dfa['Protein'].str.upper()
     a1=dfa[["Protein_2","Pocket_2"]]= dfa['Pocket_2'].str.split(".", n=1, expand=True)
     col = dfa.pop('Protein_2')
-    dfa.insert(4, 'Protein_2', col)
+    dfa.insert(5, 'Protein_2', col)
     dfa['Pocket_2'] = dfa['Pocket_2'].str.replace('pdb_res_', '')
     a1=dfa[["Pocket_2","1"]]= dfa['Pocket_2'].str.split(".", n=1, expand=True)
     dfa=dfa.drop("1", axis=1)
@@ -126,23 +152,11 @@ def getPMsimilarities(df_path,final_path, out_path,pm_path,run_path, pockets_pat
     dfa['Gene Name'] = dfa['UniProt ID'].map(gene_to_id)
     col = dfa.pop('Gene Name')
     dfa.insert(1, 'Gene Name', col)
-    #Create a dictionary that maps gene names to IDs
-    gene_to_id = dict(zip(df_pdb_af['UniProt ID'], df_pdb_af['Gene Name']))
-    # Add a new column to the DataFrame that contains the corresponding ID for each gene name
     dfa['Gene Name_2'] = dfa['UniProt ID_2'].map(gene_to_id)
     col = dfa.pop('Gene Name_2')
-    dfa.insert(5, 'Gene Name_2', col)
+    dfa.insert(6, 'Gene Name_2', col)
     dfa= dfa[dfa['Gene Name']!= dfa['Gene Name_2']]
     df_sims=dfa
-    
-    # Define a lambda function that extracts the pocket path from the pockets list based on pocket name
-    get_pocket_path = lambda pocket_name: next((pocket for pocket in pockets if pocket_name in pocket), None)
-    df_sims['Pocket_Path'] = df_sims['Pocket'].apply(get_pocket_path)
-    col = df_sims.pop('Pocket_Path')
-    df_sims.insert(4, 'Pocket_Path', col)
-    df_sims['Pocket_Path2'] = df_sims['Pocket_2'].apply(get_pocket_path)
-    col = df_sims.pop('Pocket_Path2')
-    df_sims.insert(9, 'Pocket_Path2', col)
     
     df_sims.to_csv(os.path.join(final_path,'Pocketsim.csv'))
     result=glob.glob(out_path +'/*.txt')
