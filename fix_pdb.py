@@ -39,12 +39,13 @@ def pdbfixer(out_path, in_path, ph=7.0):
             with open(output_path, 'w') as outfile:
                 PDBFile.writeFile(fixer.topology, fixer.positions, outfile)
         except Exception as e:
-            print(f"An error occurred while processing file {pdb_path}: {e}")
+            error_message = f"An error occurred while processing file {pdb_path}: {e}"
+            print(error_message)
             # delete the error file
             os.remove(pdb_path)
             # save the name of the deleted file in a text file
             with open('fixer_deleted_files.txt', 'a') as f:
-                f.write(os.path.basename(pdb_path) + '\n')
+                f.write(f"{os.path.basename(pdb_path)}\n{error_message}\n")
             continue
 
 if __name__ == '__main__':
