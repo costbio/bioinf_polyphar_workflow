@@ -73,13 +73,13 @@ def download_pdb(df, out_path):
     merged_df.to_csv(os.path.join(out_path,'Protein_info.csv'))
     return merged_df
 
-def getAlphaFold(merged_df, out_path):
+def getAlphaFold(df, merged_df, out_path):
     if not os.path.exists(out_path):
         os.mkdir(out_path)
-
+    df = pd.read_csv(df)
     alphafold_ID = 'AF-P28335-F1'
     database_version = 'v2'
-    new_values = set(merged_df['UniProt ID'])
+    new_values = set(df['Entry'])
     new_IDs = []
     
     # Loop over the unique new values and generate a new ID and folder for each value
@@ -97,7 +97,7 @@ def getAlphaFold(merged_df, out_path):
         # Append the new ID to the list
         new_IDs.append(new_ID)
         
-        
+    data_list = []    
     for alphafold_ID in new_IDs:
         # Generate the model and error URLs for the current ID
         model_url = f'https://alphafold.ebi.ac.uk/files/{alphafold_ID}-model_{database_version}.pdb'
@@ -116,7 +116,7 @@ def getAlphaFold(merged_df, out_path):
         os.system(f'curl {error_url} -o {error_path}')
         
             
-        data_list = []
+        
         for protein_name in new_values:
             protein_folder = os.path.join(out_path, protein_name)
             id_to_gene = dict(zip(merged_df['UniProt ID'], merged_df['Gene Name']))
@@ -158,11 +158,10 @@ def chains(combined_df, out_path):
                 if pdb_file.endswith(".cif"):
                     # Load the protein structure from the PDB file
                     pdb_id = os.path.splitext(pdb_file)[0]
-                    structure = parser.get_structure(pdb_id, os.path.join(subfolder_path, pdb_file))
-                
-                # Iterate over each chain in the structure and append its ID and molecule name to the list
-                for chain in structure.get_chains():
-                    data.append({"PDB": pdb_id.upper(), "Chain ID": chain.id})
+                    structure = parser.get_structure(pdb_id, os.path.join(subfolder_path, pdb_file))    
+                    # Iterate over each chain in the structure and append its ID and molecule name to the list
+                    for chain in structure.get_chains():
+                        data.append({"PDB": pdb_id.upper(), "Chain ID": chain.id})
 
     # Create a pandas DataFrame from the list of data
     df = pd.DataFrame(data)
@@ -218,7 +217,7 @@ if __name__ == "__main__":
 
     merged_df = download_pdb(df_uniprot, out_path)
     print('Downloaded structures from PDB.')
-    combined_df = getAlphaFold(merged_df, out_path)
+    combined_df = getAlphaFold(df_uniprot, merged_df, out_path)
     print('Downloaded structures from AF2 database.')
     final_df = chains(combined_df, out_path)
     extract_required_chains(final_df, out_path)
