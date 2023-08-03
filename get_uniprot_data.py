@@ -5,6 +5,9 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 import re
+import math
+import os
+import time
 
 def checkgenes(gene_path, in_csv):
     # Open the file containing the words to search for
@@ -24,6 +27,16 @@ def checkgenes(gene_path, in_csv):
             matches.append(word)
         else:
             not_found.append(word)
+     
+     # Generate the output file path based on the input file name
+    input_dir = os.path.dirname(in_csv)
+    input_filename = os.path.basename(in_csv)
+    output_filename = os.path.splitext(input_filename)[0] + '_not_found.txt'
+    output_path = os.path.join(input_dir, output_filename)
+
+     # Save the not found elements to a text file
+    with open(output_path, 'w') as file:
+        file.write('\n'.join(not_found))
 
     # Print the matched words and the words that were not found
     if matches:
@@ -56,15 +69,31 @@ def getUniprotData(gene_path, out_csv):
         
     if not gene_names:
         raise ValueError(f"No gene names found in directory {gene_path}")    
-
-     # Construct a query string for UniProt search.    
-    query = " OR ".join(gene_names).split(" OR ") #get genes 
-    #print(query)
+    
+    # Split gene names into blocks of 5
+    n_blocks = math.ceil(len(gene_names) / 5)
+    gene_blocks = [gene_names[i*5:(i+1)*5] for i in range(n_blocks)]
+    
     service = UniProt()
+    
+    # Query UniProt for each gene block and concatenate the resulting dataframes
+    dfs = []
+    for block in gene_blocks:
+        query = " OR ".join(block).split(" OR ")
+        df = service.get_df(query, organism="Homo sapiens")
+        df = df[df['Gene Names (primary)'].isin(query)]
+        dfs.append(df)
+        time.sleep(15)
 
-    # Query UniProt and store results in a dataframe.
-    df = service.get_df(query, organism="Homo sapiens", limit=None)
-    df = df[df['Gene Names (primary)'].isin(query)]
+      # Query UniProt for each gene block and concatenate the resulting dataframes
+    dfs = []
+    for block in gene_blocks:
+        query = " OR ".join(block).split(" OR ")
+        df = service.get_df(query, organism="Homo sapiens")
+        df = df[df['Gene Names (primary)'].isin(query)]
+        dfs.append(df)
+    
+    df= pd.concat(dfs)
     df.to_csv(out_csv)
     return df
 
