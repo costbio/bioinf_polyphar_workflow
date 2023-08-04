@@ -85,13 +85,7 @@ def getUniprotData(gene_path, out_csv):
         dfs.append(df)
         time.sleep(15)
 
-      # Query UniProt for each gene block and concatenate the resulting dataframes
-    dfs = []
-    for block in gene_blocks:
-        query = " OR ".join(block).split(" OR ")
-        df = service.get_df(query, organism="Homo sapiens")
-        df = df[df['Gene Names (primary)'].isin(query)]
-        dfs.append(df)
+
     
     df= pd.concat(dfs)
     df.to_csv(out_csv)
