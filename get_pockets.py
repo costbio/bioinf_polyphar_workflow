@@ -34,15 +34,16 @@ def getPockets(out_path, pdb_path, alphafold_path, ds_path, nprocs=4):
     pdb_list = []
     for root, dirs, files in os.walk(pdb_path):
         for file in files:
-            if re.match(r'.+\.(pdb)$', file):
+            if file.endswith(".pdb"):
                 pdb_list.append(os.path.join(root, file))
 
-    # Add alphafolds from a different path
+# Add alphafolds from a different path
     pdb_list2 = []
     for root, dirs, files in os.walk(alphafold_path):
         for file in files:
-            if re.match(r'^AF-.+\.pdb$', file):
+            if 'AF-' in file and file.endswith('.pdb'):
                 pdb_list2.append(os.path.join(root, file))
+
     pdb_list.extend(pdb_list2)
     
     if not os.path.exists(out_path):
