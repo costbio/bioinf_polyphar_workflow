@@ -155,7 +155,8 @@ def getPMsimilarities(df_path,final_path, out_path,pm_path,run_path, pockets_pat
     dfa['Gene Name_2'] = dfa['UniProt ID_2'].map(gene_to_id)
     col = dfa.pop('Gene Name_2')
     dfa.insert(6, 'Gene Name_2', col)
-    dfa= dfa[dfa['Gene Name']!= dfa['Gene Name_2']]
+    #avoid getting same genes scores
+    dfa= dfa[dfa['UniProt ID']!= dfa['UniProt ID_2']]
     df_sims=dfa
     
     df_sims.to_csv(os.path.join(final_path,'Pocketsim.csv'))
