@@ -81,7 +81,8 @@ def getUniprotData(gene_path, out_csv):
     for block in gene_blocks:
         query = " OR ".join(block).split(" OR ")
         df = service.get_df(query, organism="Homo sapiens")
-        df = df[df['Gene Names (primary)'].isin(query)]
+        # #ıf you are working with gene names change 'Entry' to 'Gene Names (primary)'
+        df = df[df['Entry'].isin(query)]
         dfs.append(df)
         time.sleep(15)
 
