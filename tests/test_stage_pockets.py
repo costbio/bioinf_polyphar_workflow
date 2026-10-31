@@ -200,8 +200,9 @@ def test_enqueue_requeues_failed_and_stale_done(tmp_path):
 
 def _finish(layout, job_id, out, sha="abc"):
     """What the host worker leaves behind for one successful job."""
-    _put(layout.run_dir / f"{out}_desc.txt", (FAKE_DATA / "desc.txt").read_text())
-    shutil.copy(FAKE_DATA / "res_P_1.pdb", layout.run_dir / f"{out}_res_P_1.pdb")
+    pocket = FAKE_DATA / "P53350_4rcp_A"
+    _put(layout.run_dir / f"{out}_desc.txt", Path(f"{pocket}.desc.txt").read_text())
+    shutil.copy(f"{pocket}.res_P_1.pdb", layout.run_dir / f"{out}_res_P_1.pdb")
     _put(layout.pockets / "queue" / f"{job_id}.done",
          json.dumps({"exit": 0, "seconds": 1.0, "dogsite_sha256": sha}))
 

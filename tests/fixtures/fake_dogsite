@@ -3,14 +3,17 @@
 
     fake_dogsite -p <model> [other flags...] -o <out>
 
-Writes <out>_desc.txt (the real net2 descriptor row of pocket P_1 of P53350 4rcp_A,
-drugScore 0.69) and <out>_res_P_1.pdb (that real pocket's residue file), both copied
-from fake_dogsite_data/ next to this script.
+Writes <out>.pml first (a partial output, as the real binary writes several files),
+then <out>_res_P_1.pdb and finally <out>_desc.txt. The pocket is one of several REAL
+net2 pockets of different proteins in fake_dogsite_data/ (<label>.res_P_1.pdb with its
+real descriptor row <label>.desc.txt, all drugScore >= 0.5), chosen deterministically
+from the sha256 of the model's file name, so different models get different pockets.
 
   * exits 3 when the model's file name contains FAIL
-  * sleeps $FAKE_DOGSITE_SLEEP seconds first, when set
+  * sleeps $FAKE_DOGSITE_SLEEP seconds (after writing <out>.pml), when set
   * appends the model path to $FAKE_DOGSITE_LOG, when set (one line per call)
 """
+import hashlib
 import os
 import shutil
 import sys
@@ -26,6 +29,12 @@ def _value(flag):
     return args[args.index(flag) + 1]
 
 
+def pocket_label(model):
+    labels = sorted(f[:-len(".desc.txt")] for f in os.listdir(DATA) if f.endswith(".desc.txt"))
+    digest = hashlib.sha256(os.path.basename(model).encode()).hexdigest()
+    return labels[int(digest, 16) % len(labels)]
+
+
 def main():
     model, out = _value("-p"), _value("-o")
     log = os.environ.get("FAKE_DOGSITE_LOG")
@@ -38,14 +47,17 @@ def main():
     if "FAIL" in os.path.basename(model):
         print(f"fake_dogsite: FAIL requested by model name {model}", file=sys.stderr)
         return 3
-    if os.environ.get("FAKE_DOGSITE_SLEEP"):
-        time.sleep(float(os.environ["FAKE_DOGSITE_SLEEP"]))
     if not os.path.isfile(model):
         print(f"fake_dogsite: no such model {model}", file=sys.stderr)
         return 2
-    shutil.copyfile(os.path.join(DATA, "res_P_1.pdb"), out + "_res_P_1.pdb")
-    shutil.copyfile(os.path.join(DATA, "desc.txt"), out + "_desc.txt")
-    print(f"fake_dogsite: 1 pocket for {model}")
+    label = pocket_label(model)
+    with open(out + ".pml", "w") as fh:
+        fh.write(f"# fake_dogsite pocket {label}\n")
+    if os.environ.get("FAKE_DOGSITE_SLEEP"):
+        time.sleep(float(os.environ["FAKE_DOGSITE_SLEEP"]))
+    shutil.copyfile(os.path.join(DATA, label + ".res_P_1.pdb"), out + "_res_P_1.pdb")
+    shutil.copyfile(os.path.join(DATA, label + ".desc.txt"), out + "_desc.txt")
+    print(f"fake_dogsite: pocket {label} for {model}")
     return 0
 
 

@@ -9,6 +9,7 @@
 #   POLYPHAR_HOME         calibration / pushover.env dir (default: ~/.polyphar)
 #   POLYPHAR_VERSION      image tag (default: latest)
 #   NPROCS                worker processes (passed through)
+#   POLYPHAR_PREFLIGHT_TIMEOUT  seconds the DoGSiteScorer preflight may take (default 600)
 #   POLYPHAR_DOCKER_OPTS  extra `docker run` options (word-split on purpose)
 #
 # The container runs in the foreground; for long runs use tmux or nohup.
@@ -43,8 +44,11 @@ image="polyphar:${POLYPHAR_VERSION:-latest}"
 #                                       one after it (only `--from S`, `--from=S`,
 #                                       `--to S`, `--to=S` are recognised; anything
 #                                       else is assumed to include pockets)
-# but not with --dry-run / --help. It is stopped by a trap on EXIT/INT/TERM; the
-# wrapper's exit status stays the container's.
+# but not with --dry-run / --help. Its --nprocs is the polyphar `--nprocs N` /
+# `--nprocs=N` argument if given, else $NPROCS, else 4 (the container's ETA uses the
+# same value). The container starts only once the worker's preflight passed (its
+# heartbeat appears), waiting at most POLYPHAR_PREFLIGHT_TIMEOUT + 60 s. The worker is
+# stopped by a trap on EXIT/INT/TERM/HUP; the wrapper's exit status stays the container's.
 # Host calibration of pockets (worker --benchmark) runs before the container for
 # `benchmark`, and for `run` (including pockets) when calibration.json has no pockets
 # entry yet.
@@ -56,6 +60,23 @@ stage_index() {
         *) echo "" ;;
     esac
 }
+preflight_timeout="${POLYPHAR_PREFLIGHT_TIMEOUT:-600}"
+case "$preflight_timeout" in
+    ''|*[!0-9]*|0)
+        echo "polyphar-docker: POLYPHAR_PREFLIGHT_TIMEOUT must be a whole number of seconds > 0" >&2
+        exit 2 ;;
+esac
+worker_nprocs="${NPROCS:-4}"
+prev=""
+for a in "$@"; do
+    if [ "$prev" = "--nprocs" ]; then
+        worker_nprocs="$a"
+    fi
+    case "$a" in
+        --nprocs=*) worker_nprocs="${a#--nprocs=}" ;;
+    esac
+    prev="$a"
+done
 want_worker=0
 want_bench=0
 case "${1:-}" in
@@ -110,7 +131,8 @@ fi
 
 if [ "$want_bench" = 1 ]; then
     bench_status=0
-    POLYPHAR_HOME="$home_dir" "$worker" --benchmark --dogsite "$DOGSITE_BIN" || bench_status=$?
+    POLYPHAR_HOME="$home_dir" "$worker" --benchmark --dogsite "$DOGSITE_BIN" \
+        --preflight-timeout "$preflight_timeout" || bench_status=$?
     if [ "$bench_status" != 0 ]; then
         echo "polyphar-docker: DoGSiteScorer benchmark failed (exit $bench_status)" >&2
         if [ "$want_worker" = 1 ]; then
@@ -129,7 +151,7 @@ stop_worker() {
     fi
 }
 on_signal() {
-    trap '' INT TERM
+    trap '' INT TERM HUP
     if [ -n "$docker_pid" ]; then
         kill -TERM "$docker_pid" 2>/dev/null || true
         wait "$docker_pid" 2>/dev/null || true
@@ -139,15 +161,23 @@ on_signal() {
 trap stop_worker EXIT
 trap 'on_signal 2' INT
 trap 'on_signal 15' TERM
+trap 'on_signal 1' HUP
 
 if [ "$want_worker" = 1 ]; then
     queue="$run_dir/04_pockets/queue"
     mkdir -p "$queue"
     rm -f "$queue/CLOSED"   # left by an earlier run; it would stop the new worker
-    "$worker" --run-dir "$run_dir" --dogsite "$DOGSITE_BIN" --nprocs "${NPROCS:-4}" --watch &
+    "$worker" --run-dir "$run_dir" --dogsite "$DOGSITE_BIN" --nprocs "$worker_nprocs" \
+        --preflight-timeout "$preflight_timeout" --watch &
     worker_pid=$!
     # The worker's heartbeat appears once its preflight passed.
+    start_deadline=$((SECONDS + preflight_timeout + 60))
     until compgen -G "$queue/WORKER.*.$worker_pid" >/dev/null; do
+        if [ "$SECONDS" -ge "$start_deadline" ]; then
+            echo "polyphar-docker: the DoGSiteScorer worker did not pass its preflight within" \
+                 "$((preflight_timeout + 60)) s; stopping it" >&2
+            exit 1   # the EXIT trap stops the worker
+        fi
         if ! kill -0 "$worker_pid" 2>/dev/null; then
             worker_status=0
             wait "$worker_pid" || worker_status=$?

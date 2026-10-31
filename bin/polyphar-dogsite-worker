@@ -34,31 +34,39 @@ from datetime import datetime
 QUEUE_REL = os.path.join("04_pockets", "queue")
 POLL_S = 5.0
 HEARTBEAT_S = 30.0
+STALE_HEARTBEAT_S = 120.0     # a claim whose worker heartbeat is older than this is stale
+DEFAULT_PREFLIGHT_TIMEOUT = 600.0
 DOGSITE_FLAGS = ["-s", "-i", "-y", "-d", "-w", "4"]
 STDERR_TAIL = 2000
 HINT = "license/installation problem — see README §DoGSiteScorer"
 REPO = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 BENCH_DIR = os.path.join(REPO, "polyphar", "data", "bench")
-PREFLIGHT_MODEL = os.path.join(BENCH_DIR, "2mjw_B.pdb")
+# The bench CHAINS (protein models) in BENCH_DIR, timed by --benchmark; the first one is
+# also the preflight model. Other files in BENCH_DIR (pockets, ligands) are not chains.
+BENCH_CHAINS = ["2mjw_B.pdb"]
+PREFLIGHT_MODEL = os.path.join(BENCH_DIR, BENCH_CHAINS[0])
 
 EPILOG = """\
 modes:
   default      run the jobs queued now, then exit
   --watch      keep polling every 5 s for new jobs until queue/CLOSED exists
                (bin/polyphar-docker starts the worker like this for `pockets` / `run`)
-  --benchmark  time DoGSiteScorer on the bench chains in polyphar/data/bench/ and store
+  --benchmark  time DoGSiteScorer on the bench chains (BENCH_CHAINS in this script, files
+               in polyphar/data/bench/) and store
                pockets.seconds_per_unit (per byte, one process) in
                $POLYPHAR_HOME/calibration.json (default ~/.polyphar); without
                --run-dir nothing else is done
 
 Before claiming any job the worker runs the binary once on polyphar/data/bench/2mjw_B.pdb
-(preflight). If that fails it exits with status 3 and the binary's stderr, leaving every
-job queued.
+(preflight). If that fails, or takes longer than --preflight-timeout, it exits with
+status 3 and the binary's stderr, leaving every job queued.
 
-At start, claims of this host whose process is gone (.running.<host>.<dead pid>) are put
-back in the queue. On SIGTERM / SIGINT, running DoGSiteScorer processes are killed, their
-partial outputs removed and their jobs put back in the queue. Input files are never
-modified.
+At start, claims of this host are put back in the queue when they are stale: their
+process is gone, or their WORKER.<host>.<pid> heartbeat is missing or older than 120 s
+(a reused pid after a reboot). On SIGTERM / SIGHUP / SIGINT, running DoGSiteScorer
+processes are killed, their partial outputs removed and their jobs put back in the queue.
+A job whose setup fails (e.g. its output directory cannot be created) is recorded as
+failed; the worker goes on. Input files are never modified.
 
 exit status: 0 ok (failed jobs are recorded in <id>.failed), 2 usage error,
              3 preflight / benchmark failure, 128+N killed by signal N
@@ -66,7 +74,7 @@ exit status: 0 ok (failed jobs are recorded in <id>.failed), 2 usage error,
 
 
 class Stop(Exception):
-    """Raised in the main thread by SIGTERM / SIGINT."""
+    """Raised in the main thread by SIGTERM / SIGHUP / SIGINT."""
 
     def __init__(self, signum):
         Exception.__init__(self, signum)
@@ -77,9 +85,27 @@ def _on_signal(signum, frame):
     raise Stop(signum)
 
 
+STOP_SIGNALS = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
+
+
+def install_signal_handlers():
+    """SIGTERM, SIGHUP (ssh drop) and SIGINT stop the worker cleanly. SIGHUP / SIGINT
+    stay ignored when they were ignored at start (nohup; background job of a script)."""
+    for sig in STOP_SIGNALS:
+        if sig == signal.SIGTERM or signal.getsignal(sig) is not signal.SIG_IGN:
+            signal.signal(sig, _on_signal)
+
+
+def _ignore(signum, frame):
+    pass
+
+
 def ignore_signals():
-    signal.signal(signal.SIGTERM, signal.SIG_IGN)
-    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    """Ignore further stop signals during cleanup. A no-op handler, not SIG_IGN: an
+    ignored disposition would be inherited by a DoGSiteScorer child started in the same
+    instant, which then could not be stopped with SIGTERM."""
+    for sig in STOP_SIGNALS:
+        signal.signal(sig, _ignore)
 
 
 def log(msg):
@@ -118,6 +144,19 @@ def unlink(path):
         pass
 
 
+def remove_outputs(out):
+    """Delete every DoGSiteScorer output of `-o out` (<out>_desc.txt, <out>_res_*.pdb,
+    <out>.pml, ...): files in out's directory named <out name>_* or <out name>.*."""
+    d, base = os.path.split(out)
+    try:
+        names = os.listdir(d)
+    except FileNotFoundError:
+        return
+    for name in names:
+        if name.startswith(base + "_") or name.startswith(base + "."):
+            unlink(os.path.join(d, name))
+
+
 def pid_alive(pid):
     if pid == os.getpid():
         return False   # a claim with our pid is from an earlier process of the same pid
@@ -140,18 +179,37 @@ def tail(text):
 
 # --- preflight / benchmark -------------------------------------------------------------
 
-def run_once(dogsite, model):
-    """Run DoGSiteScorer on `model` in a temp dir. Returns (ok, seconds, stderr)."""
+def killpg(proc, sig):
+    try:
+        os.killpg(proc.pid, sig)
+    except OSError:
+        pass
+
+
+def run_once(dogsite, model, timeout):
+    """Run DoGSiteScorer on `model` in a temp dir, for at most `timeout` seconds.
+    Returns (ok, seconds, message)."""
     tmpdir = tempfile.mkdtemp(prefix="polyphar-dogsite-")
     try:
         out = os.path.join(tmpdir, os.path.basename(model))
         t0 = time.monotonic()
-        proc = subprocess.run(dogsite_cmd(dogsite, os.path.abspath(model), out), cwd=tmpdir,
-                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                              universal_newlines=True, errors="replace")
+        proc = subprocess.Popen(dogsite_cmd(dogsite, os.path.abspath(model), out), cwd=tmpdir,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                universal_newlines=True, errors="replace",
+                                start_new_session=True)
+        try:
+            _, err = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            killpg(proc, signal.SIGKILL)
+            _, err = proc.communicate()
+            return False, time.monotonic() - t0, "timed out after %g s: %s" % (
+                timeout, tail(err).strip())
+        except BaseException:
+            killpg(proc, signal.SIGKILL)
+            proc.wait()
+            raise
         seconds = time.monotonic() - t0
         ok = proc.returncode == 0 and os.path.isfile(out + "_desc.txt")
-        err = proc.stderr
         if not ok and proc.returncode == 0:
             err += "\n(exit 0 but no _desc.txt written)"
         return ok, seconds, "exit %d: %s" % (proc.returncode, tail(err).strip())
@@ -164,8 +222,8 @@ def preflight_failed(model, err):
     return 3
 
 
-def preflight(dogsite):
-    ok, seconds, err = run_once(dogsite, PREFLIGHT_MODEL)
+def preflight(dogsite, timeout=DEFAULT_PREFLIGHT_TIMEOUT):
+    ok, seconds, err = run_once(dogsite, PREFLIGHT_MODEL, timeout)
     if not ok:
         return preflight_failed(PREFLIGHT_MODEL, err)
     log("preflight ok (%.1f s on %s)" % (seconds, os.path.basename(PREFLIGHT_MODEL)))
@@ -232,13 +290,20 @@ def save_calibration(seconds_per_unit):
     return path, data["pockets"]
 
 
-def benchmark(dogsite):
-    """Time DoGSiteScorer (one process) on every bench chain; store seconds per byte."""
-    models = sorted(os.path.join(BENCH_DIR, f) for f in os.listdir(BENCH_DIR)
-                    if f.endswith(".pdb"))
+def benchmark(dogsite, timeout=DEFAULT_PREFLIGHT_TIMEOUT):
+    """Time DoGSiteScorer (one process) on the bench chains; store seconds per byte."""
+    models = [os.path.join(BENCH_DIR, name) for name in BENCH_CHAINS]
+    missing = [m for m in models if not os.path.isfile(m)]
+    if missing:
+        sys.stderr.write("dogsite-worker: bench chain(s) missing: %s\n" % ", ".join(missing))
+        return 3
+    if sum(os.path.getsize(m) for m in models) == 0:
+        sys.stderr.write("dogsite-worker: the bench chains %s are empty (0 bytes); cannot "
+                         "calibrate per byte\n" % ", ".join(models))
+        return 3
     total_s = total_b = 0.0
     for model in models:
-        ok, seconds, err = run_once(dogsite, model)
+        ok, seconds, err = run_once(dogsite, model, timeout)
         if not ok:
             return preflight_failed(model, err)
         size = os.path.getsize(model)
@@ -287,22 +352,38 @@ class Worker:
         os.utime(self.heartbeat, None)
 
     # -- claims --
+    def worker_gone(self, host, pid):
+        """True when worker <host>.<pid> of THIS host is certainly not running: its pid is
+        dead, or its heartbeat is missing or older than STALE_HEARTBEAT_S (a live pid can
+        be an unrelated process after a reboot or pid reuse)."""
+        if host != self.host or not pid.isdigit():
+            return False
+        if not pid_alive(int(pid)):
+            return True
+        try:
+            age = time.time() - os.stat(self.q("WORKER.%s.%s" % (host, pid))).st_mtime
+        except FileNotFoundError:
+            return True
+        return age > STALE_HEARTBEAT_S
+
     def reclaim_stale(self):
-        """Put back claims of this host whose process is gone; drop dead heartbeats."""
-        for name in os.listdir(self.qdir):
+        """Put back stale claims of this host; drop their heartbeats."""
+        names = os.listdir(self.qdir)
+        gone = {}
+        for name in names:
+            if ".running." in name:
+                jid, rest = name.split(".running.", 1)
+                host, _, pid = rest.rpartition(".")
+                if (host, pid) not in gone:
+                    gone[(host, pid)] = self.worker_gone(host, pid)
+                if gone[(host, pid)]:
+                    self.unclaim(jid, name)
+                    log("reclaimed stale claim %s" % name)
+        for name in names:
             if name.startswith("WORKER."):
                 host, _, pid = name[len("WORKER."):].rpartition(".")
-                if host == self.host and pid.isdigit() and not pid_alive(int(pid)):
+                if gone.get((host, pid)) or self.worker_gone(host, pid):
                     unlink(self.q(name))
-                continue
-            if ".running." not in name:
-                continue
-            jid, rest = name.split(".running.", 1)
-            host, _, pid = rest.rpartition(".")
-            if host != self.host or not pid.isdigit() or pid_alive(int(pid)):
-                continue
-            self.unclaim(jid, name)
-            log("reclaimed stale claim %s" % name)
 
     def unclaim(self, jid, running_name):
         """Running job back to the queue (or dropped, when it already has a result)."""
@@ -312,7 +393,7 @@ class Worker:
         try:
             with open(self.q(running_name)) as fh:
                 out = self.resolve(json.load(fh)["out"])
-            unlink(out + "_desc.txt")   # an unconfirmed run's output must not look done
+            remove_outputs(out)   # an unconfirmed run's output must not look done
         except (OSError, ValueError, KeyError, TypeError):
             pass
         try:
@@ -335,6 +416,18 @@ class Worker:
 
     # -- one job (in a pool thread) --
     def run_job(self, jid, running):
+        """One job; any error of this job becomes its .failed, never a worker crash."""
+        try:
+            self._run_job(jid, running)
+        except Exception as exc:
+            if self.stopping:
+                return   # unclaimed by the main thread
+            self.finish(jid, running, ".failed",
+                        {"exit": -1, "stderr_tail": "worker error: %s: %s"
+                         % (type(exc).__name__, exc)})
+            log("FAILED %s (%s: %s)" % (jid, type(exc).__name__, exc))
+
+    def _run_job(self, jid, running):
         try:
             with open(self.q(running)) as fh:
                 spec = json.load(fh)
@@ -344,9 +437,9 @@ class Worker:
             self.finish(jid, running, ".failed", {"exit": -1, "stderr_tail": "bad job: %s" % exc})
             return
         outdir = os.path.dirname(out)
-        os.makedirs(outdir, exist_ok=True)
         desc = out + "_desc.txt"
-        unlink(desc)                    # the desc file is the done marker: start clean
+        os.makedirs(outdir, exist_ok=True)
+        remove_outputs(out)   # the desc file is the done marker: start clean
         t0 = time.monotonic()
         with self.lock:
             if self.stopping:
@@ -374,7 +467,7 @@ class Worker:
             return
         if self.stopping:
             return   # killed by us: unclaimed by the main thread
-        unlink(desc)
+        remove_outputs(out)
         if proc.returncode == 0:
             err += "\n(exit 0 but no %s written)" % os.path.basename(desc)
         self.finish(jid, running, ".failed", {"exit": proc.returncode, "stderr_tail": tail(err)})
@@ -389,19 +482,14 @@ class Worker:
             self.stopping = True
             procs = list(self.procs.values())
         for p in procs:
-            try:
-                os.killpg(p.pid, signal.SIGTERM)
-            except OSError:
-                pass
+            killpg(p, signal.SIGTERM)
         deadline = time.monotonic() + 10
         for p in procs:
             try:
                 p.wait(max(0.1, deadline - time.monotonic()))
             except subprocess.TimeoutExpired:
-                try:
-                    os.killpg(p.pid, signal.SIGKILL)
-                except OSError:
-                    pass
+                killpg(p, signal.SIGKILL)
+                p.wait()
 
     # -- main loop --
     def loop(self):
@@ -482,9 +570,14 @@ def parse_args(argv):
                    help="keep polling for jobs until queue/CLOSED exists")
     p.add_argument("--benchmark", action="store_true",
                    help="calibrate pockets in $POLYPHAR_HOME/calibration.json")
+    p.add_argument("--preflight-timeout", type=float, default=DEFAULT_PREFLIGHT_TIMEOUT,
+                   help="seconds the preflight (and each benchmark run) may take "
+                        "(default: %g)" % DEFAULT_PREFLIGHT_TIMEOUT)
     args = p.parse_args(argv)
     if args.nprocs < 1:
         p.error("--nprocs must be >= 1")
+    if not args.preflight_timeout > 0:
+        p.error("--preflight-timeout must be > 0")
     if not args.run_dir and not args.benchmark:
         p.error("--run-dir is required (unless --benchmark)")
     if args.run_dir and not os.path.isdir(args.run_dir):
@@ -499,11 +592,12 @@ def parse_args(argv):
 
 def main(argv=None):
     args = parse_args(argv)
-    signal.signal(signal.SIGTERM, _on_signal)
-    if signal.getsignal(signal.SIGINT) is not signal.SIG_IGN:
-        signal.signal(signal.SIGINT, _on_signal)
+    install_signal_handlers()
     try:
-        status = benchmark(args.dogsite) if args.benchmark else preflight(args.dogsite)
+        if args.benchmark:
+            status = benchmark(args.dogsite, args.preflight_timeout)
+        else:
+            status = preflight(args.dogsite, args.preflight_timeout)
         if status != 0 or not args.run_dir:
             return status
         return Worker(args.run_dir, args.dogsite, args.nprocs, args.watch).serve()
