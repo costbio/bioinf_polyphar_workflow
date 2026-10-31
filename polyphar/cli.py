@@ -13,10 +13,14 @@ import argparse
 import importlib
 import os
 import sys
+from datetime import datetime
 from pathlib import Path
 
 from polyphar import __version__
 from polyphar.common import RunLayout
+from polyphar.eta import (PARALLEL_EFFICIENCY, Calibration, Progress, estimate_stage,
+                          format_eta, polyphar_home, slots_for)
+from polyphar.notify import notify
 
 # subcommand -> (stage module, help text)
 STAGES = {
@@ -87,6 +91,47 @@ def _load_stage(name: str):
         raise
 
 
+# Wired separately (multi-stage run, estimate, benchmark); not per-stage gated.
+UNGATED = frozenset({"run", "estimate", "benchmark"})
+
+
+def _no_notify(title, message, priority=0):
+    return False
+
+
+def _run_gated(name, stage, layout, args) -> int:
+    """ETA gate: units -> estimate -> print + notify start -> (dry-run exit) ->
+    run with Progress -> done/fail."""
+    tpj = getattr(args, "threads_per_job", 1) or 1
+    units = stage.units(layout, args)
+    calib = Calibration.load(polyphar_home())
+    est = estimate_stage(name, units, args.nprocs, calib, PARALLEL_EFFICIENCY,
+                         threads_per_job=tpj)
+    eta = format_eta(est, datetime.now())
+    line = f"{name}: {units.count} units ({units.cost_basis}) - ETA {eta}"
+    print(line, flush=True)
+    if args.no_notify:
+        notifier = _no_notify
+    else:
+        def notifier(title, message, priority=0):
+            return notify(title, message, priority, run_dir=layout.run_dir)
+
+        notifier(f"{name} starting", line)
+    if args.dry_run:
+        return 0
+    total_size = float(sum(units.sizes)) if units.sizes else None
+    progress = Progress(name, units.count, est, notifier, total_size=total_size,
+                        calib=calib, slots=slots_for(name, args.nprocs, tpj) or 1.0,
+                        log_path=layout.logs / f"{name}.log")
+    try:
+        counts = stage.run(layout, args, progress)
+    except Exception as exc:
+        progress.fail(exc)
+        raise
+    progress.done(counts)
+    return 0
+
+
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     stage = _load_stage(args.command)
@@ -94,6 +139,8 @@ def main(argv=None) -> int:
         print(f"polyphar {args.command}: not implemented", file=sys.stderr)
         return 2
     layout = RunLayout(args.run_dir)
+    if args.command not in UNGATED:
+        return _run_gated(args.command, stage, layout, args)
     if args.dry_run:
         wu = stage.units(layout, args)
         print(f"{args.command}: {wu.count} units ({wu.cost_basis})")
