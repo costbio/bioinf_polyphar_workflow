@@ -50,14 +50,6 @@ def _strip_loops(text, *prefixes):
     return "\n".join(out) + "\n"
 
 
-def _cif_relettered(text):
-    """2MJW whose own annotation says author chain B is RAGE (Q15109), as after a
-    remediation that re-lettered chains while the reused SIFTS still says B = S100P."""
-    old = "\n2 2 2MJW B 1 ? 94  ? P25815"
-    assert old in text
-    return text.replace(old, "\n2 1 2MJW B 1 ? 94  ? Q15109")
-
-
 def _cif_hetatm_only(text, chain="B"):
     """2MJW whose author chain `chain` is made of HETATM records only."""
     lines = []
@@ -92,11 +84,12 @@ class FakeResponse:
 class FakeSession:
     """Routes SIFTS, RCSB and AFDB URLs to canned responses; records every GET."""
 
-    def __init__(self, cifs=None, af=None, af_pdb=AF_PDB, sifts_status=200):
+    def __init__(self, cifs=None, af=None, af_pdb=AF_PDB, sifts_status=200, sifts_text=None):
         self.cifs = cifs or {}            # PDB ID (upper) -> cif text
         self.af = af or {}                # accession -> API json text
         self.af_pdb = af_pdb
         self.sifts_status = sifts_status
+        self.sifts_text = SIFTS.read_text() if sifts_text is None else sifts_text
         self.calls = []
 
     def get(self, url, timeout=None, **kw):
@@ -105,7 +98,7 @@ class FakeSession:
         if url == structures.SIFTS_URL:
             if self.sifts_status != 200:
                 return FakeResponse(b"", self.sifts_status)
-            return FakeResponse(gzip.compress(SIFTS.read_bytes()),
+            return FakeResponse(gzip.compress(self.sifts_text.encode()),
                                 headers={"Last-Modified": LAST_MODIFIED})
         if url.startswith("https://files.rcsb.org/download/"):
             pdb = url.rsplit("/", 1)[1][:-4]
@@ -225,20 +218,20 @@ def test_extract_hetatm_only_chain_rejected(tmp_path):
 
 def test_cif_check_accepts_target_chain(tmp_path):
     cif = _cif_2mjw(tmp_path)
-    assert verify_chain(cif, "B", "P25815") == "verified"
-    assert verify_chain(cif, "D", "P25815") == "verified"   # author D (label C)
+    assert verify_chain(cif, "B", "P25815") == ("verified", ["P25815"])
+    assert verify_chain(cif, "D", "P25815") == ("verified", ["P25815"])   # author D (label C)
 
 
-def test_cif_check_rejects_chain_of_other_protein(tmp_path):
-    with pytest.raises(ChainRejected, match="does not map chain A to P25815"):
-        verify_chain(_cif_2mjw(tmp_path), "A", "P25815")
+def test_cif_check_reports_mismatch(tmp_path):
+    # author chain A of 2MJW is RAGE: the cif's own annotation disagrees with P25815
+    assert verify_chain(_cif_2mjw(tmp_path), "A", "P25815") == ("mismatch", ["Q15109"])
 
 
 def test_cif_check_without_annotation_is_unverified(tmp_path):
     cif = tmp_path / "bare.cif"
     cif.write_text(_strip_loops(_cif_2mjw(tmp_path).read_text(), "_struct_ref."))
     assert "_struct_ref." not in cif.read_text()
-    assert verify_chain(cif, "B", "P25815") == "unverified"
+    assert verify_chain(cif, "B", "P25815") == ("unverified", [])
 
 
 def test_extract_missing_chain_raises_and_writes_nothing(tmp_path):
@@ -350,7 +343,8 @@ def test_run_writes_outputs(tmp_path, monkeypatch):
     assert m["counts"] == {"accessions": 3, "pdb_entries_listed": 3, "chains_extracted": 1,
                            "unmapped": {"PDB absent from SIFTS": 1,
                                         "no SIFTS chain for accession": 1},
-                           "af_found": 1, "af_missing": 2, "cif_unverified": 0, "failed": 0}
+                           "af_found": 1, "af_missing": 2, "cif_unverified": 0, "annotation_mismatch": 0,
+                           "failed": 0}
 
 
 def test_resume_skips_existing(tmp_path, monkeypatch):
@@ -391,12 +385,32 @@ def test_entry_download_failure_is_recorded_and_stage_continues(tmp_path, monkey
     assert structures.units(layout, None).count == 1     # retried on the next run
 
 
-@pytest.mark.parametrize("broken, reason", [
-    (_cif_relettered, "cif annotation does not map chain B to P25815"),
-    (_cif_hetatm_only, "chain has no ATOM records"),
-])
-def test_rejected_chain_recorded_and_not_retried(tmp_path, monkeypatch, broken, reason):
-    s = FakeSession(cifs={"2MJW": broken(_cif_2mjw(tmp_path).read_text())})
+def test_annotation_mismatch_warns_and_extracts(tmp_path, monkeypatch):
+    # SIFTS (the authority) says 2MJW chain A is P25815 with the larger coverage;
+    # the cif's depositor annotation says A is RAGE (Q15109): extract, but list it.
+    sifts = SIFTS.read_text().replace("2mjw\tA\tQ15109\t3\t101\t23\t121\t23\t121",
+                                      "2mjw\tA\tP25815\t3\t101\t23\t121\t1\t99")
+    assert "2mjw\tA\tP25815" in sifts
+    s = FakeSession(cifs={"2MJW": _cif_2mjw(tmp_path).read_text()}, sifts_text=sifts)
+    run, layout = _setup(tmp_path, monkeypatch, [("P25815", "S100P_HUMAN", "2MJW")], s)
+    assert _main(run) == 0
+    d = layout.structures
+    assert (d / "P25815" / "2mjw_A.pdb").is_file()
+    expected = "UniProt ID\tPDB\tChain ID\tcif_accessions\nP25815\t2MJW\tA\tQ15109\n"
+    assert (d / "annotation_mismatch.tsv").read_text() == expected
+    assert (d / "failed.tsv").read_text() == "item\tstage\treason\n"
+    info = pd.read_csv(layout.protein_info, dtype=str, keep_default_na=False)
+    assert info.loc[info["PDB"] == "2MJW", "Chain ID"].tolist() == ["A"]
+    counts = json.loads((d / "manifest.json").read_text())["counts"]
+    assert (counts["chains_extracted"], counts["annotation_mismatch"], counts["failed"]) == (1, 1, 0)
+    assert _main(run) == 0                                     # rerun: same, from disk
+    assert (d / "annotation_mismatch.tsv").read_text() == expected
+    assert json.loads((d / "manifest.json").read_text())["counts"] == counts
+
+
+def test_rejected_chain_recorded_and_not_retried(tmp_path, monkeypatch):
+    reason = "chain has no ATOM records"
+    s = FakeSession(cifs={"2MJW": _cif_hetatm_only(_cif_2mjw(tmp_path).read_text())})
     run, layout = _setup(tmp_path, monkeypatch, [("P25815", "S100P_HUMAN", "2MJW")], s)
     assert _main(run) == 0
     d = layout.structures

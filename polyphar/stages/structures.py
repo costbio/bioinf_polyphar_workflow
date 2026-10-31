@@ -18,8 +18,10 @@ Outputs in 02_structures/:
   Protein_info.csv               one row per extracted chain / AlphaFold model
   unmapped.tsv                   UniProt ID, PDB, reason
   alphafold.tsv                  accession, status (found|missing), version
-  rejected.tsv                   chains rejected for good (cif annotation disagrees with
-                                 SIFTS, or no ATOM records); not retried on resume
+  annotation_mismatch.tsv        extracted chains whose cif depositor annotation (_struct_ref
+                                 UNP) names other accessions than SIFTS; a warning only
+  rejected.tsv                   chains rejected for good (not in the cif, or no ATOM
+                                 records); not retried on resume
   failed.tsv                     unmapped pairs and failed downloads/extractions
   manifest.json                  written last; SIFTS Last-Modified, AF versions
 """
@@ -216,8 +218,8 @@ def _header_text(cif) -> str:
 
 
 class ChainRejected(ValueError):
-    """The selected chain cannot be used, and retrying will not change that (the
-    cif's own UniProt annotation disagrees, or the chain has no ATOM records).
+    """The selected chain cannot be used, and retrying will not change that (it is
+    not in the cif, or it has no ATOM records).
     Recorded in rejected.tsv and failed.tsv; not retried on resume."""
 
 
@@ -272,21 +274,19 @@ def _chain_accessions(d) -> dict:
     return out
 
 
-def _verify(chain_accs, cif_name, chain, acc) -> str:
-    accs = chain_accs.get(chain)
+def _verify(chain_accs, chain, acc):
+    accs = sorted(chain_accs.get(chain, ()))
     if not accs:
-        return "unverified"      # no UniProt annotation for this chain (or the entry)
-    if _base_acc(acc) in accs:
-        return "verified"
-    raise ChainRejected(f"cif annotation does not map chain {chain} to {acc} "
-                        f"({cif_name}: {chain} -> {','.join(sorted(accs))})")
+        return "unverified", accs   # no UniProt annotation for this chain (or the entry)
+    return ("verified" if _base_acc(acc) in accs else "mismatch"), accs
 
 
-def verify_chain(cif, chain, acc) -> str:
-    """Cross-check a SIFTS-selected author chain against the cif's own UniProt
-    annotation. Returns "verified", or "unverified" when the cif has no UniProt
-    reference for that chain; raises ChainRejected when it names other proteins."""
-    return _verify(_chain_accessions(_cif_dict(cif)), Path(cif).name, chain, acc)
+def verify_chain(cif, chain, acc):
+    """Cross-check a SIFTS-selected author chain against the cif's own depositor
+    UniProt annotation. Returns (status, cif_accessions) with status "verified",
+    "unverified" (no UniProt reference for that chain) or "mismatch" (it names
+    other accessions). SIFTS stays the authority: a mismatch is only a warning."""
+    return _verify(_chain_accessions(_cif_dict(cif)), chain, acc)
 
 
 def cif_header(cif) -> dict:
@@ -433,9 +433,9 @@ def _pdb_job(d, acc, pdb, chain, session) -> dict:
     """Download, cross-check against the cif's own annotation, extract."""
     cif = download_mmcif(pdb, d / acc, session)
     cd = _cif_dict(cif)
-    status = _verify(_chain_accessions(cd), cif.name, chain, acc)
+    status, accs = _verify(_chain_accessions(cd), chain, acc)
     _write_chain(cif, chain, _chain_pdb(d, acc, pdb, chain))
-    return {**_header_from(cd), "cif_check": status}
+    return {**_header_from(cd), "cif_check": status, "cif_accessions": accs}
 
 
 def _run_pool(jobs, nprocs, progress, on_result, on_error):
@@ -538,7 +538,7 @@ def run(layout, args, progress) -> dict:
 
     _run_pool(jobs, args.nprocs, progress, on_result, on_error)
 
-    rows, af_versions, unverified = [], set(), 0
+    rows, af_versions, unverified, mismatches = [], set(), 0, []
     by_acc = {}
     for a, p, c, cov in selected.itertuples(index=False):
         by_acc.setdefault(a, []).append((p, c, cov))
@@ -550,15 +550,15 @@ def run(layout, args, progress) -> dict:
             cif = d / acc / f"{pdb.lower()}.cif"
             hdr = headers.get((acc, pdb))
             if hdr is None:            # extracted in an earlier run: re-read from the cif
-                hdr = {"Resolution": "-", "Structure method": "-", "cif_check": "unverified"}
+                hdr = {"Resolution": "-", "Structure method": "-", "cif_check": "unverified",
+                       "cif_accessions": []}
                 if _valid_cif(cif):
                     cd = _cif_dict(cif)
-                    try:
-                        status = _verify(_chain_accessions(cd), cif.name, chain, acc)
-                    except ChainRejected:
-                        status = "rejected"
-                    hdr = {**_header_from(cd), "cif_check": status}
+                    status, accs = _verify(_chain_accessions(cd), chain, acc)
+                    hdr = {**_header_from(cd), "cif_check": status, "cif_accessions": accs}
             unverified += hdr["cif_check"] == "unverified"
+            if hdr["cif_check"] == "mismatch":
+                mismatches.append((acc, pdb.upper(), chain, ",".join(hdr["cif_accessions"])))
             rows.append([acc, names[acc], pdb.upper(), chain, False, hdr["Resolution"],
                          hdr["Structure method"], cov, f"{STAGE_DIR}/{acc}/{out.name}"])
         af = _af_pdb(d, acc)
@@ -572,6 +572,8 @@ def run(layout, args, progress) -> dict:
     tmp = layout.protein_info.with_name(layout.protein_info.name + ".tmp")
     info.to_csv(tmp, index=False)
     os.replace(tmp, layout.protein_info)
+    _atomic_write(d / "annotation_mismatch.tsv", "UniProt ID\tPDB\tChain ID\tcif_accessions\n"
+                  + "".join("\t".join(m) + "\n" for m in mismatches))
     _atomic_write(af_log, "accession\tstatus\tversion\n" + "".join(
         f"{a}\t{s}\t{'' if v is None else v}\n" for a, (s, v) in sorted(af_state.items())))
 
@@ -584,6 +586,7 @@ def run(layout, args, progress) -> dict:
         "af_found": int(info["AlphaFold"].sum()) if len(info) else 0,
         "af_missing": sum(af_state.get(a, ("",))[0] == "missing" for a in accessions),
         "cif_unverified": unverified,
+        "annotation_mismatch": len(mismatches),
         "failed": failed,
     }
     versions = {"sifts_last_modified": last_modified,
