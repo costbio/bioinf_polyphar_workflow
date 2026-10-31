@@ -159,3 +159,20 @@ def test_nprocs_bad_env_is_clear_error_and_help_works(monkeypatch, capsys):
     with pytest.raises(SystemExit) as e:
         p.parse_args(["--help"])
     assert e.value.code == 0
+
+
+def test_git_commit_prefers_env_override(monkeypatch):
+    from polyphar.common import _git_commit
+
+    monkeypatch.setenv("POLYPHAR_GIT_COMMIT", "abc123def")
+    assert _git_commit() == "abc123def"
+
+
+def test_git_commit_ignores_empty_or_unknown_env(monkeypatch):
+    from polyphar.common import _git_commit
+
+    monkeypatch.setenv("POLYPHAR_GIT_COMMIT", "")
+    assert _git_commit() != ""
+    monkeypatch.setenv("POLYPHAR_GIT_COMMIT", "unknown")
+    # "unknown" (the image default) must not mask a real git lookup
+    assert _git_commit() != ""

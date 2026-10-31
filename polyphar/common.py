@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
 import sys
 import time
@@ -135,6 +136,11 @@ def append_failure(stage_dir, item, stage, reason) -> None:
 
 
 def _git_commit() -> str:
+    """Code revision: $POLYPHAR_GIT_COMMIT (baked into the docker image, which
+    has no .git) when set to a real value, else `git rev-parse HEAD`."""
+    env = os.environ.get("POLYPHAR_GIT_COMMIT", "").strip()
+    if env and env != "unknown":
+        return env
     repo = Path(__file__).resolve().parent
     try:
         out = subprocess.run(

@@ -12,3 +12,15 @@ The operations performed by each of them are described below:
 3. **fix_pdb.py** takes a directory path containing PDB files downloaded by **get_pdb_af.py**, fixes missing atoms in each PDB file using the pdbfixer library, and saves the fixed PDB files in the specified output directory.
 4. **get_pockets.py** performs pocket detection on protein structures prepared by **fix_pdb.py**, utilizing DoGSiteScorer 2, and generates a consolidated CSV file with the detected pockets.
 5. **get_PMsimilarities.py** receives the CSV file produced by **get_pockets.py**, computes similarity scores between each pair of pockets, and produces a CSV file, which is the final output of the workflow.
+
+## Docker image and wrapper
+
+Build the image from the repo root (the git commit is recorded in stage manifests):
+
+    docker build --build-arg POLYPHAR_GIT_COMMIT=$(git rev-parse HEAD) -f docker/Dockerfile -t polyphar:dev .
+
+Run any subcommand against a run folder (outputs are owned by you):
+
+    POLYPHAR_RUN_DIR=/path/to/run POLYPHAR_VERSION=dev bin/polyphar-docker ids --txt inputs/ids.txt
+
+The image contains no DoGSiteScorer and no credentials; Pushover settings are read from `$POLYPHAR_HOME/pushover.env` on the host. Tests: `pytest tests/test_docker.py` (needs the built `polyphar:dev` image).

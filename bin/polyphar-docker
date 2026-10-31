@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# Host wrapper: run the polyphar CLI in its docker image, writing into the run folder.
+#
+#   bin/polyphar-docker [polyphar args...]
+#
+# Environment:
+#   POLYPHAR_RUN_DIR      run folder on the host (default: current directory)
+#   POLYPHAR_HOME         calibration / pushover.env dir (default: ~/.polyphar)
+#   POLYPHAR_VERSION      image tag (default: latest)
+#   NPROCS                worker processes (passed through)
+#   POLYPHAR_DOCKER_OPTS  extra `docker run` options (word-split on purpose)
+#
+# The container runs in the foreground; for long runs use tmux or nohup.
+set -euo pipefail
+
+run_dir="$(realpath "${POLYPHAR_RUN_DIR:-$PWD}")"
+home_dir="${POLYPHAR_HOME:-$HOME/.polyphar}"
+mkdir -p "$home_dir"
+home_dir="$(realpath "$home_dir")"
+
+opts=(--rm --user "$(id -u):$(id -g)"
+      -v "$run_dir":/work
+      -v "$home_dir":/polyphar_home
+      -e NPROCS
+      -e POLYPHAR_RUN_NAME="$(basename "$run_dir")")
+if [ -f "$home_dir/pushover.env" ]; then
+    opts+=(--env-file "$home_dir/pushover.env")
+fi
+
+# TASK 8 HOOK: the DoGSiteScorer worker lifecycle (start bin/polyphar-dogsite-worker
+# for `pockets`, stop it via a trap on EXIT/INT/TERM) goes here; `exec` below
+# then becomes a plain call so the trap can fire.
+
+# shellcheck disable=SC2086  # POLYPHAR_DOCKER_OPTS is intentionally word-split
+exec docker run "${opts[@]}" ${POLYPHAR_DOCKER_OPTS:-} "polyphar:${POLYPHAR_VERSION:-latest}" "$@"
