@@ -1,6 +1,7 @@
 import json
 import os
 import shutil
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -184,10 +185,17 @@ def test_interrupt_propagates_and_leaves_no_partial(tmp_path, small_pdb_text):
     with pytest.raises(KeyboardInterrupt):
         fix.run(layout, _args(2), Boom())
     assert not (layout.pdbfixer / "manifest.json").exists()
-    assert not list(layout.pdbfixer.rglob("*.tmp"))
-    # every output present is complete, so a rerun skips it or redoes the rest
+    # An in-flight worker may still be writing its .tmp (atomic write: it only becomes an
+    # output on rename), so a transient .tmp is allowed. Wait for orphans to finish so the
+    # rerun does not race them; what matters is that no output is ever partial.
+    deadline = time.monotonic() + 30
+    while list(layout.pdbfixer.rglob("*.tmp")) and time.monotonic() < deadline:
+        time.sleep(0.1)
+    for out in layout.pdbfixer.rglob("*.pdb"):
+        assert len(_atoms(out)) > 100 and out.read_text().rstrip().endswith("END")
     counts = fix.run(layout, _args(2), Prog())
     assert counts["fixed"] + counts["skipped_existing"] == 4 and counts["failed"] == 0
+    assert not list(layout.pdbfixer.rglob("*.tmp"))
 
 
 def test_worker_crash_is_attributed_and_stage_continues(tmp_path, small_pdb_text, monkeypatch):
