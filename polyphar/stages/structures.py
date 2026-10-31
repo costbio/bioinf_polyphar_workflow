@@ -18,6 +18,8 @@ Outputs in 02_structures/:
   Protein_info.csv               one row per extracted chain / AlphaFold model
   unmapped.tsv                   UniProt ID, PDB, reason
   alphafold.tsv                  accession, status (found|missing), version
+  rejected.tsv                   chains rejected for good (cif annotation disagrees with
+                                 SIFTS, or no ATOM records); not retried on resume
   failed.tsv                     unmapped pairs and failed downloads/extractions
   manifest.json                  written last; SIFTS Last-Modified, AF versions
 """
@@ -213,11 +215,18 @@ def _header_text(cif) -> str:
     return "\n".join(out) + "\n"
 
 
-def cif_header(cif) -> dict:
-    """Resolution (float, or "-") and Structure method (`_exptl.method`, ';'-joined)."""
-    from Bio.PDB.MMCIF2Dict import MMCIF2Dict
+class ChainRejected(ValueError):
+    """The selected chain cannot be used, and retrying will not change that (the
+    cif's own UniProt annotation disagrees, or the chain has no ATOM records).
+    Recorded in rejected.tsv and failed.tsv; not retried on resume."""
 
-    d = MMCIF2Dict(io.StringIO(_header_text(cif)))
+
+def _cif_dict(cif):
+    from Bio.PDB.MMCIF2Dict import MMCIF2Dict
+    return MMCIF2Dict(io.StringIO(_header_text(cif)))
+
+
+def _header_from(d) -> dict:
     resolution = "-"
     for key in ("_refine.ls_d_res_high", "_refine_hist.d_res_high",
                 "_em_3d_reconstruction.resolution"):
@@ -233,21 +242,80 @@ def cif_header(cif) -> dict:
     return {"Resolution": resolution, "Structure method": ";".join(methods) or "-"}
 
 
-def extract_chain(cif, chain, out_pdb) -> dict:
-    """Write author chain `chain` of `cif` (all models) to `out_pdb`.
+def _base_acc(acc: str) -> str:
+    return acc.split("-")[0]       # P12345-2 (isoform) -> P12345
 
-    A multi-character chain ID is written as `A` (the PDB format has one column).
-    Returns cif_header(cif). Raises ValueError when the chain has no atoms."""
+
+def _chain_accessions(d) -> dict:
+    """author chain -> set of UniProt accessions, from the cif's own reference
+    annotation: _struct_ref (db_name UNP) joined to author chains through
+    _struct_ref_seq.pdbx_strand_id, or, when that loop is absent, through
+    _entity_poly.pdbx_strand_id. RCSB mmCIFs do not carry _pdbx_sifts_unp_segments."""
+    ref = {rid: (db, acc) for rid, db, acc in zip(
+        d.get("_struct_ref.id", []), d.get("_struct_ref.db_name", []),
+        d.get("_struct_ref.pdbx_db_accession", []))}
+    out = {}
+    if "_struct_ref_seq.ref_id" in d:
+        for rid, strand in zip(d["_struct_ref_seq.ref_id"],
+                               d.get("_struct_ref_seq.pdbx_strand_id", [])):
+            db, acc = ref.get(rid, (None, None))
+            if db == "UNP":
+                out.setdefault(strand, set()).add(_base_acc(acc))
+    else:
+        strands = {e: s.replace(" ", "").split(",") for e, s in zip(
+            d.get("_entity_poly.entity_id", []), d.get("_entity_poly.pdbx_strand_id", []))}
+        for rid, ent in zip(d.get("_struct_ref.id", []), d.get("_struct_ref.entity_id", [])):
+            db, acc = ref.get(rid, (None, None))
+            if db == "UNP":
+                for strand in strands.get(ent, []):
+                    out.setdefault(strand, set()).add(_base_acc(acc))
+    return out
+
+
+def _verify(chain_accs, cif_name, chain, acc) -> str:
+    accs = chain_accs.get(chain)
+    if not accs:
+        return "unverified"      # no UniProt annotation for this chain (or the entry)
+    if _base_acc(acc) in accs:
+        return "verified"
+    raise ChainRejected(f"cif annotation does not map chain {chain} to {acc} "
+                        f"({cif_name}: {chain} -> {','.join(sorted(accs))})")
+
+
+def verify_chain(cif, chain, acc) -> str:
+    """Cross-check a SIFTS-selected author chain against the cif's own UniProt
+    annotation. Returns "verified", or "unverified" when the cif has no UniProt
+    reference for that chain; raises ChainRejected when it names other proteins."""
+    return _verify(_chain_accessions(_cif_dict(cif)), Path(cif).name, chain, acc)
+
+
+def cif_header(cif) -> dict:
+    """Resolution (float, or "-") and Structure method (`_exptl.method`, ';'-joined)."""
+    return _header_from(_cif_dict(cif))
+
+
+def _write_chain(cif, chain, out_pdb) -> None:
     prody = _prody()
     out_pdb = Path(out_pdb)
     atoms = prody.parseMMCIF(str(cif), segment=chain)
     if atoms is None or atoms.numAtoms() == 0:
-        raise ValueError(f"chain {chain} not found in {Path(cif).name}")
+        raise ChainRejected(f"chain {chain} not found in {Path(cif).name}")
+    if atoms.getFlags("hetatm").all():
+        raise ChainRejected("chain has no ATOM records")
     atoms.setChids([chain if len(chain) == 1 else "A"] * atoms.numAtoms())
     tmp = out_pdb.with_name(out_pdb.name + ".tmp")
     with open(tmp, "w", encoding="utf-8") as fh:
         prody.writePDBStream(fh, atoms)
     os.replace(tmp, out_pdb)
+
+
+def extract_chain(cif, chain, out_pdb) -> dict:
+    """Write author chain `chain` of `cif` (all models) to `out_pdb`.
+
+    A multi-character chain ID is written as `A` (the PDB format has one column).
+    Returns cif_header(cif). Raises ChainRejected (a ValueError), writing nothing,
+    when the chain has no atoms or only HETATM records."""
+    _write_chain(cif, chain, out_pdb)
     return cif_header(cif)
 
 
@@ -327,6 +395,18 @@ def _read_af_state(d) -> dict:
     return state
 
 
+def _read_rejected(d) -> dict:
+    """(UniProt ID, PDB, Chain ID) -> reason for chains rejected in earlier runs."""
+    path = d / "rejected.tsv"
+    out = {}
+    if path.is_file():
+        for line in path.read_text(encoding="utf-8").splitlines()[1:]:
+            parts = line.split("\t")
+            if len(parts) == 4:
+                out[tuple(parts[:3])] = parts[3]
+    return out
+
+
 def _af_done(d, acc, state) -> bool:
     return _valid_af(_af_pdb(d, acc)) or state.get(acc, ("",))[0] == "missing"
 
@@ -337,8 +417,10 @@ def units(layout, args) -> WorkUnits:
     sifts_path = _local_sifts(d)
     if sifts_path is not None:
         selected, _ = select_chains(pairs, load_sifts(sifts_path))
-        n_pairs = sum(not _valid_pdb(_chain_pdb(d, a, p, c)) for a, p, c in
-                      zip(selected["UniProt ID"], selected["PDB"], selected["Chain ID"]))
+        rejected = _read_rejected(d)
+        n_pairs = sum(not _valid_pdb(_chain_pdb(d, a, p, c)) and (a, p, c) not in rejected
+                      for a, p, c in zip(selected["UniProt ID"], selected["PDB"],
+                                         selected["Chain ID"]))
     else:   # not mapped yet: a pair is done if any extracted chain of it exists
         n_pairs = sum(not any(_valid_pdb(f) for f in (d / a).glob(f"{p.lower()}_*.pdb"))
                       for a, p in zip(pairs["UniProt ID"], pairs["PDB"]))
@@ -348,8 +430,12 @@ def units(layout, args) -> WorkUnits:
 
 
 def _pdb_job(d, acc, pdb, chain, session) -> dict:
+    """Download, cross-check against the cif's own annotation, extract."""
     cif = download_mmcif(pdb, d / acc, session)
-    return extract_chain(cif, chain, _chain_pdb(d, acc, pdb, chain))
+    cd = _cif_dict(cif)
+    status = _verify(_chain_accessions(cd), cif.name, chain, acc)
+    _write_chain(cif, chain, _chain_pdb(d, acc, pdb, chain))
+    return {**_header_from(cd), "cif_check": status}
 
 
 def _run_pool(jobs, nprocs, progress, on_result, on_error):
@@ -414,14 +500,24 @@ def run(layout, args, progress) -> dict:
     if not af_log.is_file():
         _atomic_write(af_log, "accession\tstatus\tversion\n")
     headers, failed = {}, 0
-    jobs = [(("pdb", a, p), _pdb_job, (d, a, p, c, session))
-            for a, p, c, _ in selected.itertuples(index=False)
-            if not _valid_pdb(_chain_pdb(d, a, p, c))]
-    jobs += [(("af", a, None), fetch_alphafold, (a, d / a, session))
+    rejected = _read_rejected(d)
+    rejected_log = d / "rejected.tsv"
+    if not rejected_log.is_file():
+        _atomic_write(rejected_log, "UniProt ID\tPDB\tChain ID\treason\n")
+    jobs = []
+    for a, p, c, _ in selected.itertuples(index=False):
+        if _valid_pdb(_chain_pdb(d, a, p, c)):
+            continue
+        if (a, p, c) in rejected:      # deterministic: not retried, but still reported
+            failed += 1
+            append_failure(d, f"{a}/{p}", STAGE, f"ChainRejected: {rejected[(a, p, c)]}")
+            continue
+        jobs.append((("pdb", a, p, c), _pdb_job, (d, a, p, c, session)))
+    jobs += [(("af", a, None, None), fetch_alphafold, (a, d / a, session))
              for a in accessions if not _af_done(d, a, af_state)]
 
     def on_result(key, result):
-        kind, acc, pdb = key
+        kind, acc, pdb, _ = key
         if kind == "pdb":
             headers[(acc, pdb)] = result
         else:
@@ -432,13 +528,17 @@ def run(layout, args, progress) -> dict:
 
     def on_error(key, exc):
         nonlocal failed
-        kind, acc, pdb = key
+        kind, acc, pdb, chain = key
         failed += 1
+        if isinstance(exc, ChainRejected):
+            reason = str(exc).replace("\t", " ").replace("\n", " ")
+            with open(rejected_log, "a", encoding="utf-8") as fh:
+                fh.write(f"{acc}\t{pdb}\t{chain}\t{reason}\n")
         append_failure(d, f"{acc}/{pdb if kind == 'pdb' else 'AlphaFold'}", STAGE, _reason(exc))
 
     _run_pool(jobs, args.nprocs, progress, on_result, on_error)
 
-    rows, af_versions = [], set()
+    rows, af_versions, unverified = [], set(), 0
     by_acc = {}
     for a, p, c, cov in selected.itertuples(index=False):
         by_acc.setdefault(a, []).append((p, c, cov))
@@ -448,8 +548,17 @@ def run(layout, args, progress) -> dict:
             if not _valid_pdb(out):
                 continue
             cif = d / acc / f"{pdb.lower()}.cif"
-            hdr = headers.get((acc, pdb)) or (
-                cif_header(cif) if _valid_cif(cif) else {"Resolution": "-", "Structure method": "-"})
+            hdr = headers.get((acc, pdb))
+            if hdr is None:            # extracted in an earlier run: re-read from the cif
+                hdr = {"Resolution": "-", "Structure method": "-", "cif_check": "unverified"}
+                if _valid_cif(cif):
+                    cd = _cif_dict(cif)
+                    try:
+                        status = _verify(_chain_accessions(cd), cif.name, chain, acc)
+                    except ChainRejected:
+                        status = "rejected"
+                    hdr = {**_header_from(cd), "cif_check": status}
+            unverified += hdr["cif_check"] == "unverified"
             rows.append([acc, names[acc], pdb.upper(), chain, False, hdr["Resolution"],
                          hdr["Structure method"], cov, f"{STAGE_DIR}/{acc}/{out.name}"])
         af = _af_pdb(d, acc)
@@ -474,6 +583,7 @@ def run(layout, args, progress) -> dict:
         "unmapped": {r: int(reasons[r]) for r in sorted(reasons.index)},
         "af_found": int(info["AlphaFold"].sum()) if len(info) else 0,
         "af_missing": sum(af_state.get(a, ("",))[0] == "missing" for a in accessions),
+        "cif_unverified": unverified,
         "failed": failed,
     }
     versions = {"sifts_last_modified": last_modified,
