@@ -14,11 +14,15 @@
 set -euo pipefail
 
 run_dir="$(realpath "${POLYPHAR_RUN_DIR:-$PWD}")"
+if [ ! -d "$run_dir" ]; then
+    echo "polyphar-docker: run dir $run_dir does not exist" >&2
+    exit 2
+fi
 home_dir="${POLYPHAR_HOME:-$HOME/.polyphar}"
 mkdir -p "$home_dir"
 home_dir="$(realpath "$home_dir")"
 
-opts=(--rm --user "$(id -u):$(id -g)"
+opts=(--rm --init --user "$(id -u):$(id -g)"
       -v "$run_dir":/work
       -v "$home_dir":/polyphar_home
       -e NPROCS

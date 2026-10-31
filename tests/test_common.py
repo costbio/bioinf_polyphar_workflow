@@ -168,11 +168,14 @@ def test_git_commit_prefers_env_override(monkeypatch):
     assert _git_commit() == "abc123def"
 
 
-def test_git_commit_ignores_empty_or_unknown_env(monkeypatch):
-    from polyphar.common import _git_commit
+@pytest.mark.parametrize("value", ["", "unknown"])
+def test_git_commit_ignores_empty_or_unknown_env(monkeypatch, value):
+    import polyphar.common as common
 
-    monkeypatch.setenv("POLYPHAR_GIT_COMMIT", "")
-    assert _git_commit() != ""
-    monkeypatch.setenv("POLYPHAR_GIT_COMMIT", "unknown")
-    # "unknown" (the image default) must not mask a real git lookup
-    assert _git_commit() != ""
+    class Result:
+        returncode, stdout = 0, "feedface\n"
+
+    monkeypatch.setattr(common.subprocess, "run", lambda *a, **k: Result())
+    monkeypatch.setenv("POLYPHAR_GIT_COMMIT", value)
+    # falls through to the git lookup (sentinel), not "unknown"/empty
+    assert common._git_commit() == "feedface"

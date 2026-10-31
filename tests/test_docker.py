@@ -9,8 +9,6 @@ from pathlib import Path
 
 import pytest
 
-pytestmark = pytest.mark.docker
-
 REPO = Path(__file__).resolve().parent.parent
 IMAGE = "polyphar:dev"
 WRAPPER = REPO / "bin" / "polyphar-docker"
@@ -54,6 +52,7 @@ def _scores(text):
     return out
 
 
+@pytest.mark.docker
 def test_pocketmatch_reproduces_upstream_sample(image):
     run = _sh(image, UPSTREAM_PIPELINE)
     assert run.returncode == 0, run.stdout[-500:] + run.stderr
@@ -64,6 +63,7 @@ def test_pocketmatch_reproduces_upstream_sample(image):
     assert all(got[k] == ref[k] for k in ref), "Pmin/Pmax differ from upstream sample_outputs"
 
 
+@pytest.mark.docker
 def test_wrapper_writes_into_local_folder(image, tmp_path):
     (tmp_path / "inputs").mkdir()
     (tmp_path / "inputs" / "ids.txt").write_text("P25815\nQ05586\n")
@@ -78,6 +78,7 @@ def test_wrapper_writes_into_local_folder(image, tmp_path):
     assert out.read_text().split() == ["P25815", "Q05586"]
 
 
+@pytest.mark.docker
 def test_image_has_no_dogsite_or_credentials(image):
     r = _sh(image, "find / -xdev -iname 'dogsite*' -not -path '/proc/*' 2>/dev/null; "
                    "echo ---; env")
@@ -86,3 +87,14 @@ def test_image_has_no_dogsite_or_credentials(image):
     assert found.strip() == "", f"dogsite files in image: {found}"
     assert "PUSHOVER_" not in env
 
+
+
+def test_wrapper_rejects_missing_run_dir(tmp_path):
+    # Must fail before docker is invoked (no docker / image needed).
+    missing = tmp_path / "no_such_run"
+    env = {**os.environ, "POLYPHAR_RUN_DIR": str(missing), "POLYPHAR_HOME": str(tmp_path / "home"),
+           "PATH": "/usr/bin:/bin"}
+    r = subprocess.run([str(WRAPPER), "ids"], env=env, capture_output=True, text=True)
+    assert r.returncode == 2
+    assert r.stderr.strip() == f"polyphar-docker: run dir {missing} does not exist"
+    assert not missing.exists()

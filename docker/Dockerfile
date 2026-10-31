@@ -4,7 +4,6 @@
 # DoGSiteScorer and all credentials are deliberately NOT part of this image.
 FROM mambaorg/micromamba:2.3.2-debian12-slim
 
-ARG POLYPHAR_GIT_COMMIT=unknown
 ARG PM_COMMIT=4648bff3c4d233104c6d1f4ced351b5f7944972a
 
 USER root
@@ -41,6 +40,9 @@ COPY --chown=$MAMBA_USER:$MAMBA_USER pyproject.toml pytest.ini README.md /src/
 COPY --chown=$MAMBA_USER:$MAMBA_USER polyphar /src/polyphar
 COPY --chown=$MAMBA_USER:$MAMBA_USER tests /src/tests
 RUN /opt/conda/bin/pip install --no-cache-dir --no-deps /src
+
+# Declared last on purpose: a changing build arg must not invalidate earlier layers.
+ARG POLYPHAR_GIT_COMMIT=unknown
 
 # Runs as an arbitrary host uid (--user), so nothing may need a writable home.
 ENV PATH=/opt/conda/bin:$PATH \
