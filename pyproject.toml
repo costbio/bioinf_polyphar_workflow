@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "polyphar"
+version = "0.1.0"
+description = "Polypharmacology workflow: UniProt -> structures -> pockets -> similarity -> targets -> docking"
+requires-python = ">=3.12"
+
+[project.scripts]
+polyphar = "polyphar.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["polyphar*"]
