@@ -75,13 +75,8 @@ def test_dry_run_never_calls_run(gate, tmp_path, capsys):
     assert cli.main(_argv(tmp_path, "--dry-run")) == 0
     assert gate.events == ["units"]
     assert "fix: 3 units" in capsys.readouterr().out
-    assert [n[0] for n in gate.notes] == ["fix starting"]   # start notify still sent
+    assert gate.notes == []                                 # nothing starts: no push
     assert not (tmp_path / "run").exists()                  # nothing written
-
-
-def test_dry_run_no_notify(gate, tmp_path):
-    assert cli.main(_argv(tmp_path, "--dry-run", "--no-notify")) == 0
-    assert gate.notes == []
 
 
 def test_no_notify_suppresses_all_notifications(gate, tmp_path):
@@ -131,3 +126,44 @@ def test_calibrated_eta_line(gate, tmp_path, capsys):
     c.save()
     assert cli.main(_argv(tmp_path, "--dry-run", "--no-notify")) == 0
     assert "~15 min (finish" in capsys.readouterr().out
+
+
+def test_keyboard_interrupt_triggers_fail_and_reraises(gate, tmp_path):
+    def run(layout, args, progress):
+        raise KeyboardInterrupt
+
+    sys.modules["fake_gate_stage"].run = run
+    with pytest.raises(KeyboardInterrupt):
+        cli.main(_argv(tmp_path))
+    assert gate.events[-1] == "fail"
+    title, msg, prio = gate.notes[-1]
+    assert title == "fix FAILED" and prio == 1 and "KeyboardInterrupt" in msg
+
+
+def _subprocess_stage(tmp_path, body):
+    code = (
+        "import os, signal, sys, types\n"
+        "from polyphar import cli\n"
+        "from polyphar.common import WorkUnits\n"
+        "m = types.ModuleType('sig_stage')\n"
+        "m.units = lambda l, a: WorkUnits(1, 'x')\n"
+        f"def run(l, a, p):\n    {body}\n"
+        "m.run = run\n"
+        "sys.modules['sig_stage'] = m\n"
+        "cli.STAGES['fix'] = ('sig_stage', 'x')\n"
+        f"sys.exit(cli.main(['fix', '--run-dir', {str(tmp_path / 'run')!r}, '--no-notify']))\n"
+    )
+    return subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
+                          env={**__import__("os").environ, "POLYPHAR_HOME": str(tmp_path / "h")})
+
+
+def test_keyboard_interrupt_exits_nonzero_and_logs_failure(tmp_path):
+    r = _subprocess_stage(tmp_path, "raise KeyboardInterrupt")
+    assert r.returncode != 0
+    assert "FAILED: KeyboardInterrupt" in (tmp_path / "run" / "logs" / "fix.log").read_text()
+
+
+def test_sigterm_triggers_fail_and_exits_nonzero(tmp_path):
+    r = _subprocess_stage(tmp_path, "os.kill(os.getpid(), signal.SIGTERM); import time; time.sleep(5)")
+    assert r.returncode == 143
+    assert "FAILED: SystemExit" in (tmp_path / "run" / "logs" / "fix.log").read_text()

@@ -229,3 +229,57 @@ def test_progress_fail_priority_1_with_last_10_log_lines():
     lines = msg.splitlines()
     assert len(lines) == 10
     assert "RuntimeError: kaboom" in lines[-1]
+
+
+def test_calibration_entry_without_n_observations(tmp_path):
+    (tmp_path / "calibration.json").write_text(json.dumps({
+        "fix": {"seconds_per_unit": 2.0},
+        "dock": {"seconds_per_unit": 3.0, "n_observations": "many"},
+    }))
+    c = Calibration.load(tmp_path)
+    assert c.cost("fix") == 2.0 and c.cost("dock") == 3.0
+    c.update("fix", 4.0)                      # treated as 1 prior observation
+    assert c.cost("fix") == 3.0 and c.data["fix"]["n_observations"] == 2
+
+
+def test_calibration_update_survives_bad_in_memory_entry(tmp_path):
+    c = Calibration(tmp_path / "calibration.json", {"fix": {"seconds_per_unit": 2.0}})
+    c.update("fix", 4.0)
+    assert c.cost("fix") == 3.0
+
+
+def test_progress_done_succeeds_with_legacy_calibration_file(tmp_path):
+    (tmp_path / "calibration.json").write_text(
+        json.dumps({"fix": {"seconds_per_unit": 2.0}}))
+    clock = Clock()
+    p = Progress("fix", 4, Estimate(None, "x"), Rec(),
+                 calib=Calibration.load(tmp_path), slots=1.0, clock=clock)
+    clock.t = 8.0
+    p.advance(4)
+    p.done({"ok": 4})                          # must not raise
+    assert Calibration.load(tmp_path).cost("fix") == 2.0   # (2*1 + 2)/2
+
+
+def test_progress_done_never_raises_even_if_bookkeeping_breaks(tmp_path):
+    class Broken:
+        def update(self, *a):
+            raise KeyError("n_observations")
+
+    p = Progress("fix", 1, Estimate(None, "x"), Rec(), calib=Broken())
+    p.advance()
+    p.done({})                                 # logged warning, no exception
+    assert "bookkeeping failed" in p._recent[-1]
+
+
+def test_progress_size_mode_advance_without_size_uses_mean_unit_size(tmp_path):
+    rec, clock = Rec(), Clock()
+    calib = Calibration.load(tmp_path)
+    p = Progress("fix", 4, Estimate(None, "x"), rec, total_size=400.0,
+                 calib=calib, slots=1.0, clock=clock)
+    clock.t = 40.0
+    p.advance(2)                               # no size: 2 * (400/4) = 200 of 400
+    assert p.work_done == 200.0
+    assert [c[0] for c in rec.calls] == ["fix 5%", "fix 25%", "fix 50%"]
+    p.advance(2)
+    p.done({})
+    assert calib.cost("fix") == 40.0 / 400.0   # calibration no longer skipped

@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import importlib
 import os
+import signal
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -99,6 +100,18 @@ def _no_notify(title, message, priority=0):
     return False
 
 
+def _install_sigterm_handler():
+    """Turn SIGTERM into SystemExit(143) so an interrupted run (docker stop,
+    kill) unwinds through the failure notification. Returns the previous
+    handler, or None when it cannot be installed (not the main thread)."""
+    def handler(signum, frame):
+        raise SystemExit(128 + signum)
+    try:
+        return signal.signal(signal.SIGTERM, handler)
+    except ValueError:
+        return None
+
+
 def _run_gated(name, stage, layout, args) -> int:
     """ETA gate: units -> estimate -> print + notify start -> (dry-run exit) ->
     run with Progress -> done/fail."""
@@ -116,18 +129,22 @@ def _run_gated(name, stage, layout, args) -> int:
         def notifier(title, message, priority=0):
             return notify(title, message, priority, run_dir=layout.run_dir)
 
-        notifier(f"{name} starting", line)
     if args.dry_run:
-        return 0
+        return 0   # print the ETA only; nothing starts, nothing is notified
+    notifier(f"{name} starting", line)
     total_size = float(sum(units.sizes)) if units.sizes else None
     progress = Progress(name, units.count, est, notifier, total_size=total_size,
                         calib=calib, slots=slots_for(name, args.nprocs, tpj) or 1.0,
                         log_path=layout.logs / f"{name}.log")
+    previous = _install_sigterm_handler()
     try:
         counts = stage.run(layout, args, progress)
-    except Exception as exc:
+    except BaseException as exc:   # incl. KeyboardInterrupt / SIGTERM (docker stop)
         progress.fail(exc)
         raise
+    finally:
+        if previous is not None:
+            signal.signal(signal.SIGTERM, previous)
     progress.done(counts)
     return 0
 

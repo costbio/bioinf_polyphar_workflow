@@ -79,6 +79,9 @@ class Calibration:
             for stage, entry in raw.items():
                 c = entry.get("seconds_per_unit") if isinstance(entry, dict) else None
                 if isinstance(c, (int, float)) and math.isfinite(c) and c > 0:
+                    n = entry.get("n_observations")
+                    if not (isinstance(n, int) and not isinstance(n, bool) and n >= 1):
+                        entry = {**entry, "n_observations": 1}  # hand-edited / older file
                     data[stage] = entry
         except (OSError, ValueError, AttributeError):
             pass
@@ -95,7 +98,10 @@ class Calibration:
                 and math.isfinite(seconds_per_unit) and seconds_per_unit > 0):
             return
         old = self.data.get(stage)
-        n = int(old["n_observations"]) if old else 0
+        try:
+            n = max(1, int(old["n_observations"])) if old else 0
+        except (KeyError, TypeError, ValueError):
+            n = 1
         mean = (float(old["seconds_per_unit"]) * n + seconds_per_unit) / (n + 1) if old \
             else float(seconds_per_unit)
         self.data[stage] = {
@@ -222,7 +228,12 @@ class Progress:
     # -- API --
     def advance(self, n: int = 1, size: float | None = None) -> None:
         self.units_done += n
-        self.work_done += (size or 0.0) if self.total_size is not None else n
+        if self.total_size is None:
+            self.work_done += n
+        elif size is not None:
+            self.work_done += size
+        elif self.total > 0:   # no size given: assume the mean unit size
+            self.work_done += n * self.total_size / self.total
         total = self._work_total
         if total <= 0:
             return
@@ -242,7 +253,18 @@ class Progress:
             self._notify(f"{self.stage} {m:.0%}", msg)
 
     def done(self, counts: dict | None = None) -> None:
-        counts = counts or {}
+        """Post-stage bookkeeping. The stage already succeeded, so nothing here
+        may turn the run into a failure."""
+        try:
+            self._done(counts or {})
+        except Exception as exc:
+            try:
+                self._log(f"warning: post-run bookkeeping failed: "
+                          f"{type(exc).__name__}: {exc}")
+            except Exception:
+                pass
+
+    def _done(self, counts: dict) -> None:
         elapsed = self.clock() - self.t0
         failed = counts.get("failed", counts.get("failures", 0))
         est = ("n/a" if self.est.seconds is None
