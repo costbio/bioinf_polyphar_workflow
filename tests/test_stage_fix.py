@@ -190,6 +190,31 @@ def test_interrupt_propagates_and_leaves_no_partial(tmp_path, small_pdb_text):
     assert counts["fixed"] + counts["skipped_existing"] == 4 and counts["failed"] == 0
 
 
+def test_worker_crash_is_attributed_and_stage_continues(tmp_path, small_pdb_text, monkeypatch):
+    texts = {f"P25815/2mjw_{c}.pdb": small_pdb_text for c in "BCDE"}
+    layout = _setup(tmp_path, texts)
+    _write_info(layout, list(texts))
+    monkeypatch.setenv(fix._CRASH_ENV, "2mjw_C.pdb")   # inherited by spawned workers
+    prog = Prog()
+    counts = fix.run(layout, _args(2), prog)
+    assert counts == {"inputs": 4, "fixed": 3, "skipped_existing": 0, "failed": 1}
+    assert len(prog.calls) == 4
+    rows = (layout.pdbfixer / "failed.tsv").read_text().splitlines()
+    assert rows == ["item\tstage\treason", "P25815/2mjw_C.pdb\tfix\t" + fix.REASON_DIED]
+    for c in "BDE":
+        assert len(_atoms(layout.pdbfixer / "P25815" / f"2mjw_{c}.pdb")) > 100
+    assert not (layout.pdbfixer / "P25815" / "2mjw_C.pdb").exists()
+    assert not list(layout.pdbfixer.rglob("*.tmp"))
+    assert (layout.structures / "P25815" / "2mjw_C.pdb").read_text() == small_pdb_text
+    assert (layout.pdbfixer / "manifest.json").is_file()
+    assert fix.units(layout, _args()).count == 1   # a rerun only retries the crasher
+
+
+def test_worker_exception_crosses_process_boundary_as_message(tmp_path):
+    with pytest.raises(fix.FixError, match="^ValueError|^Exception|^\\w+Error"):
+        fix._worker(tmp_path / "missing.pdb", tmp_path, tmp_path / "out", 7.0)
+
+
 def test_missing_protein_info_is_clear(tmp_path):
     with pytest.raises(FileNotFoundError, match="polyphar structures"):
         fix.units(RunLayout(tmp_path), _args())
