@@ -38,8 +38,23 @@ def default_run_dir() -> str:
     return "/work" if Path("/work").is_dir() else os.getcwd()
 
 
-def default_nprocs() -> int:
-    return int(os.environ.get("NPROCS", 4))
+def default_nprocs() -> str:
+    """Raw default for --nprocs: $NPROCS if set and non-empty, else "4".
+
+    Returned as a string so argparse runs it through _nprocs_type at parse time:
+    a bad $NPROCS then gives a clear usage error, and --help still works."""
+    return os.environ.get("NPROCS") or "4"
+
+
+def _nprocs_type(value: str) -> int:
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        n = 0
+    if n < 1:
+        raise argparse.ArgumentTypeError(
+            f"must be an integer >= 1 (got {value!r}); check --nprocs and $NPROCS")
+    return n
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -51,7 +66,7 @@ def build_parser() -> argparse.ArgumentParser:
         p = sub.add_parser(name, help=help_text, description=help_text)
         p.add_argument("--run-dir", default=default_run_dir(),
                        help="run folder (default: /work if it exists, else cwd)")
-        p.add_argument("--nprocs", type=int, default=default_nprocs(),
+        p.add_argument("--nprocs", type=_nprocs_type, default=default_nprocs(),
                        help="worker processes (default: $NPROCS or 4)")
         p.add_argument("--dry-run", action="store_true",
                        help="print units and ETA, then exit")

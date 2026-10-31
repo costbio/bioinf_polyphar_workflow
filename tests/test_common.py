@@ -113,11 +113,12 @@ def test_cli_lists_subcommands():
         assert name in r.stdout
 
 
-def test_cli_unimplemented_exits_2():
-    from polyphar.cli import main
+def test_cli_unimplemented_exits_2(monkeypatch, capsys):
+    from polyphar import cli
 
-    assert main(["uniprot", "--no-notify"]) == 2
-    assert main(["ids", "--no-notify"]) == 2
+    monkeypatch.setitem(cli.STAGES, "uniprot", ("polyphar.stages._does_not_exist", "x"))
+    assert cli.main(["uniprot", "--no-notify"]) == 2
+    assert "not implemented" in capsys.readouterr().err
 
 
 def test_cli_common_flags(monkeypatch):
@@ -126,3 +127,35 @@ def test_cli_common_flags(monkeypatch):
     monkeypatch.setenv("NPROCS", "7")
     a = build_parser().parse_args(["uniprot", "--dry-run", "--no-notify"])
     assert a.nprocs == 7 and a.dry_run and a.no_notify
+
+
+def test_nprocs_default_and_empty_env(monkeypatch):
+    from polyphar.cli import build_parser
+
+    monkeypatch.delenv("NPROCS", raising=False)
+    assert build_parser().parse_args(["uniprot"]).nprocs == 4
+    monkeypatch.setenv("NPROCS", "")
+    assert build_parser().parse_args(["uniprot"]).nprocs == 4
+
+
+@pytest.mark.parametrize("bad", ["0", "-2", "abc"])
+def test_nprocs_flag_rejects_invalid(bad):
+    from polyphar.cli import build_parser
+
+    with pytest.raises(SystemExit) as e:
+        build_parser().parse_args(["uniprot", "--nprocs", bad])
+    assert e.value.code == 2
+
+
+def test_nprocs_bad_env_is_clear_error_and_help_works(monkeypatch, capsys):
+    from polyphar.cli import build_parser
+
+    monkeypatch.setenv("NPROCS", "0")
+    p = build_parser()  # must not raise
+    with pytest.raises(SystemExit) as e:
+        p.parse_args(["uniprot"])
+    assert e.value.code == 2
+    assert "NPROCS" in capsys.readouterr().err
+    with pytest.raises(SystemExit) as e:
+        p.parse_args(["--help"])
+    assert e.value.code == 0
