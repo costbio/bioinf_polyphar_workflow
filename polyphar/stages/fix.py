@@ -9,15 +9,18 @@ removing heterogens after adding hydrogens is unusual):
   findMissingResidues, findMissingAtoms, addMissingAtoms, addMissingHydrogens(pH),
   removeHeterogens(keepWater=False)
 
-Each output is written to `<out>.tmp` and renamed when complete, so a killed run never
-leaves a truncated file that looks done. A unit is done when its output exists and has
-ATOM records; a leftover `.tmp` is overwritten. Inputs are never modified or deleted;
+Each output is written to a unique temp file `<out>.<random>.tmp` in the same directory and
+renamed when complete, so a killed run never leaves a truncated file that looks done and
+concurrent writers never share a temp name. A unit is done when its output exists and has
+ATOM records. `*.tmp` files are ignored; those left by killed processes are harmless
+leftovers (they are not deleted: they may belong to a live process). Inputs are never modified or deleted;
 failures are listed in failed.tsv with the reason.
 """
 
 from __future__ import annotations
 
 import os
+import tempfile
 from pathlib import Path
 
 from polyphar.common import WorkUnits, append_failure, write_manifest
@@ -87,7 +90,10 @@ def fix_one(src, structures_dir, out_dir, ph: float = DEFAULT_PH) -> None:
     src = Path(src)
     out = _out_path(src, Path(structures_dir), Path(out_dir))
     out.parent.mkdir(parents=True, exist_ok=True)
-    tmp = out.with_name(out.name + ".tmp")
+    # A unique temp file in the output directory: an orphaned worker, a rerun or a second
+    # polyphar process on the same run folder never share a temp name.
+    fd, tmp_name = tempfile.mkstemp(dir=out.parent, prefix=out.name + ".", suffix=".tmp")
+    tmp = Path(tmp_name)
     try:
         fixer = PDBFixer(filename=str(src))
         fixer.findMissingResidues()
@@ -95,12 +101,16 @@ def fix_one(src, structures_dir, out_dir, ph: float = DEFAULT_PH) -> None:
         fixer.addMissingAtoms()
         fixer.addMissingHydrogens(ph)
         fixer.removeHeterogens(keepWater=False)
-        with open(tmp, "w") as fh:
+        with os.fdopen(fd, "w") as fh:
+            fd = None
             PDBFile.writeFile(fixer.topology, fixer.positions, fh)
         if not _done(tmp):
             raise ValueError("pdbfixer produced no ATOM records")
+        os.chmod(tmp, 0o644)   # mkstemp creates 0600
         os.replace(tmp, out)
     except BaseException:
+        if fd is not None:
+            os.close(fd)
         tmp.unlink(missing_ok=True)
         raise
 
@@ -188,8 +198,6 @@ def run(layout, args, progress) -> dict:
                 try:
                     ex.submit(_worker, src, layout.structures, d, ph).result()
                 except BrokenProcessPool:
-                    out = _out_path(src, layout.structures, d)
-                    out.with_name(out.name + ".tmp").unlink(missing_ok=True)
                     failures.append((item_of(src), REASON_DIED))
                 except Exception as exc:
                     failures.append((item_of(src), _reason(exc)))

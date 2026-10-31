@@ -1,4 +1,5 @@
 import json
+import multiprocessing
 import os
 import shutil
 import time
@@ -138,7 +139,7 @@ def test_resume_ignores_partial_tmp(tmp_path, small_pdb_text):
     assert prog.calls == [(1, in_c.stat().st_size)]
     assert len(_atoms(done)) == 1                     # completed output untouched
     assert len(_atoms(out_dir / "2mjw_C.pdb")) > 100  # leftover .tmp was redone
-    assert not stale.exists()
+    assert stale.read_text() == "ATOM      1  N   MET A   1 truncat"   # harmless leftover, ignored
 
 
 def test_empty_output_is_not_done(tmp_path, small_pdb_text):
@@ -185,17 +186,36 @@ def test_interrupt_propagates_and_leaves_no_partial(tmp_path, small_pdb_text):
     with pytest.raises(KeyboardInterrupt):
         fix.run(layout, _args(2), Boom())
     assert not (layout.pdbfixer / "manifest.json").exists()
-    # An in-flight worker may still be writing its .tmp (atomic write: it only becomes an
-    # output on rename), so a transient .tmp is allowed. Wait for orphans to finish so the
-    # rerun does not race them; what matters is that no output is ever partial.
-    deadline = time.monotonic() + 30
-    while list(layout.pdbfixer.rglob("*.tmp")) and time.monotonic() < deadline:
+    # Orphaned workers may still be running: wait (bounded, failing on expiry) for them to
+    # exit. Each cleans up its unique temp file or finishes and renames it.
+    deadline = time.monotonic() + 60
+    while multiprocessing.active_children() and time.monotonic() < deadline:
         time.sleep(0.1)
+    assert not multiprocessing.active_children(), "worker processes still alive after 60 s"
+    assert not list(layout.pdbfixer.rglob("*.tmp"))
     for out in layout.pdbfixer.rglob("*.pdb"):
         assert len(_atoms(out)) > 100 and out.read_text().rstrip().endswith("END")
     counts = fix.run(layout, _args(2), Prog())
     assert counts["fixed"] + counts["skipped_existing"] == 4 and counts["failed"] == 0
     assert not list(layout.pdbfixer.rglob("*.tmp"))
+
+
+def test_concurrent_fix_one_same_output(tmp_path, small_pdb_text):
+    from concurrent.futures import ThreadPoolExecutor
+
+    src = tmp_path / "02_structures" / "P25815" / "2mjw_B.pdb"
+    src.parent.mkdir(parents=True)
+    src.write_text(small_pdb_text)
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        futs = [ex.submit(fix_one, src, tmp_path / "02_structures", tmp_path / "out")
+                for _ in range(4)]
+        for f in futs:
+            f.result()   # none raises
+    outs = list((tmp_path / "out").rglob("*"))
+    assert [p.name for p in outs if p.is_file()] == ["2mjw_B.pdb"]
+    out = tmp_path / "out" / "P25815" / "2mjw_B.pdb"
+    assert len(_atoms(out)) > 100 and out.read_text().rstrip().endswith("END")
+    assert oct(out.stat().st_mode & 0o777) == "0o644"
 
 
 def test_worker_crash_is_attributed_and_stage_continues(tmp_path, small_pdb_text, monkeypatch):
