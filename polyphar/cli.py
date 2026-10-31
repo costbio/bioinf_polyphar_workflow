@@ -3,6 +3,7 @@
 Each subcommand is bound to a stage module in STAGES. A stage module exposes
     units(layout, args) -> WorkUnits
     run(layout, args, progress) -> dict
+and may define add_arguments(parser) to add stage-specific CLI options.
 To wire a new stage, add or change one line in STAGES; subcommands whose module
 does not exist yet print "not implemented" and exit 2.
 """
@@ -77,6 +78,9 @@ def build_parser() -> argparse.ArgumentParser:
                        help="print units and ETA, then exit")
         p.add_argument("--no-notify", action="store_true",
                        help="do not send notifications")
+        stage = _load_stage(name)
+        if stage is not None and hasattr(stage, "add_arguments"):
+            stage.add_arguments(p)   # optional hook: stage-specific options
     return parser
 
 
