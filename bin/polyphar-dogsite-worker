@@ -1,0 +1,516 @@
+#!/usr/bin/env python3
+"""Host-side DoGSiteScorer worker for polyphar.
+
+DoGSiteScorer is licensed for the host, so it never runs inside the polyphar container.
+`polyphar pockets` (in the container) writes job files into <run>/04_pockets/queue/;
+this script, run on the host, claims and runs them. It needs only Python >= 3.8 and its
+standard library (it does not import polyphar).
+
+Queue protocol (paths in job files are relative to the run folder):
+  <id>.job                    {"model": ..., "out": ..., "size": <bytes>}
+  <id>.running.<host>.<pid>   claimed by os.rename (atomic): no job is run twice
+  <id>.done                   {"exit": 0, "seconds": s, "dogsite_sha256": ...}
+  <id>.failed                 {"exit": n, "stderr_tail": ...}
+  WORKER.<host>.<pid>         heartbeat, touched every 30 s while the worker lives
+  CLOSED                      written by the container when every job is done or failed
+"""
+
+import argparse
+import concurrent.futures
+import hashlib
+import json
+import os
+import platform
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from datetime import datetime
+
+QUEUE_REL = os.path.join("04_pockets", "queue")
+POLL_S = 5.0
+HEARTBEAT_S = 30.0
+DOGSITE_FLAGS = ["-s", "-i", "-y", "-d", "-w", "4"]
+STDERR_TAIL = 2000
+HINT = "license/installation problem — see README §DoGSiteScorer"
+REPO = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+BENCH_DIR = os.path.join(REPO, "polyphar", "data", "bench")
+PREFLIGHT_MODEL = os.path.join(BENCH_DIR, "2mjw_B.pdb")
+
+EPILOG = """\
+modes:
+  default      run the jobs queued now, then exit
+  --watch      keep polling every 5 s for new jobs until queue/CLOSED exists
+               (bin/polyphar-docker starts the worker like this for `pockets` / `run`)
+  --benchmark  time DoGSiteScorer on the bench chains in polyphar/data/bench/ and store
+               pockets.seconds_per_unit (per byte, one process) in
+               $POLYPHAR_HOME/calibration.json (default ~/.polyphar); without
+               --run-dir nothing else is done
+
+Before claiming any job the worker runs the binary once on polyphar/data/bench/2mjw_B.pdb
+(preflight). If that fails it exits with status 3 and the binary's stderr, leaving every
+job queued.
+
+At start, claims of this host whose process is gone (.running.<host>.<dead pid>) are put
+back in the queue. On SIGTERM / SIGINT, running DoGSiteScorer processes are killed, their
+partial outputs removed and their jobs put back in the queue. Input files are never
+modified.
+
+exit status: 0 ok (failed jobs are recorded in <id>.failed), 2 usage error,
+             3 preflight / benchmark failure, 128+N killed by signal N
+"""
+
+
+class Stop(Exception):
+    """Raised in the main thread by SIGTERM / SIGINT."""
+
+    def __init__(self, signum):
+        Exception.__init__(self, signum)
+        self.signum = signum
+
+
+def _on_signal(signum, frame):
+    raise Stop(signum)
+
+
+def ignore_signals():
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+
+def log(msg):
+    sys.stdout.write("%s dogsite-worker: %s\n" % (datetime.now().strftime("%H:%M:%S"), msg))
+    sys.stdout.flush()
+
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def write_json(path, obj):
+    """Write through a unique temp name in the same directory + os.replace."""
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path),
+                               prefix="." + os.path.basename(path) + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as fh:
+            json.dump(obj, fh)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def unlink(path):
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+
+
+def pid_alive(pid):
+    if pid == os.getpid():
+        return False   # a claim with our pid is from an earlier process of the same pid
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def dogsite_cmd(dogsite, model, out):
+    return [dogsite, "-p", model] + DOGSITE_FLAGS + ["-o", out]
+
+
+def tail(text):
+    return text[-STDERR_TAIL:]
+
+
+# --- preflight / benchmark -------------------------------------------------------------
+
+def run_once(dogsite, model):
+    """Run DoGSiteScorer on `model` in a temp dir. Returns (ok, seconds, stderr)."""
+    tmpdir = tempfile.mkdtemp(prefix="polyphar-dogsite-")
+    try:
+        out = os.path.join(tmpdir, os.path.basename(model))
+        t0 = time.monotonic()
+        proc = subprocess.run(dogsite_cmd(dogsite, os.path.abspath(model), out), cwd=tmpdir,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              universal_newlines=True, errors="replace")
+        seconds = time.monotonic() - t0
+        ok = proc.returncode == 0 and os.path.isfile(out + "_desc.txt")
+        err = proc.stderr
+        if not ok and proc.returncode == 0:
+            err += "\n(exit 0 but no _desc.txt written)"
+        return ok, seconds, "exit %d: %s" % (proc.returncode, tail(err).strip())
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def preflight_failed(model, err):
+    sys.stderr.write("dogsite-worker: preflight on %s failed (%s)\n%s\n" % (model, err, HINT))
+    return 3
+
+
+def preflight(dogsite):
+    ok, seconds, err = run_once(dogsite, PREFLIGHT_MODEL)
+    if not ok:
+        return preflight_failed(PREFLIGHT_MODEL, err)
+    log("preflight ok (%.1f s on %s)" % (seconds, os.path.basename(PREFLIGHT_MODEL)))
+    return 0
+
+
+def polyphar_home():
+    return os.environ.get("POLYPHAR_HOME") or os.path.join(os.path.expanduser("~"), ".polyphar")
+
+
+def cpu_model():
+    """Same as polyphar.eta._cpu_model."""
+    try:
+        with open("/proc/cpuinfo", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if line.lower().startswith("model name"):
+                    return line.split(":", 1)[1].strip()
+    except OSError:
+        pass
+    return platform.processor() or platform.machine() or "unknown"
+
+
+def save_calibration(seconds_per_unit):
+    """Fold one measurement into calibration.json's `pockets` entry, in the schema of
+    polyphar.eta.Calibration (running mean); other entries are kept."""
+    home = polyphar_home()
+    os.makedirs(home, exist_ok=True)
+    path = os.path.join(home, "calibration.json")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        if not isinstance(data, dict):
+            data = {}
+    except (OSError, ValueError):
+        data = {}
+    old = data.get("pockets")
+    n, mean = 0, float(seconds_per_unit)
+    if isinstance(old, dict):
+        try:
+            prev = float(old["seconds_per_unit"])
+            if prev > 0:
+                try:
+                    n = max(1, int(old.get("n_observations", 1)))
+                except (TypeError, ValueError):
+                    n = 1
+                mean = (prev * n + seconds_per_unit) / (n + 1)
+        except (KeyError, TypeError, ValueError):
+            n = 0
+    data["pockets"] = {
+        "seconds_per_unit": mean,
+        "n_observations": n + 1,
+        "nproc": os.cpu_count(),
+        "cpu_model": cpu_model(),
+        "updated": datetime.now().astimezone().isoformat(timespec="seconds"),
+    }
+    fd, tmp = tempfile.mkstemp(dir=home, prefix=".calibration.json.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(data, indent=2, sort_keys=True) + "\n")
+        os.replace(tmp, path)
+    except BaseException:
+        unlink(tmp)
+        raise
+    return path, data["pockets"]
+
+
+def benchmark(dogsite):
+    """Time DoGSiteScorer (one process) on every bench chain; store seconds per byte."""
+    models = sorted(os.path.join(BENCH_DIR, f) for f in os.listdir(BENCH_DIR)
+                    if f.endswith(".pdb"))
+    total_s = total_b = 0.0
+    for model in models:
+        ok, seconds, err = run_once(dogsite, model)
+        if not ok:
+            return preflight_failed(model, err)
+        size = os.path.getsize(model)
+        log("benchmark %s: %.2f s for %d bytes" % (os.path.basename(model), seconds, size))
+        total_s += seconds
+        total_b += size
+    path, entry = save_calibration(total_s / total_b)
+    log("pockets calibrated: %.3g s per byte -> %s" % (entry["seconds_per_unit"], path))
+    return 0
+
+
+# --- the queue --------------------------------------------------------------------------
+
+class Worker:
+    def __init__(self, run_dir, dogsite, nprocs, watch):
+        self.run_dir = os.path.realpath(run_dir)
+        self.qdir = os.path.join(self.run_dir, QUEUE_REL)
+        self.dogsite = dogsite
+        self.sha = sha256_file(dogsite)
+        self.nprocs = nprocs
+        self.watch = watch
+        self.host = socket.gethostname()
+        self.pid = os.getpid()
+        self.tag = "%s.%d" % (self.host, self.pid)
+        self.heartbeat = os.path.join(self.qdir, "WORKER." + self.tag)
+        self.lock = threading.Lock()
+        self.procs = {}          # job id -> Popen, while DoGSiteScorer runs
+        self.stopping = False
+
+    # -- paths --
+    def resolve(self, rel):
+        """Run-folder-relative path from a job file -> host path; never outside."""
+        if not isinstance(rel, str) or not rel or os.path.isabs(rel):
+            raise ValueError("path %r is outside the run folder" % (rel,))
+        path = os.path.normpath(os.path.join(self.run_dir, rel))
+        if not path.startswith(self.run_dir + os.sep):
+            raise ValueError("path %r is outside the run folder" % (rel,))
+        return path
+
+    def q(self, name):
+        return os.path.join(self.qdir, name)
+
+    def touch_heartbeat(self):
+        with open(self.heartbeat, "a"):
+            pass
+        os.utime(self.heartbeat, None)
+
+    # -- claims --
+    def reclaim_stale(self):
+        """Put back claims of this host whose process is gone; drop dead heartbeats."""
+        for name in os.listdir(self.qdir):
+            if name.startswith("WORKER."):
+                host, _, pid = name[len("WORKER."):].rpartition(".")
+                if host == self.host and pid.isdigit() and not pid_alive(int(pid)):
+                    unlink(self.q(name))
+                continue
+            if ".running." not in name:
+                continue
+            jid, rest = name.split(".running.", 1)
+            host, _, pid = rest.rpartition(".")
+            if host != self.host or not pid.isdigit() or pid_alive(int(pid)):
+                continue
+            self.unclaim(jid, name)
+            log("reclaimed stale claim %s" % name)
+
+    def unclaim(self, jid, running_name):
+        """Running job back to the queue (or dropped, when it already has a result)."""
+        if os.path.exists(self.q(jid + ".done")) or os.path.exists(self.q(jid + ".failed")):
+            unlink(self.q(running_name))
+            return
+        try:
+            with open(self.q(running_name)) as fh:
+                out = self.resolve(json.load(fh)["out"])
+            unlink(out + "_desc.txt")   # an unconfirmed run's output must not look done
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+        try:
+            os.rename(self.q(running_name), self.q(jid + ".job"))
+        except FileNotFoundError:
+            pass
+
+    def claim_next(self):
+        for name in sorted(os.listdir(self.qdir)):
+            if not name.endswith(".job") or name.startswith("."):
+                continue
+            jid = name[:-len(".job")]
+            running = "%s.running.%s" % (jid, self.tag)
+            try:
+                os.rename(self.q(name), self.q(running))
+            except FileNotFoundError:
+                continue   # another worker was faster
+            return jid, running
+        return None
+
+    # -- one job (in a pool thread) --
+    def run_job(self, jid, running):
+        try:
+            with open(self.q(running)) as fh:
+                spec = json.load(fh)
+            model = self.resolve(spec["model"])
+            out = self.resolve(spec["out"])
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            self.finish(jid, running, ".failed", {"exit": -1, "stderr_tail": "bad job: %s" % exc})
+            return
+        outdir = os.path.dirname(out)
+        os.makedirs(outdir, exist_ok=True)
+        desc = out + "_desc.txt"
+        unlink(desc)                    # the desc file is the done marker: start clean
+        t0 = time.monotonic()
+        with self.lock:
+            if self.stopping:
+                return
+            try:
+                proc = subprocess.Popen(dogsite_cmd(self.dogsite, model, out), cwd=outdir,
+                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                        universal_newlines=True, errors="replace",
+                                        start_new_session=True)
+            except OSError as exc:
+                self.finish(jid, running, ".failed",
+                            {"exit": -1, "stderr_tail": "cannot start DoGSiteScorer: %s" % exc})
+                return
+            self.procs[jid] = proc
+        try:
+            _, err = proc.communicate()
+        finally:
+            with self.lock:
+                self.procs.pop(jid, None)
+        seconds = time.monotonic() - t0
+        if proc.returncode == 0 and os.path.isfile(desc):
+            self.finish(jid, running, ".done",
+                        {"exit": 0, "seconds": round(seconds, 3), "dogsite_sha256": self.sha})
+            log("done %s (%.1f s)" % (jid, seconds))
+            return
+        if self.stopping:
+            return   # killed by us: unclaimed by the main thread
+        unlink(desc)
+        if proc.returncode == 0:
+            err += "\n(exit 0 but no %s written)" % os.path.basename(desc)
+        self.finish(jid, running, ".failed", {"exit": proc.returncode, "stderr_tail": tail(err)})
+        log("FAILED %s (exit %d)" % (jid, proc.returncode))
+
+    def finish(self, jid, running, suffix, obj):
+        write_json(self.q(jid + suffix), obj)
+        unlink(self.q(running))
+
+    def kill_all(self):
+        with self.lock:
+            self.stopping = True
+            procs = list(self.procs.values())
+        for p in procs:
+            try:
+                os.killpg(p.pid, signal.SIGTERM)
+            except OSError:
+                pass
+        deadline = time.monotonic() + 10
+        for p in procs:
+            try:
+                p.wait(max(0.1, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(p.pid, signal.SIGKILL)
+                except OSError:
+                    pass
+
+    # -- main loop --
+    def loop(self):
+        inflight = set()
+        last_beat = 0.0
+        with concurrent.futures.ThreadPoolExecutor(max_workers=self.nprocs) as ex:
+            try:
+                while True:
+                    now = time.monotonic()
+                    if now - last_beat >= HEARTBEAT_S:
+                        self.touch_heartbeat()
+                        last_beat = now
+                    exhausted = False
+                    while len(inflight) < self.nprocs:
+                        c = self.claim_next()
+                        if c is None:
+                            exhausted = True
+                            break
+                        inflight.add(ex.submit(self.run_job, *c))
+                    if inflight:
+                        finished, inflight = concurrent.futures.wait(
+                            inflight, timeout=1.0,
+                            return_when=concurrent.futures.FIRST_COMPLETED)
+                        for f in finished:
+                            f.result()   # run_job handles DoGSiteScorer failures itself
+                        continue
+                    if exhausted and not self.watch:
+                        return
+                    if os.path.exists(self.q("CLOSED")):
+                        log("queue closed")
+                        return
+                    time.sleep(POLL_S)
+            except BaseException:
+                ignore_signals()   # finish the cleanup even if signalled again
+                self.kill_all()
+                raise
+
+    def unclaim_own(self):
+        suffix = ".running." + self.tag
+        for name in os.listdir(self.qdir):
+            if name.endswith(suffix):
+                self.unclaim(name[:-len(suffix)], name)
+
+    def serve(self):
+        os.makedirs(self.qdir, exist_ok=True)
+        self.reclaim_stale()
+        self.touch_heartbeat()
+        try:
+            self.loop()
+        finally:
+            self.unclaim_own()
+            unlink(self.heartbeat)
+        return 0
+
+
+def find_binary(value):
+    if not value:
+        return None
+    if os.sep not in value:
+        value = shutil.which(value) or value
+    value = os.path.abspath(value)
+    return value if os.path.isfile(value) and os.access(value, os.X_OK) else None
+
+
+def parse_args(argv):
+    p = argparse.ArgumentParser(
+        prog="polyphar-dogsite-worker",
+        description="Run the DoGSiteScorer jobs that `polyphar pockets` queues in "
+                    "<run>/04_pockets/queue/ (host side; Python >= 3.8, stdlib only).",
+        epilog=EPILOG, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--run-dir", help="the run folder on this host (required unless "
+                                     "only --benchmark)")
+    p.add_argument("--dogsite", default=os.environ.get("DOGSITE_BIN"),
+                   help="DoGSiteScorer binary (default: $DOGSITE_BIN)")
+    p.add_argument("--nprocs", type=int, default=4,
+                   help="DoGSiteScorer processes at a time (default: 4)")
+    p.add_argument("--watch", action="store_true",
+                   help="keep polling for jobs until queue/CLOSED exists")
+    p.add_argument("--benchmark", action="store_true",
+                   help="calibrate pockets in $POLYPHAR_HOME/calibration.json")
+    args = p.parse_args(argv)
+    if args.nprocs < 1:
+        p.error("--nprocs must be >= 1")
+    if not args.run_dir and not args.benchmark:
+        p.error("--run-dir is required (unless --benchmark)")
+    if args.run_dir and not os.path.isdir(args.run_dir):
+        p.error("run dir %s does not exist" % args.run_dir)
+    binary = find_binary(args.dogsite)
+    if binary is None:
+        p.error("DoGSiteScorer binary %r not found or not executable (--dogsite or "
+                "$DOGSITE_BIN)" % (args.dogsite,))
+    args.dogsite = binary
+    return args
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    signal.signal(signal.SIGTERM, _on_signal)
+    if signal.getsignal(signal.SIGINT) is not signal.SIG_IGN:
+        signal.signal(signal.SIGINT, _on_signal)
+    try:
+        status = benchmark(args.dogsite) if args.benchmark else preflight(args.dogsite)
+        if status != 0 or not args.run_dir:
+            return status
+        return Worker(args.run_dir, args.dogsite, args.nprocs, args.watch).serve()
+    except Stop as stop:
+        log("stopped by signal %d" % stop.signum)
+        return 128 + stop.signum
+
+
+if __name__ == "__main__":
+    sys.exit(main())

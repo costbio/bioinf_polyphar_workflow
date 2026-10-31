@@ -1,0 +1,53 @@
+#!/usr/bin/env python3
+"""Stand-in for the DoGSiteScorer binary (tests and local end-to-end runs only).
+
+    fake_dogsite -p <model> [other flags...] -o <out>
+
+Writes <out>_desc.txt (the real net2 descriptor row of pocket P_1 of P53350 4rcp_A,
+drugScore 0.69) and <out>_res_P_1.pdb (that real pocket's residue file), both copied
+from fake_dogsite_data/ next to this script.
+
+  * exits 3 when the model's file name contains FAIL
+  * sleeps $FAKE_DOGSITE_SLEEP seconds first, when set
+  * appends the model path to $FAKE_DOGSITE_LOG, when set (one line per call)
+"""
+import os
+import shutil
+import sys
+import time
+
+DATA = os.path.join(os.path.dirname(os.path.realpath(__file__)), "fake_dogsite_data")
+
+
+def _value(flag):
+    args = sys.argv[1:]
+    if flag not in args or args.index(flag) + 1 >= len(args):
+        sys.exit(f"fake_dogsite: missing {flag} <path>")
+    return args[args.index(flag) + 1]
+
+
+def main():
+    model, out = _value("-p"), _value("-o")
+    log = os.environ.get("FAKE_DOGSITE_LOG")
+    if log:
+        fd = os.open(log, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        try:
+            os.write(fd, (model + "\n").encode())
+        finally:
+            os.close(fd)
+    if "FAIL" in os.path.basename(model):
+        print(f"fake_dogsite: FAIL requested by model name {model}", file=sys.stderr)
+        return 3
+    if os.environ.get("FAKE_DOGSITE_SLEEP"):
+        time.sleep(float(os.environ["FAKE_DOGSITE_SLEEP"]))
+    if not os.path.isfile(model):
+        print(f"fake_dogsite: no such model {model}", file=sys.stderr)
+        return 2
+    shutil.copyfile(os.path.join(DATA, "res_P_1.pdb"), out + "_res_P_1.pdb")
+    shutil.copyfile(os.path.join(DATA, "desc.txt"), out + "_desc.txt")
+    print(f"fake_dogsite: 1 pocket for {model}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

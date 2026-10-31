@@ -13,3 +13,6 @@ polyphar = "polyphar.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["polyphar*"]
+
+[tool.setuptools.package-data]
+polyphar = ["data/bench/*"]

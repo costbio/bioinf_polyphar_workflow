@@ -1,0 +1,2 @@
+name	lig_cov	poc_cov	lig_name	4A_crit	volume	hull	surface	lid	depth	surf/vol	lid/hull	ellVol	ell c/a	ell b/a	siteAtms	accept	donor	aromat	hydrophobicity	metal	Cs	Ns	Os	Ss	Xs	negAA	posAA	polarAA	apolarAA	sumAA	ALA	ARG	ASN	ASP	CSO	CYS	GLN	GLU	GLY	HIS	ILE	LEU	LYS	MET	PHE	PRO	SER	THR	TRP	TYR	VAL	A	C	G	U	I	N	DA	DC	DG	DT	DN	UNK	simpleScore	drugScore
+P_1	0	0		0	605.376	673.6	548.48	125.12	15.3935	0.362406	0.185748	1652.74	0.19742	0.370808	115	16	19	17	0.695652	0	80	19	16	0	0	3	5	5	11	24	2	1	2	2	0	0	0	1	1	1	2	2	3	0	3	0	1	1	1	0	1	0	0	0	0	0	0	0	0	0	0	0	0	0.477211	0.690001
