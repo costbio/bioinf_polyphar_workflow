@@ -15,7 +15,10 @@ Outputs in 02_structures/:
   <UniProt>/{pdb}_{chain}.pdb    extracted author chain, all models
   <UniProt>/AF-<acc>-F1.pdb      AlphaFold DB model (F1 only, no PAE json)
   sifts/                         pdb_chain_uniprot.tsv.gz + last_modified.txt
-  Protein_info.csv               one row per extracted chain / AlphaFold model
+  Protein_info.csv               one row per extracted chain / AlphaFold model, rebuilt
+                                 from the current uniprot.csv on every run; columns
+                                 INFO_COLUMNS, incl. SIFTS segments / SIFTS other accessions
+                                 (select_chains) for fusion-chain pocket filtering
   unmapped.tsv                   UniProt ID, PDB, reason
   alphafold.tsv                  accession, status (found|missing), version
   annotation_mismatch.tsv        extracted chains whose cif depositor annotation (_struct_ref
@@ -51,7 +54,8 @@ MAX_WORKERS = 8
 REASON_NO_CHAIN = "no SIFTS chain for accession"
 REASON_NO_PDB = "PDB absent from SIFTS"
 INFO_COLUMNS = ["UniProt ID", "Gene Name", "PDB", "Chain ID", "AlphaFold", "Resolution",
-                "Structure method", "SIFTS coverage", "File"]
+                "Structure method", "SIFTS coverage", "File", "SIFTS segments",
+                "SIFTS other accessions"]
 PDB_RECORDS = ("HEADER", "OBSLTE", "TITLE ", "SPLIT ", "CAVEAT", "COMPND", "SOURCE",
                "KEYWDS", "EXPDTA", "NUMMDL", "MDLTYP", "AUTHOR", "REVDAT", "SPRSDE",
                "JRNL  ", "REMARK", "DBREF", "SEQADV", "SEQRES", "MODRES", "HET   ",
@@ -146,19 +150,31 @@ def load_sifts(path):
     return pd.read_csv(path, sep="\t", header=1, dtype=str, keep_default_na=False)
 
 
+SEL_COLUMNS = ["UniProt ID", "PDB", "Chain ID", "SP coverage", "SIFTS segments",
+               "SIFTS other accessions"]
+
+
 def select_chains(pairs, sifts):
     """Pick one author chain per (UniProt ID, PDB) pair.
 
-    Returns (selected[UniProt ID, PDB, Chain ID, SP coverage],
-             unmapped[UniProt ID, PDB, reason]). SP coverage is the number of
-    UniProt residues the chain covers (sum of SP_END - SP_BEG + 1 over its
-    segments); the largest wins, ties go to the smallest chain ID."""
+    Returns (selected[UniProt ID, PDB, Chain ID, SP coverage, SIFTS segments,
+    SIFTS other accessions], unmapped[UniProt ID, PDB, reason]). SP coverage is the number
+    of UniProt residues the chain covers (sum of SP_END - SP_BEG + 1 over its segments);
+    the largest wins, ties go to the smallest chain ID. SIFTS segments are this accession's
+    segments on the chosen chain in author numbering, `PDB_BEG:PDB_END` joined by ';' in
+    SIFTS order (a bound SIFTS leaves empty or None, e.g. an unobserved end, is kept as
+    given). SIFTS other accessions are the other SP_PRIMARY accessions SIFTS maps to the
+    same chain (';'-joined, sorted; empty for a single-protein chain): a fusion/chimeric
+    construct whose pockets the pockets stage checks against the segments."""
     import pandas as pd
 
     accs = set(pairs["UniProt ID"])
     pdbs = {p.lower() for p in pairs["PDB"]}
     s = sifts[sifts["PDB"].isin(pdbs)].copy()
     present = set(s["PDB"])
+    on_chain = {}   # (pdb, chain) -> every accession SIFTS maps to that chain
+    for pdb, chain, acc in zip(s["PDB"], s["CHAIN"], s["SP_PRIMARY"]):
+        on_chain.setdefault((pdb, chain), set()).add(acc)
     s = s[s["SP_PRIMARY"].isin(accs)]
     beg = pd.to_numeric(s["SP_BEG"], errors="coerce")
     end = pd.to_numeric(s["SP_END"], errors="coerce")
@@ -167,6 +183,10 @@ def select_chains(pairs, sifts):
     chains = {}
     for (pdb, acc, chain), c in cov.items():
         chains.setdefault((pdb, acc), []).append((chain, int(c)))
+    segments = {}
+    for pdb, chain, acc, b, e in zip(s["PDB"], s["CHAIN"], s["SP_PRIMARY"], s["PDB_BEG"],
+                                     s["PDB_END"]):
+        segments.setdefault((pdb, chain, acc), []).append(f"{b.strip()}:{e.strip()}")
 
     selected, unmapped = [], []
     for acc, pdb in zip(pairs["UniProt ID"], pairs["PDB"]):
@@ -177,8 +197,11 @@ def select_chains(pairs, sifts):
             unmapped.append((acc, pdb, REASON_NO_CHAIN))
         else:
             chain, c = min(chains[key], key=lambda t: (-t[1], t[0]))
-            selected.append((acc, pdb, chain, c))
-    return (pd.DataFrame(selected, columns=["UniProt ID", "PDB", "Chain ID", "SP coverage"]),
+            others = sorted(on_chain.get((key[0], chain), set()) - {acc})
+            selected.append((acc, pdb, chain, c,
+                             ";".join(segments.get((key[0], chain, acc), [])),
+                             ";".join(others)))
+    return (pd.DataFrame(selected, columns=SEL_COLUMNS),
             pd.DataFrame(unmapped, columns=["UniProt ID", "PDB", "reason"]))
 
 
@@ -505,7 +528,7 @@ def run(layout, args, progress) -> dict:
     if not rejected_log.is_file():
         _atomic_write(rejected_log, "UniProt ID\tPDB\tChain ID\treason\n")
     jobs = []
-    for a, p, c, _ in selected.itertuples(index=False):
+    for a, p, c, *_ in selected.itertuples(index=False):
         if _valid_pdb(_chain_pdb(d, a, p, c)):
             continue
         if (a, p, c) in rejected:      # deterministic: not retried, but still reported
@@ -540,10 +563,10 @@ def run(layout, args, progress) -> dict:
 
     rows, af_versions, unverified, mismatches = [], set(), 0, []
     by_acc = {}
-    for a, p, c, cov in selected.itertuples(index=False):
-        by_acc.setdefault(a, []).append((p, c, cov))
+    for a, p, c, cov, segs, others in selected.itertuples(index=False):
+        by_acc.setdefault(a, []).append((p, c, cov, segs, others))
     for acc in accessions:
-        for pdb, chain, cov in by_acc.get(acc, []):
+        for pdb, chain, cov, segs, others in by_acc.get(acc, []):
             out = _chain_pdb(d, acc, pdb, chain)
             if not _valid_pdb(out):
                 continue
@@ -560,11 +583,12 @@ def run(layout, args, progress) -> dict:
             if hdr["cif_check"] == "mismatch":
                 mismatches.append((acc, pdb.upper(), chain, ",".join(hdr["cif_accessions"])))
             rows.append([acc, names[acc], pdb.upper(), chain, False, hdr["Resolution"],
-                         hdr["Structure method"], cov, f"{STAGE_DIR}/{acc}/{out.name}"])
+                         hdr["Structure method"], cov, f"{STAGE_DIR}/{acc}/{out.name}",
+                         segs, others])
         af = _af_pdb(d, acc)
         if _valid_af(af):
             rows.append([acc, names[acc], "-", "A", True, "-", "-", "-",
-                         f"{STAGE_DIR}/{acc}/{af.name}"])
+                         f"{STAGE_DIR}/{acc}/{af.name}", "", ""])
             version = af_state.get(acc, ("", None))[1]
             if version is not None:
                 af_versions.add(version)
@@ -574,8 +598,10 @@ def run(layout, args, progress) -> dict:
     os.replace(tmp, layout.protein_info)
     _atomic_write(d / "annotation_mismatch.tsv", "UniProt ID\tPDB\tChain ID\tcif_accessions\n"
                   + "".join("\t".join(m) + "\n" for m in mismatches))
+    current = set(accessions)   # tables describe the current uniprot.csv only
     _atomic_write(af_log, "accession\tstatus\tversion\n" + "".join(
-        f"{a}\t{s}\t{'' if v is None else v}\n" for a, (s, v) in sorted(af_state.items())))
+        f"{a}\t{s}\t{'' if v is None else v}\n" for a, (s, v) in sorted(af_state.items())
+        if a in current))
 
     reasons = unmapped["reason"].value_counts()
     counts = {
@@ -583,6 +609,7 @@ def run(layout, args, progress) -> dict:
         "pdb_entries_listed": len(pairs),
         "chains_extracted": int((~info["AlphaFold"]).sum()) if len(info) else 0,
         "unmapped": {r: int(reasons[r]) for r in sorted(reasons.index)},
+        "chimeric_chains": int((info["SIFTS other accessions"] != "").sum()) if len(info) else 0,
         "af_found": int(info["AlphaFold"].sum()) if len(info) else 0,
         "af_missing": sum(af_state.get(a, ("",))[0] == "missing" for a in accessions),
         "cif_unverified": unverified,

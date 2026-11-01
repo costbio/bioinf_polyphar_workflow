@@ -26,7 +26,8 @@ FAKE = REPO / "tests" / "fixtures" / "fake_dogsite"
 BENCH = REPO / "polyphar" / "data" / "bench" / "2mjw_B.pdb"
 HINT = "license/installation problem — see README §DoGSiteScorer"
 INFO_COLUMNS = ["UniProt ID", "Gene Name", "PDB", "Chain ID", "AlphaFold", "Resolution",
-                "Structure method", "SIFTS coverage", "File"]
+                "Structure method", "SIFTS coverage", "File", "SIFTS segments",
+                "SIFTS other accessions"]
 
 
 def _make_run(root, names, acc="P25815"):
@@ -41,7 +42,7 @@ def _make_run(root, names, acc="P25815"):
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text(f"ATOM {name}\n")
         rows.append([acc, "S100P_HUMAN", pdb.upper(), chain, False, "-", "-", "-",
-                     f"02_structures/{acc}/{name}.pdb"])
+                     f"02_structures/{acc}/{name}.pdb", "1:999", ""])
     layout.structures.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(rows, columns=INFO_COLUMNS).to_csv(layout.protein_info, index=False)
     pockets.enqueue(layout)
@@ -613,7 +614,7 @@ def test_wrapper_starts_and_stops_worker(tmp_path):
             p.write_text(BENCH.read_text())
         pdb, chain = name.split("_")
         rows.append(["P25815", "S100P_HUMAN", pdb.upper(), chain, False, "-", "-", "-",
-                     f"02_structures/P25815/{name}.pdb"])
+                     f"02_structures/P25815/{name}.pdb", "1:999", ""])
     pd.DataFrame(rows, columns=INFO_COLUMNS).to_csv(layout.protein_info, index=False)
     env = _env(POLYPHAR_RUN_DIR=run_dir, POLYPHAR_VERSION="dev",
                POLYPHAR_HOME=tmp_path / "home", DOGSITE_BIN=FAKE)

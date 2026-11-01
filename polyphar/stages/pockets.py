@@ -11,7 +11,10 @@ Inputs (from 02_structures/Protein_info.csv, never globbed):
 Outputs (DoGSiteScorer `-o <out>` writes <out>_desc.txt, <out>_res_<P>.pdb, ...):
   04_pockets/<UniProt>/<UniProt>_<pdb>_<chain>.pdb   for PDB chains
   04_pockets/<UniProt>/AF-<acc>-F1.pdb               for AlphaFold models
-  04_pockets/DrugScore.csv                           the legacy columns (parse_pockets)
+  04_pockets/DrugScore.csv                           the legacy columns (parse_pockets),
+                                                     minus pockets outside the target's
+                                                     SIFTS segment on a fusion chain
+                                                     (filter_segments)
 
 Queue protocol (paths in job files are RELATIVE to the run folder, so the container's
 /work and the host's path both resolve them); job id = file name of <out> without .pdb:
@@ -30,6 +33,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
 import time
 from dataclasses import dataclass
@@ -307,6 +311,162 @@ def parse_pockets(pockets_dir, protein_info):
     return pd.concat(frames, ignore_index=True)
 
 
+# --- fusion / chimeric chains ------------------------------------------------------------
+# A chain SIFTS maps to several accessions (a fusion construct, e.g. 2VE7) is kept whole for
+# pdbfixer and DoGSiteScorer, but a pocket whose residues lie mostly (> 50 %) outside this
+# accession's SIFTS segment(s) of that chain belongs to the partner protein: it is dropped
+# (failed.tsv, counts["outside_segment"]) and never reaches DrugScore.csv. Pocket residues
+# are numbered as in the pdbfixer output (renumbered 1..N), so each one is mapped back to
+# its AUTHOR number through the coordinates of its heavy atoms in the extracted chain
+# (02_structures/..., first model), which pdbfixer leaves unchanged. Residues no atom maps
+# for count as not outside; a pocket without any mapped residue, or a chain whose segment
+# bounds cannot be parsed (SIFTS leaves unobserved ends empty or None), is kept and counted
+# as segment_unverified. Single-accession chains and AlphaFold models are not checked.
+
+SEGMENT_COLUMNS = ("SIFTS segments", "SIFTS other accessions")
+MAX_OUTSIDE = 0.5
+REASON_OUTSIDE = "pocket outside target segment"
+_BOUND = re.compile(r"^(-?\d+)([A-Za-z]?)$")
+
+
+def _bound(text: str):
+    m = _BOUND.match(text.strip())
+    return (int(m.group(1)), m.group(2).upper()) if m else None
+
+
+def parse_segments(text: str):
+    """[(begin, end)] from `PDB_BEG:PDB_END;...` (author numbers, optional insertion
+    code), or None when any bound cannot be parsed (empty, None, ...) or there is none."""
+    out = []
+    for part in str(text).split(";"):
+        beg, sep, end = part.partition(":")
+        b, e = _bound(beg), _bound(end)
+        if not sep or b is None or e is None:
+            return None
+        out.append((b, e))
+    return out or None
+
+
+def _le(a, b) -> bool:
+    """a <= b for (number, insertion code); the same number with different insertion codes
+    counts as <= both ways (their order is not reliable), so a bound is lenient."""
+    return a[0] < b[0] if a[0] != b[0] else True
+
+
+def in_segments(res, segments) -> bool:
+    return any(_le(b, res) and _le(res, e) for b, e in segments)
+
+
+def _coord_key(line: str):
+    try:
+        return tuple(int(round(float(line[i:i + 8]) * 1000)) for i in (30, 38, 46))
+    except ValueError:
+        return None
+
+
+def _heavy(line: str) -> bool:
+    elem = line[76:78].strip().upper()
+    if elem:
+        return elem not in ("H", "D")
+    return not line[12:16].strip().upper().startswith(("H", "D"))
+
+
+def _author_atoms(raw_pdb: Path) -> dict:
+    """heavy-atom coordinate key -> (author residue number, insertion code), first model."""
+    out = {}
+    with open(raw_pdb, encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            if line.startswith("ENDMDL"):
+                break
+            if line.startswith(("ATOM", "HETATM")) and _heavy(line):
+                key = _coord_key(line)
+                try:
+                    res = (int(line[22:26]), line[26].strip().upper())
+                except (ValueError, IndexError):
+                    continue
+                if key is not None:
+                    out.setdefault(key, res)
+    return out
+
+
+_NEAR = [(dx, dy, dz) for dx in (0, -1, 1) for dy in (0, -1, 1) for dz in (0, -1, 1)]
+
+
+def _lookup(atoms: dict, key):
+    for dx, dy, dz in _NEAR:   # +-0.001 A: a coordinate written twice may round differently
+        hit = atoms.get((key[0] + dx, key[1] + dy, key[2] + dz))
+        if hit is not None:
+            return hit
+    return None
+
+
+def outside_fraction(pocket_pdb: Path, atoms: dict, segments):
+    """Fraction of the pocket's residues whose author number lies outside `segments`, or
+    None when no residue of the pocket maps to the extracted chain."""
+    votes: dict = {}
+    with open(pocket_pdb, encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            if not line.startswith(("ATOM", "HETATM")):
+                continue
+            rid = (line[21], line[22:27])
+            v = votes.setdefault(rid, {})
+            if not _heavy(line):
+                continue
+            key = _coord_key(line)
+            hit = _lookup(atoms, key) if key is not None else None
+            if hit is not None:
+                v[hit] = v.get(hit, 0) + 1
+    mapped = [max(v.items(), key=lambda kv: (kv[1], kv[0]))[0] for v in votes.values() if v]
+    if not mapped:
+        return None
+    outside = sum(not in_segments(r, segments) for r in mapped)
+    return outside / len(votes)
+
+
+def filter_segments(layout, df, info):
+    """(kept DrugScore rows, [(item, reason)] dropped, n segment_unverified)."""
+    missing = [c for c in SEGMENT_COLUMNS if c not in info.columns]
+    if missing:
+        raise ValueError(f"{layout.protein_info} has no {', '.join(missing)} column(s) (written "
+                         f"by an older polyphar); rerun `polyphar structures` first")
+    checked = {}
+    for row in info.to_dict("records"):
+        others = str(row["SIFTS other accessions"]).strip()
+        if str(row["AlphaFold"]).strip().lower() == "true" or not others:
+            continue
+        acc, name = str(row["UniProt ID"]), Path(str(row["File"])).name
+        checked[(acc, f"{acc}_{name}")] = (row, others)
+    if not checked or df.empty:
+        return df, [], 0
+    keep, dropped, unverified = [], [], 0
+    atoms_cache: dict = {}
+    for acc, fname in zip(df["UniProt ID"], df["Pocket Filename"]):
+        model = fname.split("_res_", 1)[0]
+        hit = checked.get((acc, model))
+        if hit is None:
+            keep.append(True)
+            continue
+        row, others = hit
+        segments = parse_segments(row["SIFTS segments"])
+        frac = None
+        if segments is not None:
+            if model not in atoms_cache:
+                raw = layout.run_dir / str(row["File"])
+                atoms_cache[model] = _author_atoms(raw) if raw.is_file() else {}
+            frac = outside_fraction(layout.pockets / acc / fname, atoms_cache[model], segments)
+        if frac is None:
+            unverified += 1
+            keep.append(True)
+        elif frac > MAX_OUTSIDE:
+            keep.append(False)
+            partners = ", ".join(others.split(";"))
+            dropped.append((f"{acc}/{fname}", f"{REASON_OUTSIDE}: {frac * 100:.0f}% outside; "
+                                              f"partner(s) {partners}"))
+        else:
+            keep.append(True)
+    return df[keep].reset_index(drop=True), dropped, unverified
+
+
 # --- run -----------------------------------------------------------------------------
 
 def _dogsite_sha(layout, models: list[Model]) -> str | None:
@@ -340,7 +500,11 @@ def run(layout, args, progress) -> dict:
                          getattr(args, "worker_timeout", DEFAULT_WORKER_TIMEOUT), jobs=jobs)
     sha = _dogsite_sha(layout, models)
 
-    df = parse_pockets(d, layout.protein_info)
+    info = _info(layout.protein_info)
+    df = parse_pockets(d, info)
+    df, outside, unverified = filter_segments(layout, df, info)
+    for item, reason in outside:
+        append_failure(d, item, STAGE, reason)
     fd, tmp = tempfile.mkstemp(dir=d, prefix=".DrugScore.csv.", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="") as fh:
@@ -352,7 +516,8 @@ def run(layout, args, progress) -> dict:
 
     counts = {"models": len(models) + len(missing), "queued": len(jobs),
               "done": res["done"], "skipped_existing": len(models) - len(jobs),
-              "pockets": len(df), "failed": res["failed"] + len(missing)}
+              "pockets": len(df), "outside_segment": len(outside),
+              "segment_unverified": unverified, "failed": res["failed"] + len(missing)}
     # The manifest is written last: its presence marks the stage as finished.
     write_manifest(d, STAGE, args={"worker_timeout": getattr(args, "worker_timeout", None)},
                    inputs=[layout.protein_info], versions={"dogsite_sha256": sha},

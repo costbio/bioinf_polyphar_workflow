@@ -162,6 +162,34 @@ def test_absent_pdb_unmapped():
         {"UniProt ID": "P25815", "PDB": "1ZZZ", "reason": "PDB absent from SIFTS"}]
 
 
+CHIMERA_SIFTS = ("# test\nPDB\tCHAIN\tSP_PRIMARY\tRES_BEG\tRES_END\tPDB_BEG\tPDB_END\t"
+                 "SP_BEG\tSP_END\n"
+                 "9xyz\tA\tP11111\t1\t100\t1\t100\t1\t100\n"
+                 "9xyz\tA\tP22222\t106\t205\t105\t204\t1\t100\n"
+                 "9xyz\tA\tP11111\t210\t219\t209\tNone\t101\t110\n"
+                 "9xyz\tB\tP11111\t1\t50\t1\t50\t1\t50\n")
+
+
+def test_chimeric_chain_records_segments_and_partners(tmp_path):
+    """A chain SIFTS maps to several accessions (fusion construct) keeps this accession's
+    author-numbered segments and names the partner accessions."""
+    path = tmp_path / "sifts.tsv"
+    path.write_text(CHIMERA_SIFTS)
+    sel, _ = select_chains(_pairs(("P11111", "9XYZ"), ("P22222", "9XYZ")), load_sifts(path))
+    rows = {r["UniProt ID"]: r for r in sel.to_dict("records")}
+    assert rows["P11111"]["Chain ID"] == "A"          # coverage 110 > 50
+    assert rows["P11111"]["SIFTS segments"] == "1:100;209:None"
+    assert rows["P11111"]["SIFTS other accessions"] == "P22222"
+    assert rows["P22222"]["SIFTS segments"] == "105:204"
+    assert rows["P22222"]["SIFTS other accessions"] == "P11111"
+
+
+def test_single_protein_chain_has_no_partners():
+    sel, _ = select_chains(_pairs(("P25815", "2MJW"),), load_sifts(SIFTS))
+    assert sel.loc[0, "SIFTS segments"] == "1:94"
+    assert sel.loc[0, "SIFTS other accessions"] == ""
+
+
 def test_tie_breaks_alphabetically():
     sel, _ = select_chains(_pairs(("P99999", "9ZZA"), ("P53350", "1Q4K")), load_sifts(SIFTS))
     assert sel["Chain ID"].tolist() == ["A", "A"]
@@ -317,14 +345,17 @@ def test_run_writes_outputs(tmp_path, monkeypatch):
     d = layout.structures
     info = pd.read_csv(layout.protein_info, dtype=str, keep_default_na=False)
     assert list(info.columns) == ["UniProt ID", "Gene Name", "PDB", "Chain ID", "AlphaFold",
-                                  "Resolution", "Structure method", "SIFTS coverage", "File"]
+                                  "Resolution", "Structure method", "SIFTS coverage", "File",
+                                  "SIFTS segments", "SIFTS other accessions"]
     assert info.to_dict("records") == [
         {"UniProt ID": "P25815", "Gene Name": "S100P_HUMAN", "PDB": "2MJW", "Chain ID": "B",
          "AlphaFold": "False", "Resolution": "-", "Structure method": "SOLUTION NMR",
-         "SIFTS coverage": "94", "File": "02_structures/P25815/2mjw_B.pdb"},
+         "SIFTS coverage": "94", "File": "02_structures/P25815/2mjw_B.pdb",
+         "SIFTS segments": "1:94", "SIFTS other accessions": ""},
         {"UniProt ID": "P25815", "Gene Name": "S100P_HUMAN", "PDB": "-", "Chain ID": "A",
          "AlphaFold": "True", "Resolution": "-", "Structure method": "-",
-         "SIFTS coverage": "-", "File": "02_structures/P25815/AF-P25815-F1.pdb"},
+         "SIFTS coverage": "-", "File": "02_structures/P25815/AF-P25815-F1.pdb",
+         "SIFTS segments": "", "SIFTS other accessions": ""},
     ]
     assert (d / "P25815" / "2mjw.cif").read_text().startswith("data_")
     assert not (d / "P25815" / "2mjw_A.pdb").exists()
@@ -343,6 +374,7 @@ def test_run_writes_outputs(tmp_path, monkeypatch):
     assert m["counts"] == {"accessions": 3, "pdb_entries_listed": 3, "chains_extracted": 1,
                            "unmapped": {"PDB absent from SIFTS": 1,
                                         "no SIFTS chain for accession": 1},
+                           "chimeric_chains": 0,
                            "af_found": 1, "af_missing": 2, "cif_unverified": 0, "annotation_mismatch": 0,
                            "failed": 0}
 
@@ -376,7 +408,7 @@ def test_entry_download_failure_is_recorded_and_stage_continues(tmp_path, monkey
     s = _session(tmp_path)
     rows = [("P25815", "S100P_HUMAN", "2MJW"), ("P99999", "TEST_HUMAN", "9ZZA")]
     run, layout = _setup(tmp_path, monkeypatch, rows, s)
-    assert _main(run) == 0
+    assert _main(run) == 3        # finished with a failed unit (item 13)
     failed = (layout.structures / "failed.tsv").read_text()
     assert "P99999/9ZZA\tstructures\t" in failed and "404" in failed
     m = json.loads((layout.structures / "manifest.json").read_text())
@@ -412,7 +444,7 @@ def test_rejected_chain_recorded_and_not_retried(tmp_path, monkeypatch):
     reason = "chain has no ATOM records"
     s = FakeSession(cifs={"2MJW": _cif_hetatm_only(_cif_2mjw(tmp_path).read_text())})
     run, layout = _setup(tmp_path, monkeypatch, [("P25815", "S100P_HUMAN", "2MJW")], s)
-    assert _main(run) == 0
+    assert _main(run) == 3        # finished with a failed unit (item 13)
     d = layout.structures
     assert not (d / "P25815" / "2mjw_B.pdb").exists()
     assert not list(d.rglob("*.tmp"))
@@ -423,7 +455,7 @@ def test_rejected_chain_recorded_and_not_retried(tmp_path, monkeypatch):
     assert (counts["chains_extracted"], counts["failed"]) == (0, 1)
     assert structures.units(layout, None).count == 0          # not pending forever
     n = len(s.calls)
-    assert _main(run) == 0
+    assert _main(run) == 3        # finished with a failed unit (item 13)
     assert len(s.calls) == n
     assert reason in (d / "failed.tsv").read_text()           # still visible on rerun
     assert json.loads((d / "manifest.json").read_text())["counts"] == counts

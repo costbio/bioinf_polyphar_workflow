@@ -16,7 +16,8 @@ FIX = Path(__file__).parent / "fixtures"
 NET2 = FIX / "pockets_net2_P53350"
 FAKE_DATA = FIX / "fake_dogsite_data"
 INFO_COLUMNS = ["UniProt ID", "Gene Name", "PDB", "Chain ID", "AlphaFold", "Resolution",
-                "Structure method", "SIFTS coverage", "File"]
+                "Structure method", "SIFTS coverage", "File", "SIFTS segments",
+                "SIFTS other accessions"]
 LEGACY_HEADER = (
     ",UniProt ID,Gene Name,Protein,Pocket,lig_cov,poc_cov,lig_name,4A_crit,volume,hull,"
     "surface,lid,depth,surf/vol,lid/hull,ellVol,ell c/a,ell b/a,siteAtms,accept,donor,aromat,"
@@ -27,11 +28,12 @@ WARNING = ("No DoGSiteScorer worker is consuming the queue — "
            "start bin/polyphar-dogsite-worker on the host")
 
 
-def _row(acc, gene, pdb, chain, af):
+def _row(acc, gene, pdb, chain, af, segments="1:999", others=""):
     if af:
-        return [acc, gene, "-", "A", True, "-", "-", "-", f"02_structures/{acc}/AF-{acc}-F1.pdb"]
+        return [acc, gene, "-", "A", True, "-", "-", "-", f"02_structures/{acc}/AF-{acc}-F1.pdb",
+                "", ""]
     return [acc, gene, pdb.upper(), chain, False, "2.0", "X-RAY", "0.9",
-            f"02_structures/{acc}/{pdb.lower()}_{chain}.pdb"]
+            f"02_structures/{acc}/{pdb.lower()}_{chain}.pdb", segments, others]
 
 
 def _write_info(layout, rows):
@@ -316,6 +318,96 @@ def test_cli_exposes_worker_timeout():
     args = cli.build_parser().parse_args(["pockets", "--worker-timeout", "30"])
     assert args.worker_timeout == 30
     assert cli.build_parser().parse_args(["pockets"]).worker_timeout == 600
+
+
+# --- fusion / chimeric chains: pockets outside this accession's SIFTS segment(s) ---------
+
+def _atom(serial, resseq, x, chain="A", icode=" ", name="CA", elem="C", resn="ALA"):
+    return ("ATOM  %5d %-4s %3s %1s%4d%1s   %8.3f%8.3f%8.3f  1.00  0.00          %2s\n"
+            % (serial, name, resn, chain, resseq, icode, x, 0.0, 0.0, elem))
+
+
+def _chimera_run(tmp_path, segments="1:5", others="P22222", icodes=None):
+    """One PDB chain of 10 residues (author numbers 1..10, CA at x = 3*i, plus an H atom);
+    SIFTS says P11111 is `segments`, the rest belongs to `others`. Pockets (residues
+    renumbered 101.. as pdbfixer + DoGSiteScorer would, matched by coordinates):
+    P_1 = 1-4 (inside), P_2 = 6-9 (outside), P_3 = 4-7 (half: kept), P_4 = 5-10 (5/6 out)."""
+    layout = RunLayout(tmp_path)
+    icodes = icodes or {}
+    raw = "MODEL        1\n" + "".join(
+        _atom(i, i, 3.0 * i, icode=icodes.get(i, " ")) + _atom(100 + i, i, 3.0 * i + 1, name="H",
+                                                               elem="H")
+        for i in range(1, 11)) + "ENDMDL\nMODEL        2\n" + "".join(
+        _atom(i, 50 + i, 3.0 * i) for i in range(1, 11)) + "ENDMDL\nEND\n"
+    _put(layout.structures / "P11111" / "9xyz_A.pdb", raw)
+    _put(layout.pdbfixer / "P11111" / "9xyz_A.pdb", "ATOM fixed\n")
+    _write_info(layout, [_row("P11111", "FUSN_HUMAN", "9xyz", "A", False, segments, others)])
+    d = layout.pockets / "P11111"
+    pockets_res = {"P_1": range(1, 5), "P_2": range(6, 10), "P_3": range(4, 8),
+                   "P_4": range(5, 11)}
+    desc = "name\tvolume\tdrugScore\n" + "".join(f"{p}\t100\t0.8\n" for p in pockets_res)
+    _put(d / "P11111_9xyz_A.pdb_desc.txt", desc)
+    for p, res in pockets_res.items():
+        text = "HEADER File contains complete residues of binding site atoms\n" + "".join(
+            _atom(k, 100 + i, 3.0 * i + 0.0004) + _atom(500 + k, 100 + i, 50.0 + i, name="H",
+                                                       elem="H")
+            for k, i in enumerate(res, 1))
+        _put(d / f"P11111_9xyz_A.pdb_res_{p}.pdb", text)
+    return layout
+
+
+def test_pockets_outside_the_target_segment_are_dropped(tmp_path):
+    layout = _chimera_run(tmp_path)
+    counts = pockets.run(layout, SimpleNamespace(nprocs=1, worker_timeout=600), Prog())
+    df = pd.read_csv(layout.drugscore_csv, index_col=0)
+    assert sorted(df["Pocket"]) == ["P_1", "P_3"]          # P_3: 50 % outside is kept
+    assert counts["outside_segment"] == 2 and counts["failed"] == 0
+    assert counts["pockets"] == 2 and counts["segment_unverified"] == 0
+    failed = sorted((layout.pockets / "failed.tsv").read_text().splitlines()[1:])
+    assert failed == [
+        "P11111/P11111_9xyz_A.pdb_res_P_2.pdb\tpockets\tpocket outside target segment: "
+        "100% outside; partner(s) P22222",
+        "P11111/P11111_9xyz_A.pdb_res_P_4.pdb\tpockets\tpocket outside target segment: "
+        "83% outside; partner(s) P22222"]
+
+
+def test_single_protein_chains_are_not_filtered(tmp_path):
+    layout = _chimera_run(tmp_path, others="")
+    counts = pockets.run(layout, SimpleNamespace(nprocs=1, worker_timeout=600), Prog())
+    assert counts["outside_segment"] == 0 and counts["pockets"] == 4
+
+
+@pytest.mark.parametrize("segments", ["1:None", ":5", "1:5;x:9", ""])
+def test_unparseable_segment_bounds_keep_pockets_as_unverified(tmp_path, segments):
+    layout = _chimera_run(tmp_path, segments=segments)
+    counts = pockets.run(layout, SimpleNamespace(nprocs=1, worker_timeout=600), Prog())
+    assert counts["pockets"] == 4 and counts["outside_segment"] == 0
+    assert counts["segment_unverified"] == 4
+
+
+def test_insertion_code_bounds_are_parsed_and_lenient(tmp_path):
+    # bound 5A: residue 5 (no insertion code) at the same number counts as inside
+    layout = _chimera_run(tmp_path, segments="1:5A")
+    counts = pockets.run(layout, SimpleNamespace(nprocs=1, worker_timeout=600), Prog())
+    assert counts["outside_segment"] == 2 and counts["segment_unverified"] == 0
+
+
+def test_pocket_without_any_matching_atom_is_unverified_and_kept(tmp_path):
+    layout = _chimera_run(tmp_path)
+    p = layout.pockets / "P11111" / "P11111_9xyz_A.pdb_res_P_2.pdb"
+    p.write_text("".join(_atom(k, 7, 900.0 + k) for k in range(3)))
+    counts = pockets.run(layout, SimpleNamespace(nprocs=1, worker_timeout=600), Prog())
+    assert counts["outside_segment"] == 1 and counts["segment_unverified"] == 1
+    assert "P_2" in set(pd.read_csv(layout.drugscore_csv, index_col=0)["Pocket"])
+
+
+def test_protein_info_without_segment_columns_is_an_error(tmp_path):
+    layout = _chimera_run(tmp_path)
+    info = pd.read_csv(layout.protein_info, dtype=str, keep_default_na=False)
+    info.drop(columns=["SIFTS segments", "SIFTS other accessions"]).to_csv(
+        layout.protein_info, index=False)
+    with pytest.raises(ValueError, match="rerun `polyphar structures`"):
+        pockets.run(layout, SimpleNamespace(nprocs=1, worker_timeout=600), Prog())
 
 
 # --- real DoGSiteScorer (host only) -------------------------------------------------
