@@ -7,20 +7,32 @@ the first unit, milestone progress, done / FAILED.
   add_arguments(); two stages defining one option differently is an error).
 * ids: runs when --txt / --xlsx is given; without them an existing 00_ids/ids.txt counts
   as done (skipped), and a missing one is an error before anything starts.
-* Every stage's units() is computed first. A stage with 0 units and a manifest.json is
-  "skipped (done)": not benchmarked, not run, no notifications (its manifest counts still
-  feed the failure flags). A stage with 0 units but no manifest runs through the gate (it
-  only finishes its bookkeeping).
+* Before the first stage, a preflight checks what later stages need: with dock in range the
+  ligand library exists and `smina --version` works; with similarity in range the
+  PocketMatch binaries are there. A problem exits 2 before anything starts.
+* Every stage's units() is computed first. A stage with 0 units and a manifest.json whose
+  recorded inputs all still have their recorded sha256 is "skipped (done)": not
+  benchmarked, not run, no notifications (its manifest counts still feed the failure
+  flags). With a changed or missing input (e.g. a shrunken ids.txt after the stage
+  finished), or without a manifest, it runs through the gate and rebuilds its tables from
+  the current inputs. Skipping a stage whose manifest comes from another code version
+  (git_commit), or an unknown one, prints and notifies a warning (it does not block).
+* A code version that is "unknown" (image built without POLYPHAR_GIT_COMMIT) is warned
+  about once at the start (Methods need it).
 * Options of stages outside --from..--to are warned about (stderr) and ignored.
 * A stage with remaining units and no calibration on this machine is benchmarked first (`benchmark --stages
   <stage>`), except pockets: DoGSiteScorer is host-only (bin/polyphar-docker calibrates it
   before `run`); uncalibrated, its ETA comes with the 5 % milestone.
-* The first failed stage stops the run (priority-1 notification). SIGTERM (docker stop) is
+* The first failed stage stops the run (priority-1 notification). So does structures, fix
+  or pockets when failed / work items exceeds --max-failed-fraction (default 0.2): exit 1,
+  "run STOPPED"; --keep-going overrides. Expected exclusions (structures unmapped pairs,
+  pockets outside_segment) are not failures and not in the fraction. SIGTERM (docker stop) is
   turned into a failure for the whole run, so an interrupted benchmark or units() also ends
   in the "run FAILED" summary. A stage that finishes with counts["failed"] > 0, or dock with
   counts["incomplete_targets"] > 0, does not stop the run but is flagged in the final
   summary (printed, notified at priority 1, appended to logs/run.log).
-* Exit codes: 0 success; 1 a stage failed (the exception propagates; 143 for SIGTERM);
+* Exit codes: 0 success; 1 a stage failed (the exception propagates; 143 for SIGTERM,
+  129 for SIGHUP) or failed too often;
   2 usage error; 3 the run finished but failures were flagged.
 * --dry-run prints the `polyphar estimate` table and does nothing else.
 
@@ -31,10 +43,10 @@ from __future__ import annotations
 
 import argparse
 import json
-import signal
 import sys
 from datetime import datetime
 
+from polyphar import common
 from polyphar.benchmark import (BENCH_STAGES, ORDER, STAGE_DIRS, estimate_rows, format_table,
                                 run_benchmark)
 from polyphar.eta import Calibration, format_duration, polyphar_home
@@ -43,7 +55,10 @@ IDS_SOURCE = ("xlsx", "txt", "sheet", "id_column", "reviewed_column")
 FLAG_KEYS = ("failed", "incomplete_targets")
 EXIT_USAGE = 2
 EXIT_FLAGGED = 3
+EXIT_STOPPED = 1
 SKIPPED = "skipped (done)"
+DEFAULT_MAX_FAILED_FRACTION = 0.2
+FRACTION_STAGES = ("structures", "fix", "pockets")
 
 
 # --- options -------------------------------------------------------------------------------
@@ -105,6 +120,13 @@ def add_arguments(parser) -> None:
                                               f"{', '.join(ORDER)}")
     parser.add_argument("--to", dest="to_stage", choices=ORDER, default=ORDER[-1],
                         metavar="STAGE", help=f"last stage (default {ORDER[-1]})")
+    parser.add_argument("--max-failed-fraction", type=_fraction,
+                        default=DEFAULT_MAX_FAILED_FRACTION, metavar="F",
+                        help="stop the run when structures, fix or pockets fails more than "
+                             f"this fraction of its work items (default "
+                             f"{DEFAULT_MAX_FAILED_FRACTION:g})")
+    parser.add_argument("--keep-going", action="store_true",
+                        help="never stop for --max-failed-fraction")
     hooks = []
     for name in ORDER:
         module = cli._load_stage(name)
@@ -112,6 +134,16 @@ def add_arguments(parser) -> None:
             hooks.append((name, module.add_arguments))
     # which stage each option belongs to, for the out-of-range warning
     parser.set_defaults(run_option_owners=merge_stage_options(parser, hooks))
+
+
+def _fraction(value: str) -> float:
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        f = -1.0
+    if not 0.0 <= f <= 1.0:
+        raise argparse.ArgumentTypeError(f"must be a number in [0, 1] (got {value!r})")
+    return f
 
 
 # --- run -----------------------------------------------------------------------------------
@@ -204,6 +236,13 @@ def _finish(layout, rows, notifier, title, priority) -> str:
     return text
 
 
+def _notify_quietly(notifier, title, message, priority=0) -> None:
+    try:
+        notifier(title, message, priority=priority)
+    except Exception:
+        pass   # notifications never fail a run
+
+
 def _usage(message: str) -> int:
     print(f"polyphar run: {message}", file=sys.stderr)
     return EXIT_USAGE
@@ -220,16 +259,113 @@ def _warn_out_of_range(args, stages) -> None:
                   f"--from {args.from_stage} --to {args.to_stage}; ignored", file=sys.stderr)
 
 
-def _manifest_counts(layout, stage) -> dict | None:
-    """counts of the stage's manifest.json, or None when the stage has no manifest."""
+def _manifest(layout, stage) -> dict | None:
+    """The stage's manifest.json, or None when it has none ({} when unreadable)."""
     path = layout.run_dir / STAGE_DIRS[stage] / "manifest.json"
     if not path.is_file():
         return None
     try:
-        counts = json.loads(path.read_text(encoding="utf-8")).get("counts")
-        return counts if isinstance(counts, dict) else {}
-    except (OSError, ValueError, AttributeError):
+        m = json.loads(path.read_text(encoding="utf-8"))
+        return m if isinstance(m, dict) else {}
+    except (OSError, ValueError):
         return {}
+
+
+def _manifest_counts(layout, stage) -> dict | None:
+    """counts of the stage's manifest.json, or None when the stage has no manifest."""
+    m = _manifest(layout, stage)
+    if m is None:
+        return None
+    counts = m.get("counts")
+    return counts if isinstance(counts, dict) else {}
+
+
+def _input_path(layout, recorded: str):
+    """The file a manifest input path names, in this run folder. Paths are recorded as
+    the stage saw them (/work/... in the container, the host path outside it): when the
+    recorded path does not exist, its longest tail that exists under the run folder is it."""
+    from pathlib import Path
+
+    p = Path(recorded)
+    if p.is_file():
+        return p
+    parts = p.parts[1:] if p.is_absolute() else p.parts
+    for i in range(len(parts)):
+        candidate = layout.run_dir.joinpath(*parts[i:])
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def changed_inputs(layout, manifest: dict) -> list[str]:
+    """The manifest's recorded inputs whose current file is missing or has another sha256
+    ([] when every input is unchanged)."""
+    from polyphar.common import sha256_file
+
+    changed = []
+    for entry in manifest.get("inputs") or []:
+        try:
+            recorded, sha = entry["path"], entry["sha256"]
+        except (KeyError, TypeError):
+            changed.append(str(entry))
+            continue
+        path = _input_path(layout, recorded)
+        if path is None:
+            changed.append(f"{recorded} (missing)")
+        elif sha256_file(path) != sha:
+            changed.append(f"{recorded} (changed)")
+    return changed
+
+
+def failed_fraction(stage: str, counts) -> tuple[int, int] | None:
+    """(failed, work items) of structures / fix / pockets from their counts, or None when
+    the stage is not checked or has no work items. Expected exclusions are no failures:
+    structures' unmapped pairs (not in `failed`, removed from the denominator) and pockets'
+    outside_segment pockets (counted apart from `failed`)."""
+    counts = counts or {}
+
+    def num(key):
+        v = counts.get(key, 0)
+        return v if isinstance(v, (int, float)) and not isinstance(v, bool) else 0
+
+    if stage == "structures":
+        unmapped = counts.get("unmapped") or {}
+        n_unmapped = sum(v for v in unmapped.values() if isinstance(v, (int, float))) \
+            if isinstance(unmapped, dict) else 0
+        total = num("pdb_entries_listed") - n_unmapped + num("accessions")
+    elif stage == "fix":
+        total = num("inputs")
+    elif stage == "pockets":
+        total = num("models")
+    else:
+        return None
+    if total <= 0:
+        return None
+    return int(num("failed")), int(total)
+
+
+def preflight_problems(layout, args, stages) -> list[str]:
+    """What the stages in range need from outside the run folder's earlier stages: the
+    ligand library and a working smina (dock), the PocketMatch binaries (similarity)."""
+    problems = []
+    if "dock" in stages:
+        from polyphar.stages import dock
+
+        try:
+            dock._library_path(layout, args, copy=False)
+        except (OSError, ValueError) as exc:
+            problems.append(f"dock: {exc}")
+        if dock.smina_version() == "unavailable":
+            problems.append(f"dock: smina ({dock.smina_bin()}) not runnable "
+                            "(`smina --version` failed)")
+    if "similarity" in stages:
+        from polyphar.stages import similarity
+
+        try:
+            similarity._pm_bin_dir(args)
+        except (OSError, ValueError) as exc:
+            problems.append(f"similarity: {exc}")
+    return problems
 
 
 def main(layout, args) -> int:
@@ -249,17 +385,40 @@ def main(layout, args) -> int:
                       "(--txt or --xlsx with --sheet and --id-column)")
     _warn_out_of_range(args, stages)
 
+    problems = preflight_problems(layout, args, stages)
+    if problems:
+        return _usage("preflight failed, nothing was started:\n  " + "\n  ".join(problems))
+
     notifier = cli.make_notifier(layout, args)
-    previous = cli._install_sigterm_handler()   # docker stop -> SystemExit(143) -> summary
+    commit = common._git_commit()
+    if commit == "unknown":
+        msg = ("code version unknown: this polyphar was built without POLYPHAR_GIT_COMMIT "
+               "(rebuild the image with --build-arg POLYPHAR_GIT_COMMIT=$(git rev-parse HEAD)); "
+               "manifests will not say which code produced them")
+        print(f"run: warning: {msg}", flush=True)
+        _notify_quietly(notifier, "run: code version unknown", msg)
+    args.run_git_commit = commit
+    # docker stop -> SystemExit(143), ssh drop (SIGHUP) -> SystemExit(129) -> summary
+    previous = cli._install_sigterm_handler()
     try:
         return _run_stages(cli, layout, args, stages, ids_given, notifier)
     finally:
-        if previous is not None:
-            signal.signal(signal.SIGTERM, previous)
+        cli._restore_handlers(previous)
+
+
+def _warn_code_version(name, manifest, current, notifier) -> None:
+    recorded = manifest.get("git_commit") or "unknown"
+    if recorded != "unknown" and recorded == current:
+        return
+    msg = (f"skipped stage was produced by code version {recorded}, this is {current}; "
+           f"rerun it (delete {STAGE_DIRS[name]}/manifest.json) if the code change matters")
+    print(f"{name}: warning: {msg}", flush=True)
+    _notify_quietly(notifier, f"{name}: skipped stage from another code version", msg)
 
 
 def _run_stages(cli, layout, args, stages, ids_given, notifier) -> int:
     rows = []
+    current = getattr(args, "run_git_commit", None) or common._git_commit()
     for i, name in enumerate(stages):
         row = {"stage": name, "status": "running"}
         rows.append(row)
@@ -271,12 +430,21 @@ def _run_stages(cli, layout, args, stages, ids_given, notifier) -> int:
                 continue
             stage = cli._load_stage(name)
             units = stage.units(layout, args)
-            done_counts = _manifest_counts(layout, name) if units.count == 0 else None
-            if done_counts is not None:
-                print(f"{name}: 0 units left and a manifest exists: {SKIPPED}", flush=True)
-                row.update(status=SKIPPED, counts=done_counts,
-                           units=f"0 ({units.cost_basis})")
-                continue
+            manifest = _manifest(layout, name) if units.count == 0 else None
+            if manifest is not None:
+                changed = changed_inputs(layout, manifest)
+                if changed:
+                    print(f"{name}: 0 units left but inputs changed since its manifest "
+                          f"({'; '.join(changed[:5])}): running it", flush=True)
+                else:
+                    print(f"{name}: 0 units left and a manifest exists: {SKIPPED}", flush=True)
+                    _warn_code_version(name, manifest, current, notifier)
+                    counts = manifest.get("counts")
+                    row.update(status=SKIPPED, counts=counts if isinstance(counts, dict) else {},
+                               units=f"0 ({units.cost_basis})")
+                    if _too_many_failures(layout, args, rows, i, stages, notifier):
+                        return EXIT_STOPPED
+                    continue
             if units.count > 0 and _needs_benchmark(name):
                 _benchmark(name)
             row["counts"] = cli.gate(name, stage, layout, args, notifier, record=row,
@@ -287,6 +455,8 @@ def _run_stages(cli, layout, args, stages, ids_given, notifier) -> int:
             rows.extend({"stage": s, "status": "not run"} for s in stages[i + 1:])
             _finish(layout, rows, notifier, f"run FAILED at {name}", priority=1)
             raise
+        if _too_many_failures(layout, args, rows, i, stages, notifier):
+            return EXIT_STOPPED
     flags = _flags(rows)
     if flags:
         _finish(layout, rows, notifier, f"run done with failures ({len(flags)} flagged)",
@@ -294,3 +464,24 @@ def _run_stages(cli, layout, args, stages, ids_given, notifier) -> int:
         return EXIT_FLAGGED
     _finish(layout, rows, notifier, "run done", priority=0)
     return 0
+
+
+def _too_many_failures(layout, args, rows, i, stages, notifier) -> bool:
+    """Stop the run (summary, priority 1) when the stage just done failed more than
+    --max-failed-fraction of its work items, unless --keep-going."""
+    row = rows[-1]
+    ff = failed_fraction(row["stage"], row.get("counts"))
+    limit = getattr(args, "max_failed_fraction", DEFAULT_MAX_FAILED_FRACTION)
+    if ff is None or ff[0] <= limit * ff[1]:
+        return False
+    failed, total = ff
+    what = (f"{failed}/{total} work items failed ({failed / total:.0%} > "
+            f"--max-failed-fraction {limit:g})")
+    if getattr(args, "keep_going", False):
+        print(f"{row['stage']}: {what}; continuing (--keep-going)", flush=True)
+        return False
+    print(f"{row['stage']}: {what}; stopping the run (see {STAGE_DIRS[row['stage']]}/"
+          "failed.tsv; --keep-going continues anyway)", flush=True)
+    rows.extend({"stage": s, "status": "not run"} for s in stages[i + 1:])
+    _finish(layout, rows, notifier, f"run STOPPED at {row['stage']}: {what}", priority=1)
+    return True

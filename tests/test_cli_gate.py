@@ -167,3 +167,25 @@ def test_sigterm_triggers_fail_and_exits_nonzero(tmp_path):
     r = _subprocess_stage(tmp_path, "os.kill(os.getpid(), signal.SIGTERM); import time; time.sleep(5)")
     assert r.returncode == 143
     assert "FAILED: SystemExit" in (tmp_path / "run" / "logs" / "fix.log").read_text()
+
+
+def test_sighup_triggers_fail_and_exits_129(tmp_path):
+    """An ssh drop (SIGHUP) ends like docker stop: FAILED logged/notified, exit 128+1."""
+    r = _subprocess_stage(tmp_path, "os.kill(os.getpid(), signal.SIGHUP); import time; time.sleep(5)")
+    assert r.returncode == 129
+    assert "FAILED: SystemExit" in (tmp_path / "run" / "logs" / "fix.log").read_text()
+
+
+@pytest.mark.parametrize("counts", [{"done": 3, "failed": 2},
+                                    {"done": 3, "failed": 0, "incomplete_targets": 1}])
+def test_flagged_failures_exit_3_and_notify_at_priority_1(gate, tmp_path, counts):
+    sys.modules["fake_gate_stage"].run = lambda layout, args, progress: dict(counts)
+    assert cli.main(_argv(tmp_path)) == 3
+    title, _msg, prio = gate.notes[-1]
+    assert title == "fix done" and prio == 1
+
+
+def test_clean_stage_exits_0_and_notifies_done_at_priority_0(gate, tmp_path):
+    assert cli.main(_argv(tmp_path)) == 0
+    title, _msg, prio = gate.notes[-1]
+    assert title == "fix done" and prio == 0

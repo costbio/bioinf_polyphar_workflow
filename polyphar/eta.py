@@ -273,7 +273,9 @@ class Progress:
         msg = (f"done in {format_duration(elapsed)} (estimated {est}); "
                f"counts: {detail or 'none'}; failures: {failed}")
         self._log(msg)
-        self._notify(f"{self.stage} done", msg)
+        flagged = any(isinstance(counts.get(k), (int, float)) and not isinstance(counts.get(k), bool)
+                      and counts.get(k) > 0 for k in ("failed", "incomplete_targets"))
+        self._notify(f"{self.stage} done", msg, priority=1 if flagged else 0)
         if self.calib is not None and self.work_done > 0 and elapsed > 0:
             # seconds per unit on ONE process: elapsed wall time * slots / work
             self.calib.update(self.stage, elapsed * self.slots / self.work_done)

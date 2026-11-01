@@ -207,7 +207,7 @@ def test_progress_done_updates_calibration(tmp_path):
     assert calib.cost("fix") == 8.0
     assert Calibration.load(tmp_path).cost("fix") == 8.0   # saved to disk
     title, msg, prio = rec.calls[-1]
-    assert title == "fix done" and prio == 0
+    assert title == "fix done" and prio == 1   # failed > 0: priority 1 (item 13)
     assert "fixed=9" in msg and "failures: 1" in msg and "estimated n/a" in msg
 
 

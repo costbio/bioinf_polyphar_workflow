@@ -106,16 +106,41 @@ def _no_notify(title, message, priority=0):
     return False
 
 
+STOP_SIGNALS = (signal.SIGTERM, signal.SIGHUP)
+FLAG_KEYS = ("failed", "incomplete_targets")
+EXIT_FLAGGED = 3
+
+
 def _install_sigterm_handler():
-    """Turn SIGTERM into SystemExit(143) so an interrupted run (docker stop,
-    kill) unwinds through the failure notification. Returns the previous
-    handler, or None when it cannot be installed (not the main thread)."""
+    """Turn SIGTERM (docker stop, kill) into SystemExit(143) and SIGHUP (ssh drop, closed
+    terminal) into SystemExit(129), so an interrupted run unwinds through the failure
+    notification, the run summary and the pool cleanup. Returns {signal: previous handler}
+    for _restore_handlers, or None when they cannot be installed (not the main thread)."""
     def handler(signum, frame):
         raise SystemExit(128 + signum)
+    previous = {}
     try:
-        return signal.signal(signal.SIGTERM, handler)
+        for sig in STOP_SIGNALS:
+            previous[sig] = signal.signal(sig, handler)
     except ValueError:
+        _restore_handlers(previous)
         return None
+    return previous
+
+
+def _restore_handlers(previous) -> None:
+    for sig, handler in (previous or {}).items():
+        signal.signal(sig, handler)
+
+
+def flagged(counts) -> list[str]:
+    """`key=value` for every failure flag (failed units, incomplete targets) set in counts."""
+    out = []
+    for key in FLAG_KEYS:
+        v = (counts or {}).get(key)
+        if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0:
+            out.append(f"{key}={v:g}")
+    return out
 
 
 def make_notifier(layout, args):
@@ -160,15 +185,20 @@ def gate(name, stage, layout, args, notifier, record=None, units=None) -> dict:
         progress.fail(exc)
         raise
     finally:
-        if previous is not None:
-            signal.signal(signal.SIGTERM, previous)
+        _restore_handlers(previous)
     record["elapsed_s"] = time.monotonic() - t0
     progress.done(counts)
     return counts or {}
 
 
 def _run_gated(name, stage, layout, args) -> int:
-    gate(name, stage, layout, args, make_notifier(layout, args))
+    """0, or 3 (like `run`) when the stage finished with failed units / incomplete
+    targets (its done notification then goes out at priority 1)."""
+    counts = gate(name, stage, layout, args, make_notifier(layout, args))
+    if flagged(counts):
+        print(f"{name}: finished with failures: {', '.join(flagged(counts))} "
+              f"(see {name} failed.tsv); exit {EXIT_FLAGGED}", file=sys.stderr)
+        return EXIT_FLAGGED
     return 0
 
 
