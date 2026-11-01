@@ -232,7 +232,11 @@ exits 3, like `run`, and sends its `done` notification at priority 1.
   <accs>`; `counts.outside_segment`). Pocket residues are mapped back to author numbering
   through their heavy-atom coordinates in the extracted chain (pdbfixer renumbers residues
   but keeps the coordinates). When SIFTS leaves a bound empty or `None` (an unobserved
-  end), the pocket is kept and counted as `segment_unverified`.
+  end), the segment's SEQRES range (`RES_BEG..RES_END`) is mapped through the cif's
+  `_pdbx_poly_seq_scheme` to the first and last observed author residue in it
+  (`SIFTS segments source` = `seqres`, else `pdb`; counts `segments_from_seqres`). Only
+  when that fails too (source empty, `segments_unverified`) are the chain's pockets kept
+  and counted as `segment_unverified`.
 - **Target selection**: Pmax ≥ 0.7, top-degree hub + neighbours, O15350 excluded, as in 2023.
   Two changes: protein pairs are de-duplicated as **unordered** pairs, and a tie at the top
   degree takes the **union of the tied hubs** (`--hub-tie-break union`, the default), with one

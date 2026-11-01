@@ -342,9 +342,10 @@ def parse_pockets(pockets_dir, protein_info):
 # are numbered as in the pdbfixer output (renumbered 1..N), so each one is mapped back to
 # its AUTHOR number through the coordinates of its heavy atoms in the extracted chain
 # (02_structures/..., first model), which pdbfixer leaves unchanged. Residues no atom maps
-# for count as not outside; a pocket without any mapped residue, or a chain whose segment
-# bounds cannot be parsed (SIFTS leaves unobserved ends empty or None), is kept and counted
-# as segment_unverified. Single-accession chains and AlphaFold models are not checked.
+# for count as not outside. The structures stage recovers a bound SIFTS leaves empty or
+# None (an unobserved end) from the SEQRES range (SIFTS segments source = seqres); a pocket
+# without any mapped residue, or a chain whose segment bounds still cannot be parsed, is
+# kept and counted as segment_unverified. Single-accession chains and AlphaFold models are not checked.
 
 SEGMENT_COLUMNS = ("SIFTS segments", "SIFTS other accessions")
 MAX_OUTSIDE = 0.5

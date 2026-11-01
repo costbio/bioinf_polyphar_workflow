@@ -493,3 +493,21 @@ def test_matches_2023_pockets(tmp_path):
         assert sorted(new.index) == sorted(old.index), stem
         diff = (new["drugScore"] - old.loc[new.index, "drugScore"]).abs().max()
         assert diff <= 1e-4, (stem, diff)
+
+
+def test_fusion_bounds_recovered_from_seqres_drop_the_partner_pocket(tmp_path):
+    """SIFTS gives P11111's segment on the fusion chain with empty PDB_BEG/PDB_END (it used
+    to stay segment_unverified, every pocket kept). Its SEQRES range 3..7 maps through the
+    cif's _pdbx_poly_seq_scheme to author 1..5 (seq 1-2 are an unobserved tag), so the
+    pockets in the partner's part (P_2, P_4) are now dropped."""
+    from polyphar.stages import structures
+    from test_stage_structures import scheme_cif
+
+    residues = [(1, None, ""), (2, None, "")] + [(s, s - 2, "") for s in range(3, 13)]
+    cd = structures._cif_dict(scheme_cif(tmp_path / "9xyz.cif", {"A": residues}))
+    segments, source = structures.author_segments("None:None", "3:7", cd, "A")
+    assert (segments, source) == ("1:5", "seqres")
+    layout = _chimera_run(tmp_path / "run", segments=segments)
+    counts = pockets.run(layout, SimpleNamespace(nprocs=1, worker_timeout=600), Prog())
+    assert sorted(pd.read_csv(layout.drugscore_csv, index_col=0)["Pocket"]) == ["P_1", "P_3"]
+    assert counts["outside_segment"] == 2 and counts["segment_unverified"] == 0

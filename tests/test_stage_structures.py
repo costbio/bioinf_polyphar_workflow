@@ -346,16 +346,18 @@ def test_run_writes_outputs(tmp_path, monkeypatch):
     info = pd.read_csv(layout.protein_info, dtype=str, keep_default_na=False)
     assert list(info.columns) == ["UniProt ID", "Gene Name", "PDB", "Chain ID", "AlphaFold",
                                   "Resolution", "Structure method", "SIFTS coverage", "File",
-                                  "SIFTS segments", "SIFTS other accessions"]
+                                  "SIFTS segments", "SIFTS other accessions",
+                                  "SIFTS segments source"]
     assert info.to_dict("records") == [
         {"UniProt ID": "P25815", "Gene Name": "S100P_HUMAN", "PDB": "2MJW", "Chain ID": "B",
          "AlphaFold": "False", "Resolution": "-", "Structure method": "SOLUTION NMR",
          "SIFTS coverage": "94", "File": "02_structures/P25815/2mjw_B.pdb",
-         "SIFTS segments": "1:94", "SIFTS other accessions": ""},
+         "SIFTS segments": "1:94", "SIFTS other accessions": "",
+         "SIFTS segments source": "pdb"},
         {"UniProt ID": "P25815", "Gene Name": "S100P_HUMAN", "PDB": "-", "Chain ID": "A",
          "AlphaFold": "True", "Resolution": "-", "Structure method": "-",
          "SIFTS coverage": "-", "File": "02_structures/P25815/AF-P25815-F1.pdb",
-         "SIFTS segments": "", "SIFTS other accessions": ""},
+         "SIFTS segments": "", "SIFTS other accessions": "", "SIFTS segments source": ""},
     ]
     assert (d / "P25815" / "2mjw.cif").read_text().startswith("data_")
     assert not (d / "P25815" / "2mjw_A.pdb").exists()
@@ -374,7 +376,8 @@ def test_run_writes_outputs(tmp_path, monkeypatch):
     assert m["counts"] == {"accessions": 3, "pdb_entries_listed": 3, "chains_extracted": 1,
                            "unmapped": {"PDB absent from SIFTS": 1,
                                         "no SIFTS chain for accession": 1},
-                           "chimeric_chains": 0,
+                           "chimeric_chains": 0, "segments_from_seqres": 0,
+                           "segments_unverified": 0,
                            "af_found": 1, "af_missing": 2, "cif_unverified": 0, "annotation_mismatch": 0,
                            "failed": 0}
 
@@ -522,3 +525,90 @@ def test_end_to_end_two_proteins(tmp_path, monkeypatch):
     x = layout.structures / "Q9NPD8" / "7kzr_X.pdb"
     assert {l[21] for l in _atoms(x)} == {"X"}
     assert len(info[info["AlphaFold"] == "True"]) == 2
+
+
+# --- SIFTS segment bounds from SEQRES when PDB_BEG/PDB_END are unusable ------------------
+
+_SCHEME_TAGS = ("asym_id entity_id seq_id mon_id ndb_seq_num pdb_seq_num auth_seq_num "
+                "pdb_mon_id auth_mon_id pdb_strand_id pdb_ins_code hetero").split()
+
+
+def scheme_cif(path, chains):
+    """A minimal mmCIF with only _pdbx_poly_seq_scheme. chains: author chain ->
+    [(seq_id, author number or None if unobserved, insertion code)]."""
+    rows = []
+    for k, (chain, residues) in enumerate(chains.items()):
+        for seq, num, icode in residues:
+            auth = "?" if num is None else str(num)
+            pdb_seq = str(num if num is not None else seq)
+            mon = "?" if num is None else "ALA"
+            rows.append(f"{chr(65 + k)} 1 {seq} ALA {seq} {pdb_seq} {auth} {mon} {mon} "
+                        f"{chain} {icode or '.'} n")
+    path.write_text("data_9XYZ\n#\nloop_\n" + "".join(f"_pdbx_poly_seq_scheme.{t}\n"
+                                                      for t in _SCHEME_TAGS)
+                    + "\n".join(rows) + "\n#\n")
+    return path
+
+
+def _scheme(tmp_path):
+    # chain A: seq 1..219; author = seq for 1..105, seq-1 after (a deletion in the
+    # numbering), seq 215..219 unobserved; seq 53 is author 52A (insertion code)
+    res = []
+    for s in range(1, 220):
+        num = s if s <= 105 else s - 1
+        icode = ""
+        if s == 53:
+            num, icode = 52, "A"
+        res.append((s, None if s >= 215 else num, icode))
+    return structures._cif_dict(scheme_cif(tmp_path / "9xyz.cif", {"A": res}))
+
+
+def test_usable_pdb_bounds_are_kept(tmp_path):
+    cd = _scheme(tmp_path)
+    assert structures.author_segments("1:100;105:204", "1:100;106:205", cd, "A") == \
+        ("1:100;105:204", "pdb")
+
+
+def test_empty_pdb_bounds_come_from_seqres(tmp_path):
+    cd = _scheme(tmp_path)
+    # seq 210..219 -> author 209..213 (214..218 unobserved); segment 1 keeps its PDB bounds
+    assert structures.author_segments("1:100;209:None", "1:100;210:219", cd, "A") == \
+        ("1:100;209:213", "seqres")
+    assert structures.author_segments(":", "50:60", cd, "A") == ("50:60", "seqres")
+    assert structures.author_segments("None:None", "53:60", cd, "A") == ("52A:60", "seqres")
+
+
+def test_unobserved_or_unmappable_segments(tmp_path):
+    cd = _scheme(tmp_path)
+    # a wholly unobserved segment is dropped; the rest stays
+    assert structures.author_segments("1:10;:", "1:10;215:219", cd, "A") == ("1:10", "seqres")
+    # nothing observed, unknown chain, or unusable SEQRES bounds: left as SIFTS gave it
+    assert structures.author_segments(":", "215:219", cd, "A") == (":", "")
+    assert structures.author_segments(":", "1:10", cd, "Z") == (":", "")
+    assert structures.author_segments(":", "None:10", cd, "A") == (":", "")
+    assert structures.author_segments("", "", cd, "A") == ("", "")
+
+
+def test_run_maps_empty_pdb_bounds_through_the_cif_seqres(tmp_path, monkeypatch):
+    """Real 2MJW: author chain D numbers P25815 95..188 for SEQRES 1..94. With SIFTS
+    PDB_BEG/PDB_END empty the segment is recovered from _pdbx_poly_seq_scheme."""
+    text = SIFTS.read_text().splitlines()
+    out = []
+    for line in text:
+        f = line.split("\t")
+        if f[:2] == ["2mjw", "B"]:
+            continue                      # chain D is then the one selected for P25815
+        if f[:2] == ["2mjw", "D"]:
+            f[5] = f[6] = ""
+        out.append("\t".join(f))
+    s = FakeSession(cifs={"2MJW": _cif_2mjw(tmp_path).read_text()},
+                    af={"P25815": AF_JSON.read_text()}, sifts_text="\n".join(out) + "\n")
+    run, layout = _setup(tmp_path, monkeypatch, [("P25815", "S100P_HUMAN", "2MJW")], s)
+    assert _main(run) == 0
+    info = pd.read_csv(layout.protein_info, dtype=str, keep_default_na=False)
+    row = info[info["PDB"] == "2MJW"].iloc[0]
+    assert (row["Chain ID"], row["SIFTS segments"], row["SIFTS segments source"]) == \
+        ("D", "95:188", "seqres")
+    assert info[info["AlphaFold"] == "True"].iloc[0]["SIFTS segments source"] == ""
+    m = json.loads((layout.structures / "manifest.json").read_text())
+    assert m["counts"]["segments_from_seqres"] == 1 and m["counts"]["segments_unverified"] == 0

@@ -18,7 +18,8 @@ Outputs in 02_structures/:
   Protein_info.csv               one row per extracted chain / AlphaFold model, rebuilt
                                  from the current uniprot.csv on every run; columns
                                  INFO_COLUMNS, incl. SIFTS segments / SIFTS other accessions
-                                 (select_chains) for fusion-chain pocket filtering
+                                 (select_chains) for fusion-chain pocket filtering, and
+                                 SIFTS segments source (pdb | seqres | ""; author_segments)
   unmapped.tsv                   UniProt ID, PDB, reason
   alphafold.tsv                  accession, status (found|missing), version
   annotation_mismatch.tsv        extracted chains whose cif depositor annotation (_struct_ref
@@ -55,7 +56,7 @@ REASON_NO_CHAIN = "no SIFTS chain for accession"
 REASON_NO_PDB = "PDB absent from SIFTS"
 INFO_COLUMNS = ["UniProt ID", "Gene Name", "PDB", "Chain ID", "AlphaFold", "Resolution",
                 "Structure method", "SIFTS coverage", "File", "SIFTS segments",
-                "SIFTS other accessions"]
+                "SIFTS other accessions", "SIFTS segments source"]
 PDB_RECORDS = ("HEADER", "OBSLTE", "TITLE ", "SPLIT ", "CAVEAT", "COMPND", "SOURCE",
                "KEYWDS", "EXPDTA", "NUMMDL", "MDLTYP", "AUTHOR", "REVDAT", "SPRSDE",
                "JRNL  ", "REMARK", "DBREF", "SEQADV", "SEQRES", "MODRES", "HET   ",
@@ -151,21 +152,23 @@ def load_sifts(path):
 
 
 SEL_COLUMNS = ["UniProt ID", "PDB", "Chain ID", "SP coverage", "SIFTS segments",
-               "SIFTS other accessions"]
+               "SIFTS other accessions", "SIFTS seqres segments"]
 
 
 def select_chains(pairs, sifts):
     """Pick one author chain per (UniProt ID, PDB) pair.
 
     Returns (selected[UniProt ID, PDB, Chain ID, SP coverage, SIFTS segments,
-    SIFTS other accessions], unmapped[UniProt ID, PDB, reason]). SP coverage is the number
+    SIFTS other accessions, SIFTS seqres segments], unmapped[UniProt ID, PDB, reason]). SP coverage is the number
     of UniProt residues the chain covers (sum of SP_END - SP_BEG + 1 over its segments);
     the largest wins, ties go to the smallest chain ID. SIFTS segments are this accession's
     segments on the chosen chain in author numbering, `PDB_BEG:PDB_END` joined by ';' in
     SIFTS order (a bound SIFTS leaves empty or None, e.g. an unobserved end, is kept as
     given). SIFTS other accessions are the other SP_PRIMARY accessions SIFTS maps to the
     same chain (';'-joined, sorted; empty for a single-protein chain): a fusion/chimeric
-    construct whose pockets the pockets stage checks against the segments."""
+    construct whose pockets the pockets stage checks against the segments. SIFTS seqres
+    segments are the same segments as `RES_BEG:RES_END` (1-based SEQRES indices), used by
+    author_segments() when a PDB bound is unusable."""
     import pandas as pd
 
     accs = set(pairs["UniProt ID"])
@@ -183,10 +186,12 @@ def select_chains(pairs, sifts):
     chains = {}
     for (pdb, acc, chain), c in cov.items():
         chains.setdefault((pdb, acc), []).append((chain, int(c)))
-    segments = {}
-    for pdb, chain, acc, b, e in zip(s["PDB"], s["CHAIN"], s["SP_PRIMARY"], s["PDB_BEG"],
-                                     s["PDB_END"]):
+    segments, seqres = {}, {}
+    for pdb, chain, acc, b, e, rb, re_ in zip(s["PDB"], s["CHAIN"], s["SP_PRIMARY"],
+                                              s["PDB_BEG"], s["PDB_END"], s["RES_BEG"],
+                                              s["RES_END"]):
         segments.setdefault((pdb, chain, acc), []).append(f"{b.strip()}:{e.strip()}")
+        seqres.setdefault((pdb, chain, acc), []).append(f"{rb.strip()}:{re_.strip()}")
 
     selected, unmapped = [], []
     for acc, pdb in zip(pairs["UniProt ID"], pairs["PDB"]):
@@ -200,9 +205,67 @@ def select_chains(pairs, sifts):
             others = sorted(on_chain.get((key[0], chain), set()) - {acc})
             selected.append((acc, pdb, chain, c,
                              ";".join(segments.get((key[0], chain, acc), [])),
-                             ";".join(others)))
+                             ";".join(others),
+                             ";".join(seqres.get((key[0], chain, acc), []))))
     return (pd.DataFrame(selected, columns=SEL_COLUMNS),
             pd.DataFrame(unmapped, columns=["UniProt ID", "PDB", "reason"]))
+
+
+def _observed_by_seq(d, chain) -> dict:
+    """SEQRES index (seq_id) -> author residue "number[insertion code]" for the OBSERVED
+    residues of author chain `chain`, from the cif's _pdbx_poly_seq_scheme (unobserved
+    residues have '?' author numbers and are left out)."""
+    tag = "_pdbx_poly_seq_scheme."
+    cols = [d.get(tag + k, []) for k in ("pdb_strand_id", "seq_id", "auth_seq_num",
+                                          "pdb_seq_num", "pdb_ins_code")]
+    out = {}
+    for strand, seq, auth, num, icode in zip(*cols):
+        if strand != chain or auth in ("?", ".") or not seq.isdigit():
+            continue
+        try:
+            n = int(num)
+        except ValueError:
+            continue
+        out.setdefault(int(seq), f"{n}{'' if icode in ('?', '.') else icode}")
+    return out
+
+
+def author_segments(segments: str, seqres: str, d, chain):
+    """This accession's segments on `chain` in author numbering, and where their bounds
+    come from: (text, source), source "pdb" (SIFTS PDB_BEG:PDB_END all usable), "seqres"
+    (an unusable PDB bound, e.g. empty or None for an unobserved end, was recovered: the
+    segment's SIFTS RES_BEG..RES_END SEQRES range mapped through the cif's
+    _pdbx_poly_seq_scheme to the first and last OBSERVED residue in it; a wholly
+    unobserved segment is left out), or "" when neither works (`segments` returned as
+    SIFTS gave it; the pockets stage then keeps the chain's pockets as segment_unverified).
+    `d` is the cif dict (_cif_dict) or None."""
+    from polyphar.stages.pockets import parse_segments
+
+    if not str(segments).strip():
+        return segments, ""
+    parts = str(segments).split(";")
+    if parse_segments(segments) is not None:
+        return segments, "pdb"
+    ranges = str(seqres).split(";")
+    if d is None or len(ranges) != len(parts):
+        return segments, ""
+    observed = None
+    out = []
+    for part, rng in zip(parts, ranges):
+        if parse_segments(part) is not None:
+            out.append(part)
+            continue
+        beg, _, end = rng.partition(":")
+        if not (beg.strip().isdigit() and end.strip().isdigit()):
+            return segments, ""
+        if observed is None:
+            observed = _observed_by_seq(d, chain)
+        hits = [observed[k] for k in range(int(beg), int(end) + 1) if k in observed]
+        if hits:
+            out.append(f"{hits[0]}:{hits[-1]}")
+    if not out or parse_segments(";".join(out)) is None:
+        return segments, ""
+    return ";".join(out), "seqres"
 
 
 # --- PDB entries -------------------------------------------------------------------------
@@ -563,15 +626,17 @@ def run(layout, args, progress) -> dict:
 
     rows, af_versions, unverified, mismatches = [], set(), 0, []
     by_acc = {}
-    for a, p, c, cov, segs, others in selected.itertuples(index=False):
-        by_acc.setdefault(a, []).append((p, c, cov, segs, others))
+    for a, p, c, cov, segs, others, seqres in selected.itertuples(index=False):
+        by_acc.setdefault(a, []).append((p, c, cov, segs, others, seqres))
+    seg_sources = {"pdb": 0, "seqres": 0, "": 0}
     for acc in accessions:
-        for pdb, chain, cov, segs, others in by_acc.get(acc, []):
+        for pdb, chain, cov, segs, others, seqres in by_acc.get(acc, []):
             out = _chain_pdb(d, acc, pdb, chain)
             if not _valid_pdb(out):
                 continue
             cif = d / acc / f"{pdb.lower()}.cif"
             hdr = headers.get((acc, pdb))
+            cd = None
             if hdr is None:            # extracted in an earlier run: re-read from the cif
                 hdr = {"Resolution": "-", "Structure method": "-", "cif_check": "unverified",
                        "cif_accessions": []}
@@ -579,16 +644,22 @@ def run(layout, args, progress) -> dict:
                     cd = _cif_dict(cif)
                     status, accs = _verify(_chain_accessions(cd), chain, acc)
                     hdr = {**_header_from(cd), "cif_check": status, "cif_accessions": accs}
+            segs, source = author_segments(segs, seqres, None, chain)
+            if source == "" and segs.strip():   # an unusable PDB bound: try the SEQRES range
+                if cd is None and _valid_cif(cif):
+                    cd = _cif_dict(cif)
+                segs, source = author_segments(segs, seqres, cd, chain)
+            seg_sources[source] += 1
             unverified += hdr["cif_check"] == "unverified"
             if hdr["cif_check"] == "mismatch":
                 mismatches.append((acc, pdb.upper(), chain, ",".join(hdr["cif_accessions"])))
             rows.append([acc, names[acc], pdb.upper(), chain, False, hdr["Resolution"],
                          hdr["Structure method"], cov, f"{STAGE_DIR}/{acc}/{out.name}",
-                         segs, others])
+                         segs, others, source])
         af = _af_pdb(d, acc)
         if _valid_af(af):
             rows.append([acc, names[acc], "-", "A", True, "-", "-", "-",
-                         f"{STAGE_DIR}/{acc}/{af.name}", "", ""])
+                         f"{STAGE_DIR}/{acc}/{af.name}", "", "", ""])
             version = af_state.get(acc, ("", None))[1]
             if version is not None:
                 af_versions.add(version)
@@ -610,6 +681,8 @@ def run(layout, args, progress) -> dict:
         "chains_extracted": int((~info["AlphaFold"]).sum()) if len(info) else 0,
         "unmapped": {r: int(reasons[r]) for r in sorted(reasons.index)},
         "chimeric_chains": int((info["SIFTS other accessions"] != "").sum()) if len(info) else 0,
+        "segments_from_seqres": seg_sources["seqres"],
+        "segments_unverified": seg_sources[""],
         "af_found": int(info["AlphaFold"].sum()) if len(info) else 0,
         "af_missing": sum(af_state.get(a, ("",))[0] == "missing" for a in accessions),
         "cif_unverified": unverified,
