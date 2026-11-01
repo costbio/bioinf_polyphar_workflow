@@ -16,6 +16,80 @@ Everything runs through one CLI, `polyphar <stage>`, in a Docker image. DoGSiteS
 exception: it runs on the host (see [DoGSiteScorer](#dogsitescorer)). Each stage prints and
 notifies its exact work units and ETA before it starts, and every stage can be resumed.
 
+## First-time server setup
+
+Do these once per machine, in this order. Each step checks something the next one depends on.
+You need `git`, `docker` (your user in the `docker` group), `conda` or `mamba`, `tmux` and a
+system `python3` ≥ 3.8 on the host.
+
+1. **Clone the repo and create the host env.** The DoGSiteScorer tests and the regression
+   checks run on the host.
+
+       git clone https://github.com/costbio/bioinf_polyphar_workflow.git ~/repos/bioinf_polyphar_workflow
+       REPO=~/repos/bioinf_polyphar_workflow && cd "$REPO"
+       conda env create -f environment.yml && conda activate polyphar && pip install -e .
+
+2. **Install and license DoGSiteScorer on the host**, then check that it runs. `--benchmark`
+   first runs the worker's preflight, which is one DoGSiteScorer call on a bench chain. It
+   then stores the `pockets` calibration in `~/.polyphar/calibration.json`. Exit code 3 means
+   a license or installation problem, and the binary's error is printed.
+
+       export DOGSITE_BIN=/opt/dogsite/dogsite
+       python3 "$REPO"/bin/polyphar-dogsite-worker --benchmark
+
+3. **Build the image.** The tag you choose is what `POLYPHAR_VERSION` selects later. Also tag
+   it `dev`: `tests/test_docker.py` looks for `polyphar:dev` and skips silently without it.
+
+       docker build --build-arg POLYPHAR_GIT_COMMIT=$(git rev-parse HEAD) \
+           -f docker/Dockerfile -t polyphar:1.0 -t polyphar:dev .
+       export POLYPHAR_VERSION=1.0
+
+4. **Check the machine.**
+   - The PocketMatch binaries run in the image. `Exec format error` means the kernel lacks
+     IA32 emulation (see [Server checks](#server-checks)).
+   - The wrapper runs as your user, with the real DoGSiteScorer.
+   - RCSB and AlphaFold downloads work.
+
+       pytest -W error tests/test_docker.py
+       pytest -W error -m "dogsite and not regression" tests/test_stage_pockets.py
+       pytest -W error tests/test_stage_structures.py -k end_to_end
+
+5. **Compare the new DoGSiteScorer with the 2023 pockets.** This tells you whether the newly
+   licensed binary behaves like the one used in 2023. It reruns three net2 PLK1 chains and
+   requires the same pocket names, with drugScore within 1e-4. It needs only a small part of
+   the 2023 data, so copy that from the workstation (adjust the host name):
+
+       mkdir -p ~/adep_csb/disease_subtypes/Liver_cancer/net2/{pockets,pdbfixer/P53350}
+       rsync -av workstation:/mnt/c/experiments/adep_csb/disease_subtypes/Liver_cancer/net2/pockets/DrugScore.csv \
+           ~/adep_csb/disease_subtypes/Liver_cancer/net2/pockets/
+       rsync -av 'workstation:/mnt/c/experiments/adep_csb/disease_subtypes/Liver_cancer/net2/pdbfixer/P53350/{2ogq_A,4o56_A,4h5x_B}.pdb' \
+           ~/adep_csb/disease_subtypes/Liver_cancer/net2/pdbfixer/P53350/
+       ADEP_DATA=~/adep_csb pytest -W error -m "dogsite and regression" tests/test_stage_pockets.py
+
+   If this fails, the DoGSiteScorer version differs from 2023. Don't start a rerun until
+   that is understood: pockets, and everything after them, would not be comparable.
+
+6. **Set up Pushover and send a test notification** (see
+   [Pushover notifications](#pushover-notifications) for the file format):
+
+       mkdir -p ~/.polyphar && $EDITOR ~/.polyphar/pushover.env && chmod 600 ~/.polyphar/pushover.env
+       set -a && . ~/.polyphar/pushover.env && set +a && pytest -m pushover tests/test_notify.py
+
+7. **Calibrate the container stages.** Run this from any directory. `pockets` was already
+   calibrated on the host in step 2.
+
+       mkdir -p ~/runs && cd ~/runs && NPROCS=64 "$REPO"/bin/polyphar-docker benchmark
+
+8. **Optional: run end to end with the real binary** (~minutes, two proteins, 3 ligands).
+   Run it without `POLYPHAR_E2E_PMAX` first. If `select` stops with "no protein pair has
+   Pmax >= 0.7", that is a property of these two test proteins, not a fault: rerun it with
+   `POLYPHAR_E2E_PMAX=0.3`.
+
+       cd "$REPO" && pytest tests/test_run_e2e.py
+
+Then follow the quick start: create a run folder, check `run --dry-run`, and start the run
+in `tmux`.
+
 ## Quick start
 
 Build the image once from the repo root. The git commit is recorded in every stage manifest.
