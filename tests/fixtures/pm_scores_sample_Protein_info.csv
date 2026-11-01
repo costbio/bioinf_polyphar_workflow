@@ -1,0 +1,9 @@
+UniProt ID,Gene Name,PDB,Chain ID,AlphaFold,Resolution,Structure method,SIFTS coverage,File
+O14746,TERT_HUMAN,-,-,True,-,-,-,02_structures/O14746/AF-O14746-F1.pdb
+O60218,AK1BA_HUMAN,-,-,True,-,-,-,02_structures/O60218/AF-O60218-F1.pdb
+P06493,CDK1_HUMAN,-,-,True,-,-,-,02_structures/P06493/AF-P06493-F1.pdb
+P11388,TOP2A_HUMAN,-,-,True,-,-,-,02_structures/P11388/AF-P11388-F1.pdb
+P15559,NQO1_HUMAN,-,-,True,-,-,-,02_structures/P15559/AF-P15559-F1.pdb
+P48431,SOX2_HUMAN,-,-,True,-,-,-,02_structures/P48431/AF-P48431-F1.pdb
+P49450,CENPA_HUMAN,-,-,True,-,-,-,02_structures/P49450/AF-P49450-F1.pdb
+P53350,PLK1_HUMAN,-,-,True,-,-,-,02_structures/P53350/AF-P53350-F1.pdb

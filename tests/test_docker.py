@@ -98,3 +98,9 @@ def test_wrapper_rejects_missing_run_dir(tmp_path):
     assert r.returncode == 2
     assert r.stderr.strip() == f"polyphar-docker: run dir {missing} does not exist"
     assert not missing.exists()
+
+
+@pytest.mark.docker
+def test_image_records_pocketmatch_commit(image):
+    r = _sh(image, 'echo "$PM_COMMIT"')
+    assert r.stdout.strip() == "4648bff3c4d233104c6d1f4ced351b5f7944972a"

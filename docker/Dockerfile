@@ -49,6 +49,7 @@ ENV PATH=/opt/conda/bin:$PATH \
     HOME=/tmp \
     MPLCONFIGDIR=/tmp/matplotlib \
     PM_BIN_DIR=/opt/pocketmatch \
+    PM_COMMIT=$PM_COMMIT \
     POLYPHAR_HOME=/polyphar_home \
     POLYPHAR_GIT_COMMIT=$POLYPHAR_GIT_COMMIT
 
