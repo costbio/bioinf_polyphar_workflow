@@ -15,6 +15,7 @@ import importlib
 import os
 import signal
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -96,7 +97,8 @@ def _load_stage(name: str):
         raise
 
 
-# Wired separately (multi-stage run, estimate, benchmark); not per-stage gated.
+# Not per-stage gated: estimate and benchmark run directly; run (stages/run.py)
+# passes every stage through gate() itself.
 UNGATED = frozenset({"run", "estimate", "benchmark"})
 
 
@@ -116,40 +118,55 @@ def _install_sigterm_handler():
         return None
 
 
-def _run_gated(name, stage, layout, args) -> int:
-    """ETA gate: units -> estimate -> print + notify start -> (dry-run exit) ->
-    run with Progress -> done/fail."""
+def make_notifier(layout, args):
+    """notify() bound to the run folder, or a no-op with --no-notify."""
+    if args.no_notify:
+        return _no_notify
+
+    def notifier(title, message, priority=0):
+        return notify(title, message, priority, run_dir=layout.run_dir)
+    return notifier
+
+
+def gate(name, stage, layout, args, notifier, record=None) -> dict:
+    """ETA gate: units -> estimate -> print + notify start -> (dry-run: stop) ->
+    run with Progress -> done/fail. Returns the stage's counts ({} for a dry run).
+    `record`, when given, receives units / estimate_s / elapsed_s (also on failure)."""
+    record = {} if record is None else record
     tpj = getattr(args, "threads_per_job", 1) or 1
     units = stage.units(layout, args)
     calib = Calibration.load(polyphar_home())
     est = estimate_stage(name, units, args.nprocs, calib, PARALLEL_EFFICIENCY,
                          threads_per_job=tpj)
+    record.update(units=f"{units.count} ({units.cost_basis})", estimate_s=est.seconds)
     eta = format_eta(est, datetime.now())
     line = f"{name}: {units.count} units ({units.cost_basis}) - ETA {eta}"
     print(line, flush=True)
-    if args.no_notify:
-        notifier = _no_notify
-    else:
-        def notifier(title, message, priority=0):
-            return notify(title, message, priority, run_dir=layout.run_dir)
-
     if args.dry_run:
-        return 0   # print the ETA only; nothing starts, nothing is notified
+        return {}   # print the ETA only; nothing starts, nothing is notified
     notifier(f"{name} starting", line)
     total_size = float(sum(units.sizes)) if units.sizes else None
     progress = Progress(name, units.count, est, notifier, total_size=total_size,
                         calib=calib, slots=slots_for(name, args.nprocs, tpj) or 1.0,
                         log_path=layout.logs / f"{name}.log")
     previous = _install_sigterm_handler()
+    t0 = time.monotonic()
     try:
         counts = stage.run(layout, args, progress)
     except BaseException as exc:   # incl. KeyboardInterrupt / SIGTERM (docker stop)
+        record["elapsed_s"] = time.monotonic() - t0
         progress.fail(exc)
         raise
     finally:
         if previous is not None:
             signal.signal(signal.SIGTERM, previous)
+    record["elapsed_s"] = time.monotonic() - t0
     progress.done(counts)
+    return counts or {}
+
+
+def _run_gated(name, stage, layout, args) -> int:
+    gate(name, stage, layout, args, make_notifier(layout, args))
     return 0
 
 
@@ -162,6 +179,8 @@ def main(argv=None) -> int:
     layout = RunLayout(args.run_dir)
     if args.command not in UNGATED:
         return _run_gated(args.command, stage, layout, args)
+    if hasattr(stage, "main"):   # run: its own dry-run and multi-stage gate
+        return stage.main(layout, args)
     if args.dry_run:
         wu = stage.units(layout, args)
         print(f"{args.command}: {wu.count} units ({wu.cost_basis})")

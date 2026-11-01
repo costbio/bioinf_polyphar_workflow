@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import os
+from datetime import datetime
 from pathlib import Path
 
 from polyphar.common import http_session
@@ -30,8 +31,36 @@ def run_name(run_dir=None) -> str:
     return Path(run_dir).resolve().name if run_dir else Path.cwd().name
 
 
+NOTIFICATIONS_LOG = Path("logs") / "notifications.log"
+
+
+def _record(run_dir, stamp: str, priority: int, sent: bool, title: str, message: str) -> None:
+    """Append one line to <run_dir>/logs/notifications.log: timestamp, priority,
+    sent / not sent, title, message (newlines and tabs escaped). Never raises."""
+    if run_dir is None:
+        return
+    try:
+        esc = lambda x: str(x).replace("\\", "\\\\").replace("\t", "\\t").replace("\n", "\\n")
+        path = Path(run_dir) / NOTIFICATIONS_LOG
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(f"{stamp}\t{priority}\t{'sent' if sent else 'not sent'}\t"
+                     f"{esc(title)}\t{esc(message)}\n")
+    except Exception as exc:
+        log.warning("could not record the notification: %s: %s", type(exc).__name__, exc)
+
+
 def notify(title: str, message: str, priority: int = 0, run_dir=None) -> bool:
-    """Send one push notification. True only if Pushover accepted it."""
+    """Send one push notification. True only if Pushover accepted it. With run_dir,
+    every notification (sent or not, e.g. without credentials) is also recorded in
+    <run_dir>/logs/notifications.log."""
+    stamp = datetime.now().astimezone().isoformat(timespec="microseconds")
+    sent = _send(title, message, priority, run_dir)
+    _record(run_dir, stamp, priority, sent, title, message)
+    return sent
+
+
+def _send(title: str, message: str, priority: int, run_dir) -> bool:
     try:
         token = os.environ.get("PUSHOVER_APP_TOKEN")
         user = os.environ.get("PUSHOVER_USER_KEY")
