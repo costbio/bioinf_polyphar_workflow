@@ -1,4 +1,5 @@
 import json
+import os
 import math
 import re
 from pathlib import Path
@@ -228,3 +229,150 @@ def test_fetch_live():
     df, release = fetch_uniprot(["P25815", "Q9NPD8"], http_session())
     assert re.fullmatch(r"\d{4}_\d{2}", release)
     assert "2MJW" in df.set_index("Entry").loc["P25815", "PDB"].split(";")
+
+
+# ------------------------------------------------- one protein per workbook row
+ROW_TABLE = {
+    "P0DP23": "P0DP23\tCALM1_HUMAN\tCALM1\treviewed\t9606\t",
+    "P0DP24": "P0DP24\tCALM2_HUMAN\tCALM2\treviewed\t9606\t",
+    "P0DP25": "P0DP25\tCALM3_HUMAN\tCALM3\treviewed\t9606\t",
+    "Q96HY3": "Q96HY3\tX_HUMAN\tX\tunreviewed\t9606\t",
+    "P11111": "P11111\tA_HUMAN\tAAA\treviewed\t9606\t",
+}
+CALM_IDS = ["Q96HY3", "P0DP23", "P0DP24", "P0DP25"]
+
+
+def _with_rows(tmp_path, monkeypatch, ids, rows_text, table=ROW_TABLE):
+    run, layout = _setup_run(tmp_path, monkeypatch, ids, FakeSession(table))
+    if rows_text is not None:
+        layout.rows_tsv.write_text("row\tgene\tids\tsolo\n" + rows_text)
+    return run, layout
+
+
+def _go(run):
+    return cli.main(["uniprot", "--run-dir", str(run), "--no-notify"])
+
+
+def test_rows_keep_gene_matching_accession(tmp_path, monkeypatch):
+    run, layout = _with_rows(tmp_path, monkeypatch, CALM_IDS + ["P11111"],
+                             "3\tcalm3 \tQ96HY3;P0DP23;P0DP24;P0DP25\t\n")
+    assert _go(run) == 0
+    assert pd.read_csv(layout.uniprot_csv, dtype=str)["Entry"].tolist() == ["P0DP25", "P11111"]
+    d = layout.stage_dir("01_uniprot")
+    ex = (d / "excluded.tsv").read_text()
+    assert "P0DP23\tsame workbook row as P0DP25 (gene calm3)\n" in ex
+    assert "P0DP24\tsame workbook row as P0DP25 (gene calm3)\n" in ex
+    assert "Q96HY3\tunreviewed\n" in ex
+    m = json.loads((d / "manifest.json").read_text())
+    assert m["counts"]["row_collapsed"] == 2 and m["counts"]["kept"] == 2
+    assert [Path(i["path"]).name for i in m["inputs"]] == ["ids.txt", "rows.tsv"]
+    assert m["inputs"][1]["sha256"] == sha256_file(layout.rows_tsv)
+
+
+def test_rows_ambiguous_or_unmatched_gene_stops_with_candidates(tmp_path, monkeypatch):
+    run, layout = _with_rows(tmp_path, monkeypatch, CALM_IDS,
+                             "7\tNOPE\tQ96HY3;P0DP23;P0DP24;P0DP25\t\n")
+    with pytest.raises(ValueError, match=r"row 7.*NOPE.*P0DP23 \(CALM1\).*P0DP25 \(CALM3\)"):
+        _go(run)
+    assert not (layout.stage_dir("01_uniprot") / "manifest.json").exists()
+    assert not layout.uniprot_csv.exists()
+
+
+def test_rows_two_gene_matches_is_ambiguous(tmp_path, monkeypatch):
+    table = dict(ROW_TABLE, P0DP24="P0DP24\tCALM2_HUMAN\tCALM3\treviewed\t9606\t")
+    run, _ = _with_rows(tmp_path, monkeypatch, CALM_IDS,
+                        "7\tCALM3\tP0DP23;P0DP24;P0DP25\t\n", table)
+    with pytest.raises(ValueError, match=r"row 7"):
+        _go(run)
+
+
+def test_rows_accession_kept_via_another_row_is_not_dropped(tmp_path, monkeypatch):
+    # P0DP23 also is the sole accession of another row (solo) -> stays alongside CALM3
+    run, layout = _with_rows(tmp_path, monkeypatch, ["P0DP23", "P0DP25"],
+                             "3\tCALM3\tP0DP23;P0DP25\tP0DP23\n")
+    assert _go(run) == 0
+    assert pd.read_csv(layout.uniprot_csv, dtype=str)["Entry"].tolist() == ["P0DP23", "P0DP25"]
+    m = json.loads((layout.stage_dir("01_uniprot") / "manifest.json").read_text())
+    assert m["counts"]["row_collapsed"] == 0
+
+
+def test_rows_accession_winning_another_row_is_not_dropped(tmp_path, monkeypatch):
+    run, layout = _with_rows(tmp_path, monkeypatch, ["P0DP23", "P0DP24", "P0DP25"],
+                             "3\tCALM3\tP0DP23;P0DP25\t\n9\tCALM1\tP0DP23;P0DP24\t\n")
+    assert _go(run) == 0
+    assert pd.read_csv(layout.uniprot_csv, dtype=str)["Entry"].tolist() == ["P0DP23", "P0DP25"]
+
+
+def test_rows_zero_or_one_kept_candidate_is_untouched(tmp_path, monkeypatch):
+    run, layout = _with_rows(tmp_path, monkeypatch, ["Q96HY3", "P11111"],
+                             "2\tWHATEVER\tQ96HY3;P11111\t\n5\tGONE\tQ96HY3\t\n")
+    assert _go(run) == 0
+    assert pd.read_csv(layout.uniprot_csv, dtype=str)["Entry"].tolist() == ["P11111"]
+
+
+def test_no_rows_tsv_means_no_row_collapsed_count_and_all_kept(tmp_path, monkeypatch):
+    run, layout = _with_rows(tmp_path, monkeypatch, CALM_IDS, None)
+    assert _go(run) == 0
+    assert pd.read_csv(layout.uniprot_csv, dtype=str)["Entry"].tolist() == [
+        "P0DP23", "P0DP24", "P0DP25"]
+    m = json.loads((layout.stage_dir("01_uniprot") / "manifest.json").read_text())
+    assert "row_collapsed" not in m["counts"]
+
+
+def test_rows_tsv_change_invalidates_resume(tmp_path, monkeypatch):
+    run, layout = _with_rows(tmp_path, monkeypatch, ["P0DP23", "P0DP25"],
+                             "3\tCALM3\tP0DP23;P0DP25\t\n")
+    assert _go(run) == 0
+    assert uniprot.units(layout, None).count == 0
+    layout.rows_tsv.write_text("row\tgene\tids\tsolo\n3\tCALM1\tP0DP23;P0DP25\t\n")
+    assert uniprot.units(layout, None).count == 1
+    assert _go(run) == 0
+    assert pd.read_csv(layout.uniprot_csv, dtype=str)["Entry"].tolist() == ["P0DP23"]
+    layout.rows_tsv.unlink()                               # removal also invalidates
+    assert uniprot.units(layout, None).count == 1
+
+
+# ------------------------------------------------------- AD regression (2023 lists)
+AD = Path(os.environ.get("ADEP_DATA", "")) / "disease_subtypes" / "Alzhemier"
+
+
+@pytest.fixture(scope="module")
+def ad_workbook(tmp_path_factory):
+    import shutil
+    local = tmp_path_factory.mktemp("ad") / "w.xlsx"
+    shutil.copy(AD / "PPIN_ROSMAP_clusterFeatures_v7.xlsx", local)
+    return local
+
+
+def _ad_2023(n):
+    if n == 1:
+        df = pd.read_csv(AD / "Cluster1" / "Cluster10_UniProt.csv", dtype=str)
+        return set(df["Entry"])
+    return {l.strip() for l in (AD / f"Cluster{n}" / f"Cluster{n}.txt").read_text().splitlines()
+            if l.strip()}
+
+
+@pytest.mark.network
+@pytest.mark.regression
+@pytest.mark.parametrize("n", [1, 2, 3, 4])
+def test_ad_cluster_kept_matches_2023(n, ad_workbook, tmp_path, monkeypatch):
+    monkeypatch.setenv("POLYPHAR_HOME", str(tmp_path / "home"))
+    run = tmp_path / "run"
+    (run / "inputs").mkdir(parents=True)
+    import shutil
+    shutil.copy(ad_workbook, run / "inputs" / "w.xlsx")
+    assert cli.main(["ids", "--run-dir", str(run), "--no-notify", "--xlsx", "inputs/w.xlsx",
+                     "--sheet", f"cluster{n}", "--id-column", "UNIPROTID",
+                     "--gene-column", "GeneID"]) == 0
+    assert cli.main(["uniprot", "--run-dir", str(run), "--no-notify"]) == 0
+    layout = RunLayout(run)
+    got = set(pd.read_csv(layout.uniprot_csv, dtype=str)["Entry"])
+    ref = _ad_2023(n)
+    d = layout.stage_dir("01_uniprot")
+    print(f"cluster{n}: got {len(got)} ref {len(ref)} only_now={sorted(got - ref)} "
+          f"only_2023={sorted(ref - got)}")
+    print((d / "renamed.tsv").read_text())
+    # Cluster3: the 2023 list holds 'P8529', a truncated accession (not a UniProt entry);
+    # the v7 workbook has the full P85299. This is the one explained difference.
+    known = {3: ({"P85299"}, {"P8529"})}.get(n, (set(), set()))
+    assert (got - ref, ref - got) == known

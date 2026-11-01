@@ -109,10 +109,16 @@ Make a run folder (one per subtype), put the inputs in `inputs/`, and run everyt
         --id-column "uniprot Entry" --reviewed-column "Reviewed/unreviewed"
 
 The HCC workbook `clusters_features_ppi.xlsx` has tabs `net1`, `net2`, `net3`. The Alzheimer
-workbook has no reviewed column:
+workbook has no reviewed column and needs `--gene-column`:
 
     "$REPO"/bin/polyphar-docker run --xlsx inputs/PPIN_ROSMAP_clusterFeatures_v7.xlsx \
-        --sheet clusterN --id-column UNIPROTID
+        --sheet clusterN --id-column UNIPROTID --gene-column GeneID
+
+One workbook row is one protein. Some AD cells list several accessions (the CALM3 row holds
+CALM1, CALM2 and CALM3), and `--gene-column` makes the `uniprot` stage keep only the reviewed
+accession whose primary gene name equals the row's gene. The stage stops with the candidates
+listed if none or several match. HCC needs no gene column: it has one accession per row, and
+every reviewed row is kept.
 
 The wrapper uses the current directory as the run folder (or `$POLYPHAR_RUN_DIR`). It mounts the run folder at `/work` and `~/.polyphar` (or
 `$POLYPHAR_HOME`) at `/polyphar_home`, runs as your user, and passes `NPROCS` through.
@@ -141,7 +147,7 @@ DoGSiteScorer worker, and stops it when the container exits.
 ### `polyphar run`
 
 `run [--from STAGE] [--to STAGE]` runs the stages in order, or the contiguous range you give.
-It accepts every stage's own options (`--xlsx/--txt/--sheet/--id-column/--reviewed-column`,
+It accepts every stage's own options (`--xlsx/--txt/--sheet/--id-column/--reviewed-column/--gene-column`,
 `--ph`, `--worker-timeout`, `--worker-dead-after`, `--pm-bin-dir`, `--pmax`, `--exclude`,
 `--hub-tie-break`, `--library`, `--seed`, `--chunk-size`, `--threads-per-job`,
 `--chunk-timeout`), plus `--max-failed-fraction` and `--keep-going`.
@@ -227,7 +233,7 @@ All stages take `--run-dir` (default `/work` in the container, else the current 
     polyphar ids --xlsx inputs/clusters_features_ppi.xlsx --sheet net1 \
                  --id-column "uniprot Entry" --reviewed-column "Reviewed/unreviewed"
                  # AD: --xlsx inputs/PPIN_ROSMAP_clusterFeatures_v7.xlsx --sheet clusterN
-                 #     --id-column UNIPROTID      or: --txt inputs/ids.txt
+                 #     --id-column UNIPROTID --gene-column GeneID   or: --txt inputs/ids.txt
     polyphar uniprot                                  # reviewed human entries only
     polyphar structures                               # SIFTS chains + AlphaFold F1 models
     polyphar fix [--ph 7.0]
@@ -278,6 +284,12 @@ exits 3, like `run`, and sends its `done` notification at priority 1.
 - **cif annotation cross-check.** Each extracted chain's depositor annotation (`_struct_ref`
   UNP) is compared with SIFTS. A mismatch is a warning only and is listed in
   `annotation_mismatch.tsv`.
+- **One protein per workbook row (AD).** A workbook cell with several accessions (AD
+  `UNIPROTID`) is resolved to the single reviewed human accession whose primary gene name equals
+  the row's `GeneID` (`--gene-column`); the others are listed in `excluded.tsv` as `same
+  workbook row as ...`. The 2023 AD lists had one protein per row, and this rule reproduces
+  them (it only affects the CALM3 row in cluster1). HCC has one accession per row and is
+  unchanged.
 - **Reviewed human entries only** (`Reviewed == reviewed`, organism 9606). Secondary
   accessions are renamed to their primary (`renamed.tsv`). Excluded entries are listed in
   `excluded.tsv`.

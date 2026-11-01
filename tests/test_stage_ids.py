@@ -139,3 +139,63 @@ def test_hcc_tabs_match_known_counts(hcc_ids):
     assert set(hcc_ids["net1"]) != _ref("net1/net1UniprotID.txt")
     assert set(hcc_ids["net2"]) == _ref("net2/net2.txt") and len(hcc_ids["net2"]) == 156
     assert set(hcc_ids["net3"]) == _ref("net3/net3.txt") and len(hcc_ids["net3"]) == 197
+
+
+# ------------------------------------------------------- --gene-column / rows.tsv
+def _gene_xlsx(path, rows, sheet="cluster1"):
+    df = pd.DataFrame(rows, columns=["GeneID", "UNIPROTID"])
+    with pd.ExcelWriter(path) as xw:
+        df.to_excel(xw, sheet_name=sheet, index=False)
+    return path
+
+
+def _ids_cli(tmp_path, monkeypatch, rows, extra=("--gene-column", "GeneID")):
+    monkeypatch.setenv("POLYPHAR_HOME", str(tmp_path / "home"))
+    run = tmp_path / "run"
+    (run / "inputs").mkdir(parents=True, exist_ok=True)
+    _gene_xlsx(run / "inputs" / "w.xlsx", rows)
+    rc = cli.main(["ids", "--run-dir", str(run), "--no-notify", "--xlsx", "inputs/w.xlsx",
+                   "--sheet", "cluster1", "--id-column", "UNIPROTID", *extra])
+    assert rc == 0
+    return RunLayout(run)
+
+
+GENE_ROWS = [("AAA", "P1"), ("CALM3", "Q96HY3, B4DJ51, P0DP23"), ("BBB", "P2;P1"), ("CCC", None)]
+
+
+def test_gene_column_writes_rows_tsv_only_for_multi_id_rows(tmp_path, monkeypatch):
+    layout = _ids_cli(tmp_path, monkeypatch, GENE_ROWS)
+    assert layout.rows_tsv.read_text() == (
+        "row\tgene\tids\tsolo"
+        + "\n3\tCALM3\tQ96HY3;B4DJ51;P0DP23\t\n4\tBBB\tP2;P1\tP1\n")
+    assert layout.ids_txt.read_text() == "P1\nQ96HY3\nB4DJ51\nP0DP23\nP2\n"
+    m = json.loads((layout.stage_dir("00_ids") / "manifest.json").read_text())
+    assert m["args"]["gene_column"] == "GeneID"
+
+
+def test_without_gene_column_no_rows_tsv_and_stale_one_removed(tmp_path, monkeypatch):
+    layout = _ids_cli(tmp_path, monkeypatch, GENE_ROWS)
+    assert layout.rows_tsv.exists()
+    _ids_cli(tmp_path, monkeypatch, GENE_ROWS, extra=())
+    assert not layout.rows_tsv.exists()
+    m = json.loads((layout.stage_dir("00_ids") / "manifest.json").read_text())
+    assert m["args"]["gene_column"] is None
+
+
+def test_gene_column_missing_is_a_clear_error(tmp_path):
+    x = _gene_xlsx(tmp_path / "w.xlsx", GENE_ROWS)
+    from polyphar.stages.ids import _read_xlsx
+    with pytest.raises(ValueError, match=r"'bogus'.*GeneID"):
+        _read_xlsx(x, "cluster1", "UNIPROTID", None, "bogus")
+
+
+def test_gene_column_rejected_with_txt(tmp_path):
+    with pytest.raises(SystemExit, match="--gene-column"):
+        cli.main(["ids", "--run-dir", str(tmp_path), "--no-notify", "--txt", "a.txt",
+                  "--gene-column", "GeneID"])
+
+
+def test_run_accepts_gene_column():
+    args = cli.build_parser().parse_args(["run", "--xlsx", "a.xlsx", "--sheet", "s",
+                                          "--id-column", "i", "--gene-column", "GeneID"])
+    assert args.gene_column == "GeneID"

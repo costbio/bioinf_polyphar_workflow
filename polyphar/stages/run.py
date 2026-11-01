@@ -51,7 +51,7 @@ from polyphar.benchmark import (BENCH_STAGES, ORDER, STAGE_DIRS, estimate_rows, 
                                 run_benchmark)
 from polyphar.eta import Calibration, format_duration, polyphar_home
 
-IDS_SOURCE = ("xlsx", "txt", "sheet", "id_column", "reviewed_column")
+IDS_SOURCE = ("xlsx", "txt", "sheet", "id_column", "reviewed_column", "gene_column")
 FLAG_KEYS = ("failed", "incomplete_targets")
 EXIT_USAGE = 2
 EXIT_FLAGGED = 3

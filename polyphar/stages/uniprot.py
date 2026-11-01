@@ -3,7 +3,7 @@
 Outputs in 01_uniprot/:
   uniprot.csv     kept rows (reviewed, human), one per primary accession
   not_found.txt   requested accessions UniProt does not return at all
-  excluded.tsv    accession, reason  (reason: unreviewed | non_human)
+  excluded.tsv    accession, reason  (reason: unreviewed | non_human | same workbook row as ...)
   renamed.tsv     requested, primary (secondary accession -> current primary)
   failed.tsv      header only: a failed batch aborts the stage instead
   manifest.json   inputs (ids.txt sha256), versions {"uniprot": release}, counts
@@ -137,6 +137,56 @@ def classify(requested, df, requery=None):
             "non_human": non_human, "renamed": renamed}
 
 
+# --- one protein per workbook row ----------------------------------------------
+
+def read_rows(path):
+    """Parse 00_ids/rows.tsv -> [(row, gene, [ids], {solo ids})]."""
+    out = []
+    lines = Path(path).read_text(encoding="utf-8").splitlines()
+    for line in lines[1:]:
+        if not line.strip():
+            continue
+        f = line.split("\t")
+        f += [""] * (4 - len(f))
+        out.append((f[0], f[1], [i for i in f[2].split(";") if i], {i for i in f[3].split(";") if i}))
+    return out
+
+
+def collapse_rows(rows, kept, renamed):
+    """Resolve multi-accession workbook rows to one protein each.
+
+    `rows`: read_rows() output; `kept`: reviewed-human DataFrame; `renamed`: {requested: primary}.
+    A row with several kept accessions keeps the one whose `Gene Names (primary)` equals the
+    row's gene (case-insensitive); none or several matching raises ValueError. Returns
+    {dropped accession: reason}. An accession also kept by another row (as that row's
+    winner, or as a single-accession row) is not dropped."""
+    genes = dict(zip(kept["Entry"], kept["Gene Names (primary)"]))
+    winners, drops, protected = {}, {}, set()
+    for row, gene, ids, solo in rows:
+        gene = gene.strip()
+        protected |= {renamed.get(i, i) for i in solo}
+        cands = list(dict.fromkeys(renamed.get(i, i) for i in ids if renamed.get(i, i) in genes))
+        if len(cands) < 2:
+            if cands:
+                winners[row] = cands[0]
+            continue
+        want = gene.strip().casefold()
+        match = [a for a in cands if str(genes[a]).strip().casefold() == want] if want else []
+        if len(match) != 1:
+            listing = ", ".join(f"{a} ({genes[a]})" for a in cands)
+            raise ValueError(
+                f"workbook row {row} (gene {gene!r}): cannot pick one protein, "
+                f"{len(match)} of its accessions match the gene; candidates: {listing}. "
+                "Fix the workbook row or the gene column and rerun `polyphar ids`.")
+        winners[row] = match[0]
+        for a in cands:
+            if a != match[0]:
+                drops.setdefault(a, (match[0], gene))
+    protected |= set(winners.values())
+    return {a: f"same workbook row as {w} (gene {g})"
+            for a, (w, g) in drops.items() if a not in protected}
+
+
 # --- stage ------------------------------------------------------------------
 
 def _read_ids(layout):
@@ -147,14 +197,19 @@ def _read_ids(layout):
     return list(dict.fromkeys(i for i in ids if i))
 
 
+def _input_files(layout):
+    return [layout.ids_txt] + ([layout.rows_tsv] if layout.rows_tsv.is_file() else [])
+
+
 def _previous_counts(layout):
-    """Counts of a finished run on the same ids.txt, else None."""
+    """Counts of a finished run on the same ids.txt (and rows.tsv), else None."""
     manifest = layout.stage_dir(STAGE_DIR) / "manifest.json"
     if not (manifest.is_file() and layout.uniprot_csv.is_file() and layout.ids_txt.is_file()):
         return None
     try:
         m = json.loads(manifest.read_text(encoding="utf-8"))
-        if m["inputs"][0]["sha256"] == sha256_file(layout.ids_txt):
+        now = [(p.name, sha256_file(p)) for p in _input_files(layout)]
+        if [(Path(i["path"]).name, i["sha256"]) for i in m["inputs"]] == now:
             return m["counts"]
     except (OSError, ValueError, KeyError, IndexError, TypeError):
         pass
@@ -182,6 +237,10 @@ def run(layout, args, progress) -> dict:
     session = http_session()
     df, release = fetch_uniprot(ids, session, BATCH, on_batch=progress.advance)
     res = classify(ids, df, requery=lambda acc: requery_primary(session, acc))
+    collapsed = {}
+    if layout.rows_tsv.is_file():
+        collapsed = collapse_rows(read_rows(layout.rows_tsv), res["kept"], res["renamed"])
+        res["kept"] = res["kept"][~res["kept"]["Entry"].isin(collapsed)].reset_index(drop=True)
 
     d = layout.stage_dir(STAGE_DIR)
     d.mkdir(parents=True, exist_ok=True)
@@ -191,7 +250,8 @@ def run(layout, args, progress) -> dict:
         f"{k}\t{v}\n" for k, v in res["renamed"].items()))
     _atomic_write(d / "excluded.tsv", "accession\treason\n"
                   + "".join(f"{a}\tunreviewed\n" for a in res["unreviewed"])
-                  + "".join(f"{a}\tnon_human\n" for a in res["non_human"]))
+                  + "".join(f"{a}\tnon_human\n" for a in res["non_human"])
+                  + "".join(f"{a}\t{why}\n" for a, why in collapsed.items()))
     _atomic_write(d / "failed.tsv", "item\tstage\treason\n")
     tmp = layout.uniprot_csv.with_name("uniprot.csv.tmp")
     res["kept"].to_csv(tmp, index=False)
@@ -201,7 +261,9 @@ def run(layout, args, progress) -> dict:
               "not_found": len(res["not_found"]), "unreviewed": len(res["unreviewed"]),
               "non_human": len(res["non_human"]), "renamed": len(res["renamed"]),
               "failed": 0}
+    if layout.rows_tsv.is_file():
+        counts["row_collapsed"] = len(collapsed)
     # The manifest is written last: its presence marks the stage as finished.
-    write_manifest(d, "uniprot", args={"batch": BATCH}, inputs=[layout.ids_txt],
+    write_manifest(d, "uniprot", args={"batch": BATCH}, inputs=_input_files(layout),
                    versions={"uniprot": release}, counts=counts, timing={})
     return counts

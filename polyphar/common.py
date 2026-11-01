@@ -39,6 +39,10 @@ class RunLayout:
         return self.run_dir / "00_ids" / "ids.txt"
 
     @property
+    def rows_tsv(self) -> Path:
+        return self.run_dir / "00_ids" / "rows.tsv"
+
+    @property
     def uniprot_csv(self) -> Path:
         return self.run_dir / "01_uniprot" / "uniprot.csv"
 
