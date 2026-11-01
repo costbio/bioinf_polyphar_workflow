@@ -248,6 +248,33 @@ def test_worker_crash_is_attributed_and_stage_continues(tmp_path, small_pdb_text
     assert fix.units(layout, _args()).count == 1   # a rerun only retries the crasher
 
 
+def test_broken_pool_repools_and_isolates_only_repeat_offenders(tmp_path, small_pdb_text,
+                                                                 monkeypatch):
+    """fix uses the shared pool: after a worker dies, the units in flight go back to a fresh
+    full-size pool; only units in flight during a second break run alone (not every
+    unfinished unit, as a serial fallback would)."""
+    from polyphar import pool
+
+    texts = {f"P25815/2mjw_{c}.pdb": small_pdb_text for c in "BCDEFGHI"}
+    layout = _setup(tmp_path, texts)
+    _write_info(layout, list(texts))
+    monkeypatch.setenv(fix._CRASH_ENV, "2mjw_C.pdb")
+    calls = []
+    real = pool.run_pool
+
+    def spy(tasks, nprocs, *a, **kw):
+        out = real(tasks, nprocs, *a, **kw)
+        calls.append((len(tasks), nprocs, list(out.isolated)))
+        return out
+    monkeypatch.setattr(pool, "run_pool", spy)
+    counts = fix.run(layout, _args(2), Prog())
+    assert counts == {"inputs": 8, "fixed": 7, "skipped_existing": 0, "failed": 1}
+    assert len(calls) == 1 and calls[0][:2] == (8, 2)
+    isolated = calls[0][2]
+    assert "P25815/2mjw_C.pdb" in isolated and len(isolated) <= 2
+    assert not multiprocessing.active_children()
+
+
 def test_submit_race_routes_remaining_units_to_isolation(tmp_path, small_pdb_text, monkeypatch):
     import concurrent.futures as cf
     from concurrent.futures.process import BrokenProcessPool

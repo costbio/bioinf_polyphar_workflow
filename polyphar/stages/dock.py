@@ -572,9 +572,9 @@ def _dock_chunk(receptor, ligands, center, size, sdf, log, done, seed, cpu, key,
 
 
 def _chunk_worker(*args) -> int:
-    from polyphar.stages.similarity import _task
+    from polyphar.pool import task
 
-    return _task(lambda: _dock_chunk(*args))
+    return task(lambda: _dock_chunk(*args))
 
 
 # --- merge -----------------------------------------------------------------------------
@@ -726,7 +726,7 @@ def units(layout, args):
 
 def run(layout, args, progress) -> dict:
     from polyphar.common import append_failure, sha256_file, write_manifest
-    from polyphar.stages.similarity import _run_pool
+    from polyphar.pool import run_pool as _run_pool
 
     lib = _library_path(layout, args)
     smina = smina_version()

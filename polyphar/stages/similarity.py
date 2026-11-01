@@ -54,7 +54,11 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from polyphar import pool
 from polyphar.common import PM_NAME_LIMIT, WorkUnits, append_failure, sha256_file, write_manifest
+from polyphar.pool import REASON_DIED, TaskError
+from polyphar.pool import run_pool as _run_pool
+from polyphar.pool import task as _task
 
 STAGE = "similarity"
 DRUGSCORE_CUTOFF = 0.5
@@ -69,10 +73,7 @@ NULL = "NULL____"
 POCKETSIM_COLUMNS = ["UniProt ID", "Gene Name", "Protein", "Pocket", "Pocket_Path",
                      "UniProt ID_2", "Gene Name_2", "Protein_2", "Pocket_2", "Pocket_Path_2",
                      "Pmin", "Pmax"]
-REASON_DIED = "worker process died (BrokenProcessPool)"
 REASON_MISSING = "pocket file missing"
-SOLO_RETRY_PROBES = 3
-TERMINATE_GRACE_S = 15.0
 
 
 def add_arguments(parser) -> None:
@@ -80,7 +81,7 @@ def add_arguments(parser) -> None:
                         help="directory holding the PocketMatch binaries (default: $PM_BIN_DIR)")
 
 
-class PocketMatchError(RuntimeError):
+class PocketMatchError(TaskError):
     """A PocketMatch step failed or wrote unexpected output (a plain message, so it
     always pickles across the process boundary; `returncode` does not cross it)."""
 
@@ -370,44 +371,6 @@ def _plan(paths: list[Path], nprocs: int, work_dir: Path, digests: list[str],
 
 # --- one block-pair job (runs in a worker process) -----------------------------------
 
-_BUSY = False   # worker process: inside a task (temp files / a PocketMatch child to clean up)
-_STOP = False   # worker process: SIGTERM received while busy
-
-
-def _worker_init() -> None:
-    # SIGTERM (the parent stopping the pool): an idle worker exits at once. A busy one
-    # unwinds through subprocess.run, which kills the PocketMatch child, and through the
-    # temp dir / temp file cleanup, then exits in _task. Further SIGTERMs (the pool's
-    # terminate_broken sends one) do not cut that cleanup short.
-    def handler(signum, frame):
-        global _STOP
-        if not _BUSY:
-            os._exit(128 + signum)
-        if not _STOP:
-            _STOP = True
-            raise SystemExit(128 + signum)
-    signal.signal(signal.SIGTERM, handler)
-
-
-def _task(fn):
-    """Run a worker task: mark the process busy, carry failures across the process
-    boundary as PocketMatchError (always pickles), exit once stopped by SIGTERM."""
-    global _BUSY
-    _BUSY = True
-    try:
-        return fn()
-    except PocketMatchError:
-        raise
-    except Exception as exc:
-        raise PocketMatchError(f"{type(exc).__name__}: {exc}") from None
-    except BaseException:
-        os._exit(143)   # SIGTERM / Ctrl-C: the cleanup inside fn has run
-    finally:
-        _BUSY = False
-        if _STOP:
-            os._exit(143)   # the parent is stopping the pool; never go back to idle
-
-
 def _atomic_write_lines(path: Path, lines, encoding: str = "latin-1") -> None:
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
     try:
@@ -466,7 +429,7 @@ def _cabbage(pocket: Path, pm_bin_dir, record: Path, failed: Path) -> str | None
             reason = str(exc)
             # only the tool's own verdict on this pocket is cached: not a kill from
             # outside, and nothing while this worker is being stopped
-            cache = not (_STOP or _external_kill(exc.returncode))
+            cache = not (pool.stopping() or _external_kill(exc.returncode))
         else:
             os.chmod(tmp, 0o644)
             os.replace(tmp, record)
@@ -503,122 +466,6 @@ def _job(paths, records, block_of, job, pm_bin_dir, jobs_dir, fingerprint) -> in
               "pockets": len(paths), "seconds": round(time.monotonic() - t0, 3)}
     _atomic_write_lines(jobs_dir / f"{job.tag}.done", [json.dumps(marker) + "\n"])
     return kept
-
-
-def _reason(exc) -> str:
-    return str(exc) if isinstance(exc, PocketMatchError) else f"{type(exc).__name__}: {exc}"
-
-
-def _terminate(ex) -> None:
-    """Cancel pending jobs and stop running ones now (an interrupted run leaves no
-    workers and no PocketMatch children behind)."""
-    procs = list((getattr(ex, "_processes", None) or {}).values())
-    ex.shutdown(wait=False, cancel_futures=True)
-    for p in procs:
-        if p.is_alive():
-            p.terminate()
-    deadline = time.monotonic() + TERMINATE_GRACE_S
-    for p in procs:
-        p.join(timeout=max(0.0, deadline - time.monotonic()))
-    for p in procs:   # a worker that did not exit in time is killed
-        if p.is_alive():
-            p.kill()
-            p.join(timeout=10)
-
-
-@dataclass
-class PoolOutcome:
-    failures: list[tuple[object, str]]   # (item, reason)
-    isolated: list[object]               # items run alone after their pool broke twice
-
-
-def _pool_pass(tasks, queue, nprocs: int, on_result, failures):
-    """Run tasks from `queue` (indices into tasks) on one fresh spawn pool, keeping at most
-    nprocs in flight, until the queue is empty or the pool breaks. Returns (indices that
-    were in flight when the pool broke, number of tasks completed)."""
-    import multiprocessing
-    from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
-    from concurrent.futures.process import BrokenProcessPool
-
-    ctx = multiprocessing.get_context("spawn")   # workers start clean (no fork of a threaded parent)
-    completed = 0
-    with ProcessPoolExecutor(max_workers=max(1, min(nprocs, len(queue))), mp_context=ctx,
-                             initializer=_worker_init) as ex:
-        try:
-            inflight: dict = {}
-            while queue or inflight:
-                while queue and len(inflight) < nprocs:
-                    i = queue.popleft()
-                    item, fn, args = tasks[i]
-                    try:
-                        inflight[ex.submit(fn, *args)] = i
-                    except BrokenProcessPool:   # never ran: back to the queue
-                        queue.appendleft(i)
-                        return list(inflight.values()), completed
-                finished, _ = wait(inflight, return_when=FIRST_COMPLETED)
-                broke = []
-                for fut in finished:
-                    i = inflight.pop(fut)
-                    try:
-                        result = fut.result()
-                    except BrokenProcessPool:
-                        broke.append(i)
-                        continue
-                    except Exception as exc:
-                        failures.append((tasks[i][0], _reason(exc)))
-                    else:
-                        if on_result is not None:
-                            on_result(tasks[i][0], result)
-                    completed += 1
-                if broke:   # everything still in flight went down with it
-                    return broke + list(inflight.values()), completed
-            return [], completed
-        except BaseException:
-            _terminate(ex)
-            raise
-
-
-def _run_pool(tasks, nprocs: int, on_result=None) -> PoolOutcome:
-    """Run tasks [(item, fn, args)] on spawn process pools; returns the failed items with
-    their reasons. on_result(item, result) runs in this (parent) process. When a worker
-    dies, the tasks in flight go back to a fresh full-size pool; a task in flight during
-    a second break runs alone, so a crash is attributed to its own task. When pools keep
-    breaking without finishing anything, or every solo run dies, the rest are failed
-    without retrying. Any BaseException (Ctrl-C, SIGTERM) stops the workers and propagates."""
-    from collections import deque
-
-    failures: list = []
-    queue = deque(range(len(tasks)))
-    breaks: dict[int, int] = {}
-    solo: list[int] = []
-    empty = total = 0
-    while queue:
-        broken, completed = _pool_pass(tasks, queue, nprocs, on_result, failures)
-        total += completed
-        if not broken:
-            continue
-        empty = 0 if completed else empty + 1
-        retry = []
-        for i in broken:
-            breaks[i] = breaks.get(i, 0) + 1
-            (solo if breaks[i] >= 2 else retry).append(i)
-        queue.extendleft(reversed(sorted(retry)))
-        if total == 0 and empty >= SOLO_RETRY_PROBES:   # pools cannot run anything at all
-            failures += [(tasks[i][0], REASON_DIED + "; not retried, every pool died")
-                         for i in list(queue) + solo]
-            return PoolOutcome(failures, [])
-    isolated, tried, died = [], 0, 0
-    for i in sorted(solo):
-        if tried >= SOLO_RETRY_PROBES and died == tried:
-            failures.append((tasks[i][0], REASON_DIED + "; not retried, every retry died"))
-            continue
-        tried += 1
-        isolated.append(tasks[i][0])
-        broken, _ = _pool_pass(tasks, deque([i]), 1, on_result, failures)
-        if broken:
-            failures.append((tasks[i][0], REASON_DIED))
-            died += 1
-    return PoolOutcome(failures, isolated)
 
 
 def _bin_hashes(pm: Path) -> dict[str, str]:

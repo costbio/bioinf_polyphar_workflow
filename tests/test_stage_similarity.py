@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import pandas as pd
 import pytest
 
-from polyphar import cli
+from polyphar import cli, pool
 from polyphar.common import RunLayout
 from polyphar.stages import similarity as sim
 
@@ -288,7 +288,7 @@ def test_failure_while_stopping_is_not_cached(tmp_path, monkeypatch):
     pocket = tmp_path / "P1" / "a.pdb"
     pocket.parent.mkdir()
     pocket.write_text("x\n")
-    monkeypatch.setattr(sim, "_STOP", True)   # this worker is being stopped
+    monkeypatch.setattr(pool, "_STOP", True)   # this worker is being stopped
     assert "failed (exit 1)" in sim._cabbage(pocket, pm, tmp_path / "r", tmp_path / "f")
     assert not (tmp_path / "f").exists()
 

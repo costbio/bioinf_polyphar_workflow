@@ -27,7 +27,9 @@ import random
 import tempfile
 from pathlib import Path
 
+from polyphar import pool
 from polyphar.common import WorkUnits, append_failure, write_manifest
+from polyphar.pool import REASON_DIED, TaskError, task
 
 STAGE = "fix"
 DEFAULT_PH = 7.0
@@ -153,7 +155,7 @@ def fix_one(src, structures_dir, out_dir, ph: float = DEFAULT_PH, token: str = "
         raise
 
 
-class FixError(RuntimeError):
+class FixError(TaskError):
     """Worker failure carried across the process boundary as a plain message, so it
     always pickles (an arbitrary exception that cannot be unpickled breaks the pool)."""
 
@@ -164,17 +166,14 @@ _CRASH_ENV = "POLYPHAR_FIX_TEST_CRASH_ON"   # test hook: worker dies hard on thi
 def _worker(src, structures_dir, out_dir, ph, token=""):
     if os.environ.get(_CRASH_ENV) == Path(src).name:
         os._exit(1)
+    return task(lambda: _fix(src, structures_dir, out_dir, ph, token))
+
+
+def _fix(src, structures_dir, out_dir, ph, token) -> None:
     try:
         fix_one(src, structures_dir, out_dir, ph, token)
     except Exception as exc:   # fix_one already removed its .tmp
         raise FixError(f"{type(exc).__name__}: {exc}") from None
-
-
-def _reason(exc) -> str:
-    return str(exc) if isinstance(exc, FixError) else f"{type(exc).__name__}: {exc}"
-
-
-REASON_DIED = "worker process died (BrokenProcessPool)"
 
 
 def _new_token() -> str:
@@ -204,10 +203,6 @@ def _versions() -> dict:
 
 
 def run(layout, args, progress) -> dict:
-    import multiprocessing
-    from concurrent.futures import ProcessPoolExecutor, as_completed
-    from concurrent.futures.process import BrokenProcessPool
-
     ph = getattr(args, "ph", DEFAULT_PH)
     d = layout.pdbfixer
     d.mkdir(parents=True, exist_ok=True)
@@ -219,58 +214,27 @@ def run(layout, args, progress) -> dict:
     fixed = 0
     failures: list[tuple[str, str]] = []
     token = _new_token()
-    ctx = multiprocessing.get_context("spawn")   # workers start clean (no fork of a threaded parent)
+    src_of = {src.relative_to(layout.structures).as_posix(): src for src in todo}
 
-    def item_of(src):
-        return src.relative_to(layout.structures).as_posix()
+    def on_result(item, _result):
+        nonlocal fixed
+        fixed += 1
+        progress.advance(1, size=_size(src_of[item]))
+
+    def on_failure(item, why):
+        failures.append((item, why))
+        progress.advance(1, size=_size(src_of[item]))
 
     try:
-        broken: list[Path] = []   # units whose pool died: cause unknown until run alone
-        if todo:
-            with ProcessPoolExecutor(max_workers=max(1, args.nprocs), mp_context=ctx) as ex:
-                try:
-                    futures = {}
-                    for p in todo:
-                        try:
-                            futures[ex.submit(_worker, p, layout.structures, d, ph, token)] = p
-                        except BrokenProcessPool:   # pool died while submitting: redone alone
-                            broken.append(p)
-                    for fut in as_completed(futures):
-                        src = futures[fut]
-                        try:
-                            fut.result()
-                        except BrokenProcessPool:
-                            broken.append(src)   # a worker died hard; sort it out below
-                            continue
-                        except Exception as exc:   # one structure failing never stops the stage
-                            failures.append((item_of(src), _reason(exc)))
-                        else:
-                            fixed += 1
-                        progress.advance(1, size=_size(src))
-                except BaseException:
-                    ex.shutdown(wait=False, cancel_futures=True)
-                    raise
-        # The pool is dead for everything that was still in flight. Redo those one at a
-        # time, each in a fresh single-worker pool, so a crashing structure is attributed
-        # to itself and the rest are fixed.
-        # (the pool and its workers are gone, so temps of those units are ours to delete)
-        _sweep_own_temps(broken, layout.structures, d, token)
-        for src in sorted(broken, key=todo.index):
-            with ProcessPoolExecutor(max_workers=1, mp_context=ctx) as ex:
-                try:
-                    ex.submit(_worker, src, layout.structures, d, ph, token).result()
-                except BrokenProcessPool:
-                    _sweep_own_temps([src], layout.structures, d, token)
-                    failures.append((item_of(src), REASON_DIED))
-                except Exception as exc:
-                    failures.append((item_of(src), _reason(exc)))
-                except BaseException:
-                    ex.shutdown(wait=False, cancel_futures=True)
-                    raise
-                else:
-                    fixed += 1
-            progress.advance(1, size=_size(src))
+        # shared pool: a worker that dies sends only the units in flight back to a fresh
+        # full-size pool; a unit in flight during a second break runs alone, so a crashing
+        # structure is attributed to itself and the rest are fixed in parallel
+        pool.run_pool([(item, _worker, (src, layout.structures, d, ph, token))
+                       for item, src in src_of.items()],
+                      max(1, args.nprocs), on_result=on_result, on_failure=on_failure)
     finally:
+        # every pool of this run is gone: its leftover temps (killed workers) are ours
+        _sweep_own_temps(todo, layout.structures, d, token)
         # appended from the parent only, in a fixed order, even when interrupted
         for item, reason in sorted(failures):
             append_failure(d, item, STAGE, reason)
