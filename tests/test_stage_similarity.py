@@ -234,8 +234,8 @@ def _fake_pm_bin(tmp_path):
 
 
 def test_dead_workers_are_not_retried_forever(tmp_path, monkeypatch):
-    """Every worker dies: the pool is unusable, so the pockets are failed after a few
-    empty pools instead of one pool each."""
+    """Every worker dies: after the first solo probes all die (nothing ever finished), the
+    remaining pockets are failed without running instead of one pool each."""
     src = FIX / "pockets_net2_P53350" / "P53350" / "P53350_4o56_A.pdb_res_P_1.pdb"
     layout = _run_folder(tmp_path, {("P53350", f"P53350_4o56_A.pdb_res_P_{i}.pdb"): src
                                     for i in range(1, 9)})
@@ -246,7 +246,9 @@ def test_dead_workers_are_not_retried_forever(tmp_path, monkeypatch):
     assert counts["cabbage_failed"] == counts["failed"] == 8 and counts["pairs"] == 0
     rows = (layout.similarity / "failed.tsv").read_text().splitlines()[1:]
     assert len(rows) == 8
-    assert all(r.endswith("not retried, every pool died") for r in rows), rows
+    assert all(r.split("\t")[2].startswith(sim.REASON_DIED) for r in rows), rows
+    probed = [r for r in rows if not r.endswith("not retried, every pool died")]
+    assert 1 <= len(probed) <= 4, rows   # the solo probes (two pools' worth at nprocs 2)
     assert not multiprocessing.active_children()
 
 
