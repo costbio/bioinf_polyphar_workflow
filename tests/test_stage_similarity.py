@@ -248,7 +248,7 @@ def test_dead_workers_are_not_retried_forever(tmp_path, monkeypatch):
     assert len(rows) == 8
     assert all(r.split("\t")[2].startswith(sim.REASON_DIED) for r in rows), rows
     probed = [r for r in rows if not r.endswith("not retried, every pool died")]
-    assert 1 <= len(probed) <= 4, rows   # the solo probes (two pools' worth at nprocs 2)
+    assert 1 <= len(probed) <= 5, rows   # solo runs: two pools' worth + one fresh probe
     assert not multiprocessing.active_children()
 
 

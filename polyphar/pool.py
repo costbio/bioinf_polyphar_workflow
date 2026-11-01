@@ -7,10 +7,13 @@ flight during two breaks (a repeat offender) runs alone in its own one-worker po
 nprocs of those at a time), so a crash is attributed to its own task and every other task
 keeps running in parallel. Healthy tasks are never failed because another task crashes.
 A pool that breaks with nothing in flight (at submit) blames no task; after a few such
-empty pools in a row the remaining tasks run alone. Solo runs that all die (the first few)
-end the retries: the rest are failed, not retried. Every loop is bounded by the per-task
-break counts. Any BaseException in the parent (Ctrl-C, SIGTERM, SIGHUP) stops the workers
-and propagates.
+empty pools in a row the remaining tasks run alone. Tasks are failed without running
+("every pool died") only when nothing has ever completed and max(3, nprocs) tasks no pool
+had broken under (fresh probes, run alone once the first solo runs die) all died too, so
+the first tasks being real crashers does not fail the healthy rest (unless the first
+nprocs + max(3, nprocs) tasks all crash). Every loop is
+bounded by the per-task break counts. Any BaseException in the parent (Ctrl-C, SIGTERM,
+SIGHUP) stops the workers and propagates.
 
 Worker functions wrap their body in task(): a failure crosses the process boundary as
 TaskError (a plain message, always pickles), and a worker being stopped by SIGTERM finishes
@@ -175,11 +178,18 @@ def _pool_pass(tasks, queue, nprocs: int, on_result, on_failure, failures):
             raise
 
 
-def _solo(tasks, idxs, nprocs: int, on_result, on_failure, failures, probes: dict):
+def _nothing_runs(probes: dict) -> bool:
+    """True once nothing has ever completed and `fresh_needed` tasks no pool had ever broken
+    under (fresh probes) died alone: the environment cannot run anything, as opposed to
+    the first tasks being real crashers."""
+    return probes["completed"] == 0 and probes["fresh_died"] >= probes["fresh_needed"]
+
+
+def _solo(tasks, idxs, nprocs: int, on_result, on_failure, failures, probes: dict,
+          breaks: dict):
     """Run each task alone in its own one-worker spawn pool, up to nprocs such pools at a
-    time: a worker death is then attributed to its own task only. After SOLO_RETRY_PROBES
-    solo runs that all died, the rest are failed without running. Returns (number
-    completed, items run)."""
+    time: a worker death is then attributed to its own task only. Tasks are failed without
+    running only while _nothing_runs(probes). Returns the items run."""
     import multiprocessing
     from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
     from concurrent.futures.process import BrokenProcessPool
@@ -187,14 +197,14 @@ def _solo(tasks, idxs, nprocs: int, on_result, on_failure, failures, probes: dic
     ctx = multiprocessing.get_context("spawn")
     pending = deque(sorted(idxs))
     running: dict = {}   # future -> (task index, its one-worker pool)
-    completed, ran = 0, []
+    ran = []
     try:
         while pending or running:
             while pending and len(running) < max(1, nprocs):
                 i = pending.popleft()
-                if probes["tried"] >= SOLO_RETRY_PROBES and probes["died"] == probes["tried"]:
+                if _nothing_runs(probes):
                     _fail(failures, on_failure, tasks[i][0],
-                          REASON_DIED + "; not retried, every retry died")
+                          REASON_DIED + "; not retried, every pool died")
                     continue
                 item, fn, args = tasks[i]
                 ran.append(item)
@@ -204,21 +214,24 @@ def _solo(tasks, idxs, nprocs: int, on_result, on_failure, failures, probes: dic
                 except BrokenProcessPool:
                     fut = _failed_future(BrokenProcessPool("pool broke at submit"))
                 running[fut] = (i, ex)
+            if not running:
+                break
             finished, _ = wait(running, return_when=FIRST_COMPLETED)
             for fut in finished:
                 i, ex = running.pop(fut)
                 ex.shutdown(wait=True)
-                probes["tried"] += 1
                 if isinstance(fut.exception(), BrokenProcessPool):
                     probes["died"] += 1
+                    probes["fresh_died"] += breaks.get(i, 0) == 0
                     _fail(failures, on_failure, tasks[i][0], REASON_DIED)
                 else:
-                    completed += _harvest(tasks, {fut: i}, on_result, on_failure, failures)[1]
+                    probes["completed"] += _harvest(tasks, {fut: i}, on_result, on_failure,
+                                                    failures)[1]
     except BaseException:
         for _, ex in running.values():
             terminate(ex)
         raise
-    return completed, ran
+    return ran
 
 
 def _failed_future(exc):
@@ -238,12 +251,13 @@ def run_pool(tasks, nprocs: int, on_result=None, on_failure=None) -> PoolOutcome
     queue = deque(range(len(tasks)))
     breaks: dict[int, int] = {}
     isolated: list = []
-    probes = {"tried": 0, "died": 0}
-    empty = total = 0
+    probes = {"completed": 0, "died": 0, "fresh_died": 0,
+              "fresh_needed": max(SOLO_RETRY_PROBES, nprocs), "probed": False}
+    empty = 0
     while queue:
         broken, completed, broke = _pool_pass(tasks, queue, nprocs, on_result, on_failure,
                                               failures)
-        total += completed
+        probes["completed"] += completed
         if not broke:
             continue
         # only a pool that broke with nothing in flight (at submit) blames no task
@@ -257,13 +271,21 @@ def run_pool(tasks, nprocs: int, on_result=None, on_failure=None) -> PoolOutcome
             offenders += list(queue)
             queue.clear()
         if offenders:
-            done, ran = _solo(tasks, offenders, nprocs, on_result, on_failure, failures,
-                              probes)
-            total += done
-            isolated += ran
-            if total == 0 and probes["died"] >= SOLO_RETRY_PROBES:   # nothing runs at all
-                for i in queue:
-                    _fail(failures, on_failure, tasks[i][0],
-                          REASON_DIED + "; not retried, every pool died")
-                queue.clear()
+            isolated += _solo(tasks, offenders, nprocs, on_result, on_failure, failures,
+                              probes, breaks)
+        if probes["completed"] == 0 and probes["died"] and not probes["probed"]:
+            # nothing has completed and solo runs died, but each had been in a broken pool:
+            # the first tasks may all be real crashers. Probe (once) up to fresh_needed
+            # tasks no pool has broken under, each alone.
+            probes["probed"] = True
+            fresh = [i for i in queue if breaks.get(i, 0) == 0][:probes["fresh_needed"]]
+            for i in fresh:
+                queue.remove(i)
+            isolated += _solo(tasks, fresh, nprocs, on_result, on_failure, failures,
+                              probes, breaks)
+        if _nothing_runs(probes):   # fresh tasks die alone too: nothing runs at all
+            for i in queue:
+                _fail(failures, on_failure, tasks[i][0],
+                      REASON_DIED + "; not retried, every pool died")
+            queue.clear()
     return PoolOutcome(failures, isolated)

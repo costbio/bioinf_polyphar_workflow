@@ -20,7 +20,10 @@ def _run(crashers):
     return out, sorted(got), time.monotonic() - t0
 
 
-@pytest.mark.parametrize("crashers", [{1, 5}, {9, 13}], ids=["early", "after-progress"])
+@pytest.mark.parametrize("crashers", [{1, 5}, {9, 13}, {0, 1, 2, 3}, {0, 1, 2, 3, 4, 5},
+                                      {4, 5, 6, 7, 9}],
+                         ids=["early", "after-progress", "first-nprocs", "first-nprocs+2",
+                              "after-solo-deaths"])
 def test_two_crashers_fail_alone_and_healthy_tasks_stay_parallel(crashers):
     out, got, wall = _run(crashers)
     healthy = [i for i in range(N) if i not in crashers]
@@ -38,11 +41,16 @@ def test_two_crashers_fail_alone_and_healthy_tasks_stay_parallel(crashers):
 
 
 def test_every_task_crashing_stops_after_a_few_probes():
+    """Every task crashes: the first pool's tasks die alone, then nprocs tasks no pool broke
+    under (fresh probes) die alone too, and the rest are failed without running. When only
+    the first few tasks crash, a fresh probe succeeds instead (see above)."""
     out, got, _ = _run(set(range(N)))
     assert got == [] and sorted(i for i, _ in out.failures) == list(range(N))
-    assert len(out.isolated) <= 2 * NPROCS            # not one solo run per task
-    assert sum(r.endswith("not retried, every pool died") for _, r in out.failures) \
-        >= N - 2 * NPROCS
+    assert sorted(out.isolated) == list(range(2 * NPROCS))   # nprocs + nprocs fresh probes
+    reasons = dict(out.failures)
+    assert all(reasons[i] == pool.REASON_DIED for i in range(2 * NPROCS))
+    assert all(reasons[i] == pool.REASON_DIED + "; not retried, every pool died"
+               for i in range(2 * NPROCS, N))
     assert not multiprocessing.active_children()
 
 
