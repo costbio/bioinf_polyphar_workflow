@@ -3,6 +3,7 @@ import multiprocessing
 import os
 import shutil
 import time
+import unittest.mock
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -73,11 +74,33 @@ def test_name_guard_fails_before_pocketmatch_runs(tmp_path):
     src = FIX / "pockets_net2_P53350" / "P53350" / "P53350_4o56_A.pdb_res_P_1.pdb"
     layout = _run_folder(tmp_path, {("P53350", "P53350_4o56_A.pdb_res_P_1.pdb"): src,
                                     ("Q99999", "Q99999_1abc_A.pdb_res_P_12_10_1.pdb"): src})
+    (layout.pockets / "P53350" / "P53350_4o56_A.pdb_res_P_1.pdb").unlink()   # also missing
     # a bogus binary dir: the guard must fire before anything looks for PocketMatch
     with pytest.raises(ValueError, match="longer than 32"):
         sim.run(layout, _args(2, pm_bin_dir=tmp_path / "no_pocketmatch"), Prog())
     assert not (layout.similarity / "PocketMatch_score.txt").exists()
     assert not (layout.similarity / "manifest.json").exists()
+    assert (layout.similarity / "failed.tsv").read_text().splitlines() == [
+        "item\tstage\treason",
+        "P53350/P53350_4o56_A.pdb_res_P_1.pdb\tsimilarity\tpocket file missing",
+        "Q99999/Q99999_1abc_A.pdb_res_P_12_10_1.pdb\tsimilarity\t"
+        "pocket name longer than 32 characters"]
+
+
+def test_name_guard_in_units_and_dry_run(tmp_path):
+    src = FIX / "pockets_net2_P53350" / "P53350" / "P53350_4o56_A.pdb_res_P_1.pdb"
+    dup = "P53350_4o56_A.pdb_res_P_1.pdb"
+    layout = _run_folder(tmp_path, {("P53350", dup): src, ("Q99999", dup): src})
+    with pytest.raises(ValueError, match="collide in PocketMatch") as dry:
+        cli.main(["similarity", "--run-dir", str(tmp_path), "--dry-run", "--no-notify"])
+    assert not layout.similarity.exists()   # --dry-run writes nothing
+    with pytest.raises(ValueError) as real:   # a real run fails in units(), before run()
+        cli.main(["similarity", "--run-dir", str(tmp_path), "--no-notify"])
+    assert str(real.value) == str(dry.value)
+    assert (layout.similarity / "failed.tsv").read_text().splitlines() == [
+        "item\tstage\treason",
+        f"P53350/{dup}\tsimilarity\tpocket name collides in PocketMatch with Q99999/{dup}",
+        f"Q99999/{dup}\tsimilarity\tpocket name collides in PocketMatch with P53350/{dup}"]
 
 
 # --- inputs --------------------------------------------------------------------------
@@ -104,8 +127,11 @@ def test_select_pockets_cutoff_order_and_exact_names(tmp_path):
     # exact on-disk name (Review Focus 2): a case mismatch is missing on any filesystem
     (layout.pockets / "P53350" / "P53350_4o56_A.pdb_res_P_2.pdb").rename(
         layout.pockets / "P53350" / "P53350_4o56_a.pdb_res_P_2.pdb")
-    with pytest.raises(FileNotFoundError, match=r"P53350_4o56_A\.pdb_res_P_2\.pdb"):
-        sim.select_pockets(layout.pockets)
+    table, missing = sim.pocket_table(layout.pockets)
+    assert missing == ["P53350/P53350_4o56_A.pdb_res_P_2.pdb"]
+    assert list(table["Pocket Filename"]) == ["AF-O14746-F1.pdb_res_P_1.pdb",
+                                              "P53350_2ogq_A.pdb_res_P_3.pdb"]
+    assert len(sim.select_pockets(layout.pockets)) == 2
 
 
 def test_missing_drugscore_is_clear(tmp_path):
@@ -208,17 +234,49 @@ def _fake_pm_bin(tmp_path):
 
 
 def test_dead_workers_are_not_retried_forever(tmp_path, monkeypatch):
+    """Every worker dies: the pool is unusable, so the pockets are failed after a few
+    empty pools instead of one pool each."""
     src = FIX / "pockets_net2_P53350" / "P53350" / "P53350_4o56_A.pdb_res_P_1.pdb"
     layout = _run_folder(tmp_path, {("P53350", f"P53350_4o56_A.pdb_res_P_{i}.pdb"): src
                                     for i in range(1, 9)})
-    monkeypatch.setenv(sim._CRASH_ENV, "*")   # every worker dies: the pool is unusable
-    with pytest.raises(sim.JobsFailed, match="worker process died"):
-        sim.run(layout, _args(2, pm_bin_dir=_fake_pm_bin(tmp_path)), Prog())
+    monkeypatch.setenv(sim._CRASH_ENV, "*")
+    t0 = time.monotonic()
+    counts = sim.run(layout, _args(2, pm_bin_dir=_fake_pm_bin(tmp_path)), Prog())
+    assert time.monotonic() - t0 < 60
+    assert counts["cabbage_failed"] == counts["failed"] == 8 and counts["pairs"] == 0
     rows = (layout.similarity / "failed.tsv").read_text().splitlines()[1:]
     assert len(rows) == 8
-    assert sum(r.endswith("not retried, every retry died") for r in rows) == 8 - sim.SOLO_RETRY_PROBES
+    assert all(r.endswith("not retried, every pool died") for r in rows), rows
     assert not multiprocessing.active_children()
-    assert not (layout.similarity / "manifest.json").exists()
+
+
+def _echo_pm_bin(tmp_path):
+    d = _fake_pm_bin(tmp_path)
+    (d / sim.CABBAGE).write_text('#!/bin/sh\necho "record $1"\n')
+    return d
+
+
+def test_broken_pool_isolates_only_repeat_suspects(tmp_path, monkeypatch):
+    """A crashing task sends the tasks in flight back to a fresh full-size pool; only
+    tasks in flight during a second break run alone."""
+    pm = _echo_pm_bin(tmp_path)
+    pockets, tasks = [], []
+    (tmp_path / "cache").mkdir()
+    for i in range(24):
+        p = tmp_path / "P1" / f"p{i:02d}.pdb"
+        p.parent.mkdir(exist_ok=True)
+        p.write_text("x\n")
+        rec, fl = tmp_path / "cache" / f"{i}.cabbage", tmp_path / "cache" / f"{i}.failed"
+        tasks.append((p.name, sim._cabbage_worker, (str(p), str(pm), str(rec), str(fl))))
+        pockets.append(p)
+    monkeypatch.setenv(sim._CRASH_ENV, "p05.pdb")
+    got = []
+    out = sim._run_pool(tasks, 4, lambda item, r: got.append(item))
+    assert out.failures == [("p05.pdb", sim.REASON_DIED)]
+    assert "p05.pdb" in out.isolated and len(out.isolated) <= 4   # at most one pool's worth
+    assert sorted(got) == sorted(p.name for p in pockets if p.name != "p05.pdb")
+    assert (tmp_path / "cache" / "0.cabbage").read_text() == "record ./p00.pdb\n"
+    assert not multiprocessing.active_children()
 
 
 # --- PocketMatch (inside the image) --------------------------------------------------
@@ -255,6 +313,8 @@ def test_parallel_equals_serial_on_sample(tmp_path):
     assert m["versions"]["pocketmatch_commit"]
     assert set(m["versions"]["pocketmatch_sha256"]) == set(sim.PM_BINARIES)
     assert not list(outs[4].rglob("*.tmp"))
+    assert not (outs[4] / "jobs").exists()
+    assert len(list((outs[4] / "cabbage").glob("*.cabbage"))) == 16
 
 
 @pytest.mark.pocketmatch
@@ -284,13 +344,20 @@ def test_resume_skips_done_jobs_and_counts_remaining(tmp_path):
     assert remaining == 120 - sum(json.loads(p.read_text())["pairs"] for p in done)
 
     before = {p.with_suffix(".txt"): p.with_suffix(".txt").stat().st_mtime_ns for p in done}
+    rewritten = []
+    real_job = sim._run_jobs
+
+    def spy(plan, *a, **kw):   # finished jobs are not rerun
+        rewritten.extend(j.tag for j in plan.jobs if j.tag not in plan.done)
+        assert {t.stem for t in before} == set(plan.done)
+        return real_job(plan, *a, **kw)
     prog = Prog()
-    counts = sim.run(layout, args, prog)
+    with unittest.mock.patch.object(sim, "_run_jobs", spy):
+        counts = sim.run(layout, args, prog)
+    assert not {t.stem for t in before} & set(rewritten)
     assert sum(prog.calls) == remaining
     assert counts["skipped_existing"] == 120 - remaining and counts["failed"] == 0
-    for txt, mtime in before.items():   # finished jobs were not redone
-        assert txt.stat().st_mtime_ns == mtime, txt.name
-    assert sim.units(layout, args).count == 0
+    assert not jobs.exists()   # deleted once Pocketsim.csv is written
 
     serial = _sample_layout(tmp_path / "serial")
     sim.run(serial, _args(1), Prog())
@@ -298,39 +365,97 @@ def test_resume_skips_done_jobs_and_counts_remaining(tmp_path):
             == (serial.similarity / "PocketMatch_score.txt").read_bytes())
 
 
+def _interrupted_run(layout, args):
+    class Boom(Prog):
+        def advance(self, n=1, size=None):
+            if len(self.calls) == 2:
+                raise KeyboardInterrupt
+            super().advance(n)
+    with pytest.raises(KeyboardInterrupt):
+        sim.run(layout, args, Boom())
+    deadline = time.monotonic() + 60
+    while multiprocessing.active_children() and time.monotonic() < deadline:
+        time.sleep(0.1)
+
+
 @pytest.mark.pocketmatch
-def test_changed_pocket_invalidates_done_job(tmp_path):
+def test_done_markers_are_checked(tmp_path):
+    """A .done marker counts only with its fingerprint (pocket contents, PocketMatch
+    binaries) and the size of its .txt as written."""
     layout = _sample_layout(tmp_path)
-    sim.run(layout, _args(4), Prog())
-    assert sim.units(layout, _args(4)).count == 0
-    victim = sim.select_pockets(layout.pockets)[0]
-    victim.write_text(victim.read_text() + "REMARK changed\n")
-    assert 0 < sim.units(layout, _args(4)).count < 120
+    args = _args(4)
+    _interrupted_run(layout, args)
+    jobs = layout.similarity / "jobs"
+    done = sorted(jobs.glob("*.done"))
+    assert len(done) >= 2
+    remaining = sim.units(layout, args).count
+    assert remaining < 120
+
+    # a host crash can leave a short .txt behind a marker: that job is redone
+    txt = done[0].with_suffix(".txt")
+    txt.write_bytes(txt.read_bytes()[:-10])
+    pairs0 = json.loads(done[0].read_text())["pairs"]
+    assert sim.units(layout, args).count == remaining + pairs0
+
+    # other PocketMatch binaries (an image update) invalidate every job
+    paths = sim.select_pockets(layout.pockets)
+    digests = [sim.sha256_file(p) for p in paths]
+    bins = sim._bin_hashes(Path(PM_BIN))
+    assert sim._plan(paths, 4, layout.similarity, digests, bins).done
+    other = {**bins, sim.PM_SERIAL: "0" * 64}
+    assert sim._plan(paths, 4, layout.similarity, digests, other).done == {}
+
+    # changed pocket contents invalidate every job holding them
+    for p in paths:
+        p.write_text(p.read_text() + "REMARK changed\n")
+    assert sim.units(layout, args).count == 120
 
 
 @pytest.mark.pocketmatch
-def test_pocketmatch_failure_is_reported(tmp_path):
-    src = Path(PM_BIN) / "Sample_pockets" / "1g64.pdb"
-    layout = _run_folder(tmp_path, {("P1", "a.pdb"): src, ("P2", "b.pdb"): src})
-    one_atom = next(l for l in src.read_text().splitlines() if l.startswith("ATOM"))
+def test_rejected_and_missing_pockets_are_dropped(tmp_path):
+    """A pocket cabbage-core rejects and a listed pocket missing on disk are recorded in
+    failed.tsv and left out; the stage completes. A rerun takes cabbage-core's verdicts
+    from the cache instead of running it again."""
+    s = Path(PM_BIN) / "Sample_pockets"
+    layout = _run_folder(tmp_path, {("P1", "a.pdb"): s / "1g64.pdb", ("P2", "b.pdb"): s / "1g64.pdb",
+                                    ("P3", "c.pdb"): s / "1i9c.pdb", ("P4", "d.pdb"): s / "1iwb.pdb"})
+    one_atom = next(l for l in (s / "1g64.pdb").read_text().splitlines() if l.startswith("ATOM"))
     (layout.pockets / "P2" / "b.pdb").write_text(one_atom + "\n")   # cabbage-core aborts
-    with pytest.raises(RuntimeError, match="Step0-cabbage-core"):
-        sim.run(layout, _args(1), Prog())
+    (layout.pockets / "P4" / "d.pdb").unlink()
+    assert sim.units(layout, _args(1)).count == 3   # a, b, c: b's fate is not known yet
+
+    counts = sim.run(layout, _args(1), Prog())
+    assert counts["pockets"] == 2 and counts["pairs"] == 1 and counts["rows"] == 1
+    assert counts["missing"] == 1 and counts["cabbage_failed"] == 1 and counts["failed"] == 2
     rows = (layout.similarity / "failed.tsv").read_text().splitlines()
-    assert rows[0] == "item\tstage\treason" and len(rows) == 2
-    assert not (layout.similarity / "manifest.json").exists()
+    assert rows[:2] == ["item\tstage\treason", "P4/d.pdb\tsimilarity\tpocket file missing"]
+    assert rows[2].startswith("P2/b.pdb\tsimilarity\tStep0-cabbage-core ./b.pdb failed (exit ")
+    assert "malloc" in rows[2] and len(rows) == 3   # the tool's stderr tail
+    assert (layout.similarity / "manifest.json").is_file()
+    assert [l.split()[:2] for l in (layout.similarity / "PocketMatch_score.txt").read_text()
+            .splitlines()] == [["a.pdb" + "_" * 27, "c.pdb" + "_" * 27]]
+
+    cache = layout.similarity / "cabbage"
+    entries = {p.name: p.stat().st_mtime_ns for p in cache.iterdir()}
+    assert sorted(n.rsplit(".", 1)[1] for n in entries if n != sim.CABBAGE_STAMP) == [
+        "cabbage", "cabbage", "failed"]
+    assert sim.units(layout, _args(1)).count == 1   # b is known to fail now
+    again = sim.run(layout, _args(1), Prog())
+    assert again == counts
+    assert {p.name: p.stat().st_mtime_ns for p in cache.iterdir()} == entries
+    assert (layout.similarity / "failed.tsv").read_text().splitlines() == rows
 
 
 @pytest.mark.pocketmatch
 def test_worker_crash_is_attributed(tmp_path, monkeypatch):
     layout = _sample_layout(tmp_path)
     monkeypatch.setenv(sim._CRASH_ENV, "1req.pdb")   # inherited by spawned workers
-    with pytest.raises(sim.JobsFailed, match="1req.pdb: worker process died"):
-        sim.run(layout, _args(4), Prog())
+    counts = sim.run(layout, _args(4), Prog())
+    assert counts["failed"] == 1 and counts["pockets"] == 15 and counts["pairs"] == 105
     rows = (layout.similarity / "failed.tsv").read_text().splitlines()
     assert rows == ["item\tstage\treason",
                     "P00000/1req.pdb\tsimilarity\t" + sim.REASON_DIED]
-    monkeypatch.delenv(sim._CRASH_ENV)
+    monkeypatch.delenv(sim._CRASH_ENV)   # a death is not cached: the rerun retries it
     assert sim.run(layout, _args(4), Prog())["failed"] == 0
 
 
@@ -356,8 +481,8 @@ def net2_run(tmp_path_factory):
     their ON-DISK names, and a DrugScore.csv whose Pocket Filename matches those names
     (the legacy file lowercases the chain; it only resolved on case-insensitive NTFS).
     Legacy AlphaFold `Protein` AF-<acc> is written in the current form AF-<acc>-F1.
-    9 rows (O95235) name files that are not on disk; the legacy script skipped missing
-    files silently, and the 2023 scores contain exactly the 1182 pockets that exist."""
+    9 rows (O95235) name files that are not on disk (the legacy script skipped missing
+    files silently); they stay in DrugScore.csv for the stage to report and drop."""
     net2 = _net2()
     base = tmp_path_factory.mktemp("net2")
     layout = RunLayout(base)
@@ -365,6 +490,7 @@ def net2_run(tmp_path_factory):
     ds = ds[ds["drugScore"] >= 0.5].copy()
     listing = {}
     names = []
+    ds["legacy"] = ds["Pocket Filename"]
     for acc, fname in zip(ds["UniProt ID"], ds["Pocket Filename"]):
         d = net2 / "pockets" / acc
         if acc not in listing:
@@ -375,15 +501,9 @@ def net2_run(tmp_path_factory):
             shutil.copyfile(d / real, layout.pockets / acc / real)
         names.append(real)
     ds["Pocket Filename"] = names
-    absent = ds[ds["Pocket Filename"].isna()]
-    assert len(absent) == 9 and set(absent["UniProt ID"]) == {"O95235"}
-    ds = ds.dropna(subset=["Pocket Filename"])
-    ref_names = set()
-    with open(net2 / "PM_net2" / "PocketMatch_score.txt") as fh:
-        for line in fh:
-            f = line.split(None, 2)
-            ref_names.update((f[0].rstrip("_").lower(), f[1].rstrip("_").lower()))
-    assert {n.lower() for n in ds["Pocket Filename"]} == ref_names   # the same 1182 pockets
+    absent = ds["Pocket Filename"].isna()
+    ds.loc[absent, "Pocket Filename"] = ds.loc[absent, "legacy"]   # left for the stage to report
+    ds = ds.drop(columns="legacy")
     af = ds["Protein"].str.match(r"^AF-[^-]+$")
     ds.loc[af, "Protein"] = ds.loc[af, "Protein"] + "-F1"
     ds.to_csv(layout.drugscore_csv)
@@ -435,6 +555,12 @@ def test_reproduces_net2_2023(net2_run, tmp_path, nprocs):
     wall = time.monotonic() - t0
     print(f"\nnet2 similarity nprocs={nprocs}: {counts['pockets']} pockets, "
           f"{counts['pairs']} pairs, wall {wall:.1f} s")
+
+    rows = (layout.similarity / "failed.tsv").read_text().splitlines()[1:]
+    assert len(rows) == 9 and counts["missing"] == counts["failed"] == 9
+    assert all(r.startswith("O95235/AF-O95235-F1.pdb_res_P_") and
+               r.endswith("\tsimilarity\tpocket file missing") for r in rows), rows
+    assert counts["pockets"] == 1182 and counts["cabbage_failed"] == 0
 
     ref_dir = _net2() / "PM_net2"
     got, ref = _score_map(layout.similarity / "PocketMatch_score.txt"), _score_map(

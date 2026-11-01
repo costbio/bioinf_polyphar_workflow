@@ -2,25 +2,34 @@
 
 Inputs: 04_pockets/DrugScore.csv, rows with drugScore >= 0.5; each pocket file is
 04_pockets/<UniProt ID>/<Pocket Filename>, found by its exact on-disk name. The pocket
-list is ordered by (UniProt ID, Pocket Filename) so every run sees the same order.
+list is ordered by (UniProt ID, Pocket Filename) so every run sees the same order. A
+listed file that is missing is recorded in failed.tsv (`pocket file missing`) and dropped.
+PocketMatch records a file's base name truncated to 32 characters, so names longer than
+32 or colliding fail the stage before PocketMatch runs (also in --dry-run), listed in
+failed.tsv.
 
 PocketMatch (the upstream prebuilt 32-bit binaries in $PM_BIN_DIR) is run as the upstream
 pipeline does: `Step0-cabbage-core ./<pocket>` (from the pocket's directory) for each
 pocket into outfile.cabbage, then `Step0-END-FILE`, then `Step3-PM_serial outfile.cabbage`,
-every exit code checked, in private temp dirs. cabbage-core's output depends only on the
-pocket, so it runs once per pocket (in parallel) and each job concatenates the records.
-PocketMatch records the file's base name, truncated to 32 characters, so names longer
-than 32 or colliding fail before it runs. Its PocketMatch_pairs.txt (hundreds of bytes
-per pair, not used) goes to /dev/null.
+every exit code checked, in private temp dirs. Its PocketMatch_pairs.txt (hundreds of
+bytes per pair, not used) goes to /dev/null.
 
-Parallelism: the ordered list is cut into k contiguous blocks B_0..B_{k-1}, k the smallest
-with k(k-1)/2 >= nprocs. Job (i, j), i < j, runs all-vs-all on B_i ++ B_j and keeps the
-cross pairs; the within-block pairs of B_i are kept by exactly one job (the ring
-neighbour (i, i+1 mod k)). Each job writes 05_similarity/jobs/<i>-<j>.txt and then a
-<i>-<j>.done marker holding a fingerprint of its pockets (names + file sha256); a rerun
-skips jobs whose marker matches. The job files are merged in the order a serial run
-emits pairs ((index(name1), index(name2)) in the ordered list), so the merged
-PocketMatch_score.txt is byte-identical for every nprocs.
+Phase 1, cabbage: cabbage-core's output depends only on the pocket file (content and name),
+so it runs once per pocket, in parallel, into the persistent cache 05_similarity/cabbage/
+<sha256>_<name>.cabbage (atomic writes; the cache is cleared when the cabbage-core binary
+changes). A pocket cabbage-core rejects is recorded in failed.tsv with the tool's stderr
+tail (and cached as <key>.failed, so a resume does not rerun it) and dropped.
+
+Phase 2, PocketMatch: the surviving list is cut into k contiguous blocks B_0..B_{k-1}, k
+the smallest with k(k-1)/2 >= nprocs. Job (i, j), i < j, concatenates the records of
+B_i ++ B_j, runs PM_serial and keeps the cross pairs; the within-block pairs of B_i are
+kept by exactly one job (the ring neighbour (i, i+1 mod k)). Each job writes
+05_similarity/jobs/<i>-<j>.txt and then a <i>-<j>.done marker holding the .txt size and
+a fingerprint (its pockets' names and sha256, the PocketMatch binaries' sha256); a rerun
+skips jobs whose marker matches. A failed job is fatal. The job files are merged in the
+order a serial run emits pairs ((index(name1), index(name2)) in the ordered list), so the
+merged PocketMatch_score.txt is byte-identical for every nprocs. jobs/ is deleted once
+PocketMatch_score.txt and Pocketsim.csv are written.
 
 Outputs: 05_similarity/PocketMatch_score.txt, Pocketsim.csv (legacy columns and filters;
 Pocket_Path relative to the run folder), failed.tsv, manifest.json (written last).
@@ -49,11 +58,14 @@ CABBAGE, END_FILE, PM_SERIAL = "Step0-cabbage-core", "Step0-END-FILE", "Step3-PM
 PM_BINARIES = (CABBAGE, END_FILE, PM_SERIAL)
 SCORE_FILE = "PocketMatch_score.txt"
 JOBS = "jobs"
+CABBAGE_DIR = "cabbage"
+CABBAGE_STAMP = "BINARY_SHA256"
 NULL = "NULL____"
 POCKETSIM_COLUMNS = ["UniProt ID", "Gene Name", "Protein", "Pocket", "Pocket_Path",
                      "UniProt ID_2", "Gene Name_2", "Protein_2", "Pocket_2", "Pocket_Path_2",
                      "Pmin", "Pmax"]
 REASON_DIED = "worker process died (BrokenProcessPool)"
+REASON_MISSING = "pocket file missing"
 SOLO_RETRY_PROBES = 3
 TERMINATE_GRACE_S = 15.0
 
@@ -78,9 +90,10 @@ class JobsFailed(RuntimeError):
 # --- inputs --------------------------------------------------------------------------
 
 def pocket_table(pockets_dir, cutoff: float = DRUGSCORE_CUTOFF):
-    """DrugScore.csv rows with drugScore >= cutoff, one per pocket file, sorted by
-    (UniProt ID, Pocket Filename). Raises FileNotFoundError, listing them, when files are
-    missing (compared by exact name, so a case mismatch is caught on any filesystem)."""
+    """(table, missing): the DrugScore.csv rows with drugScore >= cutoff whose pocket file
+    exists, one per file, sorted by (UniProt ID, Pocket Filename); and the listed files that
+    do not exist, as `<UniProt ID>/<Pocket Filename>` (compared by exact name, so a case
+    mismatch counts as missing on any filesystem)."""
     import pandas as pd
 
     pockets_dir = Path(pockets_dir)
@@ -95,17 +108,15 @@ def pocket_table(pockets_dir, cutoff: float = DRUGSCORE_CUTOFF):
     df = df.sort_values(["UniProt ID", "Pocket Filename"], kind="mergesort")
     df = df.reset_index(drop=True)
     listing: dict[str, set[str]] = {}
-    missing = []
+    present, missing = [], []
     for acc, name in zip(df["UniProt ID"], df["Pocket Filename"]):
         if acc not in listing:
             d = pockets_dir / acc
             listing[acc] = set(os.listdir(d)) if d.is_dir() else set()
-        if name not in listing[acc]:
+        present.append(name in listing[acc])
+        if not present[-1]:
             missing.append(f"{acc}/{name}")
-    if missing:
-        raise FileNotFoundError(f"{len(missing)} pocket file(s) listed in {path} are missing: "
-                                + ", ".join(missing[:20]))
-    return df
+    return df[present].reset_index(drop=True), missing
 
 
 def _paths(pockets_dir, table) -> list[Path]:
@@ -113,33 +124,53 @@ def _paths(pockets_dir, table) -> list[Path]:
 
 
 def select_pockets(pockets_dir, cutoff: float = DRUGSCORE_CUTOFF) -> list[Path]:
-    """Pocket files with drugScore >= cutoff, in the stage's deterministic order."""
-    return _paths(pockets_dir, pocket_table(pockets_dir, cutoff))
+    """Existing pocket files with drugScore >= cutoff, in the stage's deterministic order."""
+    return _paths(pockets_dir, pocket_table(pockets_dir, cutoff)[0])
+
+
+def _name_problems(pockets) -> tuple[list[tuple[str, str]], str]:
+    """([(item, reason)], summary) for names PocketMatch cannot keep apart: longer than
+    32 characters (it truncates them), colliding, or with whitespace / a trailing '_'
+    (it pads names with '_')."""
+    pockets = [Path(p) for p in pockets]
+    rows: list[tuple[str, str]] = []
+    long = [p for p in pockets if len(p.name) > PM_NAME_LIMIT]
+    rows += [(_item(p), f"pocket name longer than {PM_NAME_LIMIT} characters") for p in long]
+    seen: dict[str, list[Path]] = {}
+    for p in pockets:
+        seen.setdefault(p.name[:PM_NAME_LIMIT].rstrip("_"), []).append(p)
+    collide = {k: v for k, v in seen.items() if len(v) > 1}
+    for v in collide.values():
+        rows += [(_item(p), "pocket name collides in PocketMatch with "
+                  + ", ".join(_item(q) for q in v if q is not p)) for p in v]
+    bad = [p for p in pockets if p.name != p.name.strip() or any(c.isspace() for c in p.name)
+           or p.name.endswith("_")]
+    rows += [(_item(p), "pocket name with whitespace or a trailing '_'") for p in bad]
+    problems = []
+    if long:
+        names = sorted({p.name for p in long})
+        problems.append(f"{len(names)} pocket name(s) longer than {PM_NAME_LIMIT} characters "
+                        f"(PocketMatch truncates them): " + ", ".join(names[:20]))
+    if collide:
+        problems.append(f"{len(collide)} pocket name(s) collide in PocketMatch: " + "; ".join(
+            f"{k}: {', '.join(map(str, v))}" for k, v in list(collide.items())[:20]))
+    if bad:
+        problems.append("pocket name(s) with whitespace or a trailing '_': "
+                        + ", ".join(sorted({p.name for p in bad})[:20]))
+    return rows, "; ".join(problems)
 
 
 def check_pocket_names(pockets) -> None:
-    """PocketMatch keeps the first 32 characters of the base name and pads it with '_'.
-    Raise ValueError, listing the names, when a name is longer than 32 characters,
-    cannot be read back (whitespace, trailing '_'), or two names collide."""
-    names = [Path(p).name for p in pockets]
-    long = sorted({n for n in names if len(n) > PM_NAME_LIMIT})
-    bad = sorted({n for n in names if n != n.strip() or any(c.isspace() for c in n)
-                  or n.endswith("_")})
-    seen: dict[str, list[str]] = {}
-    for p in pockets:
-        seen.setdefault(Path(p).name[:PM_NAME_LIMIT].rstrip("_"), []).append(str(p))
-    collide = {k: v for k, v in seen.items() if len(v) > 1}
-    problems = []
-    if long:
-        problems.append(f"{len(long)} pocket name(s) longer than {PM_NAME_LIMIT} characters "
-                        f"(PocketMatch truncates them): " + ", ".join(long[:20]))
-    if collide:
-        problems.append(f"{len(collide)} pocket name(s) collide in PocketMatch: " + "; ".join(
-            f"{k}: {', '.join(v)}" for k, v in list(collide.items())[:20]))
-    if bad:
-        problems.append("pocket name(s) with whitespace or a trailing '_': " + ", ".join(bad[:20]))
-    if problems:
-        raise ValueError("; ".join(problems))
+    """Raise ValueError, listing the names, when a name is longer than 32 characters,
+    cannot be read back (whitespace, trailing '_'), or two names collide in PocketMatch."""
+    _, summary = _name_problems(pockets)
+    if summary:
+        raise ValueError(summary)
+
+
+def _item(path) -> str:
+    path = Path(path)
+    return f"{path.parent.name}/{path.name}"
 
 
 # --- PocketMatch ---------------------------------------------------------------------
@@ -172,7 +203,7 @@ def cabbage_record(pocket, pm_bin_dir, out) -> None:
     with open(out, "wb") as fh:
         proc = subprocess.run([str(Path(pm_bin_dir) / CABBAGE), f"./{p.name}"], cwd=p.parent,
                               stdout=fh, stderr=subprocess.PIPE)
-    _check(proc, f"{CABBAGE} {p}")
+    _check(proc, f"{CABBAGE} ./{p.name}")
 
 
 def run_pocketmatch(pockets, pm_bin_dir, work_dir, records=None) -> Path:
@@ -282,20 +313,27 @@ def _read_done(path: Path) -> dict:
         return {}
 
 
-def _plan(paths: list[Path], nprocs: int, work_dir: Path) -> _Plan:
+def _plan(paths: list[Path], nprocs: int, work_dir: Path, digests: list[str],
+          bins: dict | None) -> _Plan:
+    """Blocks, jobs and fingerprints for `paths`; a job is done when its .done marker has
+    the same fingerprint and the size of its .txt as written. `bins` are the PocketMatch
+    binaries' sha256 (None when unknown: then no job counts as done)."""
     blocks = plan_blocks(len(paths), nprocs)
     jobs = plan_jobs(blocks) if len(paths) >= 2 else []
-    digests = [sha256_file(p) for p in paths]
     jobs_dir = Path(work_dir) / JOBS
     fps, done = {}, {}
     for job in jobs:
         payload = {"blocks": [[[paths[a].name, digests[a]] for a in range(*blocks[b])]
                               for b in job.blocks],
-                   "within": list(job.within)}
+                   "within": list(job.within), "pocketmatch_sha256": bins}
         fp = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
         fps[job.tag] = fp
         marker = _read_done(jobs_dir / f"{job.tag}.done")
-        if marker.get("fingerprint") == fp and (jobs_dir / f"{job.tag}.txt").is_file():
+        try:
+            size = (jobs_dir / f"{job.tag}.txt").stat().st_size
+        except OSError:
+            continue
+        if bins is not None and marker.get("fingerprint") == fp and marker.get("bytes") == size:
             done[job.tag] = int(marker["pairs"])
     return _Plan(list(paths), blocks, jobs, fps, done)
 
@@ -340,10 +378,10 @@ def _task(fn):
             os._exit(143)   # the parent is stopping the pool; never go back to idle
 
 
-def _atomic_write_lines(path: Path, lines) -> None:
+def _atomic_write_lines(path: Path, lines, encoding: str = "latin-1") -> None:
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
     try:
-        with os.fdopen(fd, "w", encoding="latin-1", newline="") as fh:
+        with os.fdopen(fd, "w", encoding=encoding, newline="") as fh:
             for line in lines:
                 fh.write(line)
         os.chmod(tmp, 0o644)
@@ -380,10 +418,30 @@ def _job_lines(score: Path, names: list[str], block_of: list[int], job: Job):
 _CRASH_ENV = "POLYPHAR_SIMILARITY_TEST_CRASH_ON"   # test hook: worker dies on this pocket ("*": all)
 
 
-def _cabbage_worker(pocket: str, pm_bin_dir: str, out: str) -> None:
+def _cabbage_worker(pocket: str, pm_bin_dir: str, record: str, failed: str) -> str | None:
+    """cabbage-core on one pocket into the cache: `record` on success (returns None); on a
+    cabbage-core failure writes `failed` and returns the reason. Both atomically."""
     if os.environ.get(_CRASH_ENV) in (Path(pocket).name, "*"):
         os._exit(1)
-    _task(lambda: cabbage_record(pocket, pm_bin_dir, out))
+    return _task(lambda: _cabbage(Path(pocket), pm_bin_dir, Path(record), Path(failed)))
+
+
+def _cabbage(pocket: Path, pm_bin_dir, record: Path, failed: Path) -> str | None:
+    fd, tmp = tempfile.mkstemp(dir=record.parent, prefix=record.name + ".", suffix=".tmp")
+    os.close(fd)
+    try:
+        try:
+            cabbage_record(pocket, pm_bin_dir, tmp)
+        except PocketMatchError as exc:
+            reason = str(exc)
+        else:
+            os.chmod(tmp, 0o644)
+            os.replace(tmp, record)
+            return None
+    finally:
+        Path(tmp).unlink(missing_ok=True)
+    _atomic_write_lines(failed, [reason + "\n"], encoding="utf-8")
+    return reason
 
 
 def _job_worker(paths: list[str], records: list[str], block_of: list[int], job: Job,
@@ -405,9 +463,10 @@ def _job(paths, records, block_of, job, pm_bin_dir, jobs_dir, fingerprint) -> in
             for line in _job_lines(score, names, block_of, job):
                 kept += 1
                 yield line
-        _atomic_write_lines(jobs_dir / f"{job.tag}.txt", counted())
-    marker = {"fingerprint": fingerprint, "pairs": kept, "pockets": len(paths),
-              "seconds": round(time.monotonic() - t0, 3)}
+        txt = jobs_dir / f"{job.tag}.txt"
+        _atomic_write_lines(txt, counted())
+    marker = {"fingerprint": fingerprint, "pairs": kept, "bytes": txt.stat().st_size,
+              "pockets": len(paths), "seconds": round(time.monotonic() - t0, 3)}
     _atomic_write_lines(jobs_dir / f"{job.tag}.done", [json.dumps(marker) + "\n"])
     return kept
 
@@ -433,111 +492,184 @@ def _terminate(ex) -> None:
             p.join(timeout=10)
 
 
-def _run_pool(tasks, nprocs: int, on_result=None) -> list[tuple[str, str]]:
-    """Run tasks [(item, fn, args)] on a spawn process pool; returns [(item, reason)] for
-    the failed ones. on_result(item, result) runs in this (parent) process. Any
-    BaseException (Ctrl-C, SIGTERM) stops the workers and propagates."""
+@dataclass
+class PoolOutcome:
+    failures: list[tuple[object, str]]   # (item, reason)
+    isolated: list[object]               # items run alone after their pool broke twice
+
+
+def _pool_pass(tasks, queue, nprocs: int, on_result, failures):
+    """Run tasks from `queue` (indices into tasks) on one fresh spawn pool, keeping at most
+    nprocs in flight, until the queue is empty or the pool breaks. Returns (indices that
+    were in flight when the pool broke, number of tasks completed)."""
     import multiprocessing
-    from concurrent.futures import ProcessPoolExecutor, as_completed
+    from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
     from concurrent.futures.process import BrokenProcessPool
 
     ctx = multiprocessing.get_context("spawn")   # workers start clean (no fork of a threaded parent)
-    failures: list[tuple[str, str]] = []
-    broken = []
-
-    def done(task, result):
-        if on_result is not None:
-            on_result(task[0], result)
-
-    if not tasks:
-        return failures
-    with ProcessPoolExecutor(max_workers=max(1, min(nprocs, len(tasks))), mp_context=ctx,
+    completed = 0
+    with ProcessPoolExecutor(max_workers=max(1, min(nprocs, len(queue))), mp_context=ctx,
                              initializer=_worker_init) as ex:
         try:
-            futures = {}
-            for task in tasks:
-                try:
-                    futures[ex.submit(task[1], *task[2])] = task
-                except BrokenProcessPool:   # a worker already died: retried below
-                    broken.append(task)
-            for fut in as_completed(futures):
-                task = futures[fut]
-                try:
-                    result = fut.result()
-                except BrokenProcessPool:
-                    broken.append(task)
-                    continue
-                except Exception as exc:
-                    failures.append((task[0], _reason(exc)))
-                    continue
-                done(task, result)
+            inflight: dict = {}
+            while queue or inflight:
+                while queue and len(inflight) < nprocs:
+                    i = queue.popleft()
+                    item, fn, args = tasks[i]
+                    try:
+                        inflight[ex.submit(fn, *args)] = i
+                    except BrokenProcessPool:   # never ran: back to the queue
+                        queue.appendleft(i)
+                        return list(inflight.values()), completed
+                finished, _ = wait(inflight, return_when=FIRST_COMPLETED)
+                broke = []
+                for fut in finished:
+                    i = inflight.pop(fut)
+                    try:
+                        result = fut.result()
+                    except BrokenProcessPool:
+                        broke.append(i)
+                        continue
+                    except Exception as exc:
+                        failures.append((tasks[i][0], _reason(exc)))
+                    else:
+                        if on_result is not None:
+                            on_result(tasks[i][0], result)
+                    completed += 1
+                if broke:   # everything still in flight went down with it
+                    return broke + list(inflight.values()), completed
+            return [], completed
         except BaseException:
             _terminate(ex)
             raise
-    # The pool died under the tasks still in flight: redo each alone in a fresh pool,
-    # so a crash is attributed to its own task. When the first solo retries all die too,
-    # workers cannot run at all: fail the rest without spawning a pool for each.
-    tried = died = 0
-    for task in sorted(broken, key=tasks.index):
-        item, fn, args = task
+
+
+def _run_pool(tasks, nprocs: int, on_result=None) -> PoolOutcome:
+    """Run tasks [(item, fn, args)] on spawn process pools; returns the failed items with
+    their reasons. on_result(item, result) runs in this (parent) process. When a worker
+    dies, the tasks in flight go back to a fresh full-size pool; a task in flight during
+    a second break runs alone, so a crash is attributed to its own task. When pools keep
+    breaking without finishing anything, or every solo run dies, the rest are failed
+    without retrying. Any BaseException (Ctrl-C, SIGTERM) stops the workers and propagates."""
+    from collections import deque
+
+    failures: list = []
+    queue = deque(range(len(tasks)))
+    breaks: dict[int, int] = {}
+    solo: list[int] = []
+    empty = total = 0
+    while queue:
+        broken, completed = _pool_pass(tasks, queue, nprocs, on_result, failures)
+        total += completed
+        if not broken:
+            continue
+        empty = 0 if completed else empty + 1
+        retry = []
+        for i in broken:
+            breaks[i] = breaks.get(i, 0) + 1
+            (solo if breaks[i] >= 2 else retry).append(i)
+        queue.extendleft(reversed(sorted(retry)))
+        if total == 0 and empty >= SOLO_RETRY_PROBES:   # pools cannot run anything at all
+            failures += [(tasks[i][0], REASON_DIED + "; not retried, every pool died")
+                         for i in list(queue) + solo]
+            return PoolOutcome(failures, [])
+    isolated, tried, died = [], 0, 0
+    for i in sorted(solo):
         if tried >= SOLO_RETRY_PROBES and died == tried:
-            failures.append((item, REASON_DIED + "; not retried, every retry died"))
+            failures.append((tasks[i][0], REASON_DIED + "; not retried, every retry died"))
             continue
         tried += 1
-        with ProcessPoolExecutor(max_workers=1, mp_context=ctx, initializer=_worker_init) as ex:
-            try:
-                result = ex.submit(fn, *args).result()
-            except BrokenProcessPool:
-                failures.append((item, REASON_DIED))
-                died += 1
-                continue
-            except Exception as exc:
-                failures.append((item, _reason(exc)))
-                continue
-            except BaseException:
-                _terminate(ex)
-                raise
-        done(task, result)
-    return failures
+        isolated.append(tasks[i][0])
+        broken, _ = _pool_pass(tasks, deque([i]), 1, on_result, failures)
+        if broken:
+            failures.append((tasks[i][0], REASON_DIED))
+            died += 1
+    return PoolOutcome(failures, isolated)
 
 
-def _item(path: Path) -> str:
-    return f"{path.parent.name}/{path.name}"
+def _bin_hashes(pm: Path) -> dict[str, str]:
+    return {b: sha256_file(Path(pm) / b) for b in PM_BINARIES}
 
 
-def _run_jobs(plan: _Plan, pm_bin_dir: Path, jobs_dir: Path, nprocs: int, progress) -> None:
-    """Phase 1: cabbage-core once per pocket the remaining jobs need, in parallel, into a
-    private temp dir. Phase 2: the block-pair jobs, which concatenate those records."""
+def _cache_paths(work: Path, path: Path, digest: str) -> tuple[Path, Path]:
+    key = f"{digest}_{path.name}"   # the record embeds the name, so it is part of the key
+    d = Path(work) / CABBAGE_DIR
+    return d / f"{key}.cabbage", d / f"{key}.failed"
+
+
+def _cache_valid(work: Path, cabbage_sha: str | None) -> bool:
+    stamp = Path(work) / CABBAGE_DIR / CABBAGE_STAMP
+    try:
+        return cabbage_sha is not None and stamp.read_text().strip() == cabbage_sha
+    except OSError:
+        return False
+
+
+def _cached(work: Path, paths, digests, cabbage_sha) -> tuple[dict[int, Path], dict[int, str]]:
+    """(records, failures) already in the cabbage cache, by pocket index (read only)."""
+    records, failed = {}, {}
+    if not _cache_valid(work, cabbage_sha):
+        return records, failed
+    for i, (p, dg) in enumerate(zip(paths, digests)):
+        rec, fl = _cache_paths(work, p, dg)
+        if rec.is_file():
+            records[i] = rec
+        elif fl.is_file():
+            failed[i] = fl.read_text(encoding="utf-8", errors="replace").strip()
+    return records, failed
+
+
+def _cabbage_phase(paths, digests, pm: Path, bins: dict, work: Path, nprocs: int):
+    """Phase 1: cabbage records for every pocket, from the cache or computed in parallel.
+    Returns (records by index, reasons by index for the pockets cabbage-core rejected or
+    whose worker died)."""
+    d = Path(work) / CABBAGE_DIR
+    if not _cache_valid(work, bins[CABBAGE]):   # new binary: old records are stale
+        shutil.rmtree(d, ignore_errors=True)
+        d.mkdir(parents=True)
+        _atomic_write_lines(d / CABBAGE_STAMP, [bins[CABBAGE] + "\n"])
+    records, failed = _cached(work, paths, digests, bins[CABBAGE])
+    todo = [i for i in range(len(paths)) if i not in records and i not in failed]
+    # Largest first, so a giant pocket (cabbage-core is superlinear: 42 s for a 265 kB
+    # net2 pocket) does not start last; results do not depend on run order.
+    todo.sort(key=lambda i: (-paths[i].stat().st_size, i))
+    tasks = []
+    for i in todo:
+        rec, fl = _cache_paths(work, paths[i], digests[i])
+        tasks.append((i, _cabbage_worker, (str(paths[i]), str(pm), str(rec), str(fl))))
+
+    def collect(i, reason):
+        if reason is None:
+            records[i] = _cache_paths(work, paths[i], digests[i])[0]
+        else:
+            failed[i] = reason
+    outcome = _run_pool(tasks, nprocs, collect)
+    for i, reason in outcome.failures:
+        failed[i] = reason
+    return records, failed
+
+
+def _run_jobs(plan: _Plan, records: list[Path], pm_bin_dir: Path, jobs_dir: Path,
+              nprocs: int, progress) -> None:
+    """Phase 2: the block-pair jobs not done yet; any failure is fatal (JobsFailed)."""
     todo = [j for j in plan.jobs if j.tag not in plan.done]
     if not todo:
         return
     block_of = [b for b, (s, e) in enumerate(plan.blocks) for _ in range(s, e)]
-    # Largest first, so a giant pocket (cabbage-core is superlinear: 42 s for a 265 kB
-    # net2 pocket) does not start last; result order does not depend on run order.
-    size = {a: plan.paths[a].stat().st_size for job in todo for a in _members(job, plan.blocks)}
-    needed = sorted(size, key=lambda a: (-size[a], a))
-    with tempfile.TemporaryDirectory(prefix="polyphar_cabbage_") as tmp:
-        rec = {a: str(Path(tmp) / f"{a}.cabbage") for a in needed}
-        failures = _run_pool([(_item(plan.paths[a]), _cabbage_worker,
-                               (str(plan.paths[a]), str(pm_bin_dir), rec[a])) for a in needed],
-                             nprocs)
-        if failures:
-            raise JobsFailed(sorted(failures))
+    tasks = []
+    for job in todo:
+        members = _members(job, plan.blocks)
+        tasks.append((job.tag, _job_worker,
+                      ([str(plan.paths[a]) for a in members], [str(records[a]) for a in members],
+                       [block_of[a] for a in members], job, str(pm_bin_dir),
+                       str(jobs_dir), plan.fingerprints[job.tag])))
 
-        tasks = []
-        for job in todo:
-            members = _members(job, plan.blocks)
-            tasks.append((job.tag, _job_worker,
-                          ([str(plan.paths[a]) for a in members], [rec[a] for a in members],
-                           [block_of[a] for a in members], job, str(pm_bin_dir),
-                           str(jobs_dir), plan.fingerprints[job.tag])))
-
-        def advance(item, kept):
-            if progress is not None:
-                progress.advance(kept)
-        failures = _run_pool(tasks, nprocs, advance)
-    if failures:
-        raise JobsFailed(sorted(failures))
+    def advance(item, kept):
+        if progress is not None:
+            progress.advance(kept)
+    outcome = _run_pool(tasks, nprocs, advance)
+    if outcome.failures:
+        raise JobsFailed(sorted(outcome.failures))
 
 
 def _merge(plan: _Plan, jobs_dir: Path, out: Path) -> int:
@@ -568,25 +700,45 @@ def _merge(plan: _Plan, jobs_dir: Path, out: Path) -> int:
     return count
 
 
-def run_pocketmatch_parallel(pockets, pm_bin_dir, work_dir, nprocs, progress=None) -> Path:
-    """All-vs-all PocketMatch on `pockets` as block-pair jobs on `nprocs` processes;
-    finished jobs (matching .done markers in work_dir/jobs) are skipped. Writes
-    work_dir/PocketMatch_score.txt, byte-identical to a serial run, and returns it."""
-    work = Path(work_dir)
+@dataclass
+class _Result:
+    score: Path
+    plan: _Plan
+    skipped: int                 # pairs of jobs already done before this run
+    dropped: dict[Path, str]     # pockets dropped in phase 1 -> reason
+
+
+def _similarity(pockets, pm_bin_dir, work_dir, nprocs, progress=None) -> _Result:
+    work, pm = Path(work_dir), Path(pm_bin_dir)
+    paths = [Path(p) for p in pockets]
+    bins = _bin_hashes(pm)
+    digests = [sha256_file(p) for p in paths]
+    records, failed = _cabbage_phase(paths, digests, pm, bins, work, nprocs)
+    keep = [i for i in range(len(paths)) if i not in failed]
+    plan = _plan([paths[i] for i in keep], nprocs, work, [digests[i] for i in keep], bins)
     jobs_dir = work / JOBS
     jobs_dir.mkdir(parents=True, exist_ok=True)
-    plan = _plan([Path(p) for p in pockets], nprocs, work)
     current = {f"{j.tag}{s}" for j in plan.jobs for s in (".txt", ".done")}
     for f in jobs_dir.iterdir():   # job files of another plan (other nprocs or pockets)
         if f.suffix in (".txt", ".done") and f.name not in current:
             f.unlink(missing_ok=True)
-    _run_jobs(plan, Path(pm_bin_dir), jobs_dir, nprocs, progress)
+    _run_jobs(plan, [records[i] for i in keep], pm, jobs_dir, nprocs, progress)
     out = work / SCORE_FILE
     if plan.jobs:
         _merge(plan, jobs_dir, out)
     else:
         _atomic_write_lines(out, [])
-    return out
+    return _Result(out, plan, plan.total - plan.remaining,
+                   {paths[i]: failed[i] for i in sorted(failed)})
+
+
+def run_pocketmatch_parallel(pockets, pm_bin_dir, work_dir, nprocs, progress=None) -> Path:
+    """All-vs-all PocketMatch on `pockets` as block-pair jobs on `nprocs` processes;
+    cabbage records come from the cache in work_dir/cabbage and finished jobs (matching
+    .done markers in work_dir/jobs) are skipped. Pockets cabbage-core rejects are left
+    out. Writes work_dir/PocketMatch_score.txt, byte-identical to a serial run, and
+    returns it."""
+    return _similarity(pockets, pm_bin_dir, work_dir, nprocs, progress).score
 
 
 # --- scores --------------------------------------------------------------------------
@@ -608,68 +760,122 @@ def parse_scores(score_file, pockets, protein_info):
     of the scored pockets (UniProt ID, Gene Name, Protein, Pocket, Pocket Filename);
     every name in the file must be one of its Pocket Filenames. Legacy filters: drop
     NULL____ scores, Pmin or Pmax == 1, and same-UniProt pairs. Rows are sorted by Pmax
-    descending (stable); the index is the 0-based line number in the score file."""
+    descending (stable); the index is the 0-based line number in the score file.
+
+    Memory: the file is streamed into integer pocket codes and float scores (24 bytes a
+    line); the per-pocket text columns are categoricals over the pocket table."""
+    from array import array
+
+    import numpy as np
     import pandas as pd
 
-    meta: dict[str, dict] = {}
-    for row in pockets.to_dict("records"):
-        name = str(row["Pocket Filename"])
-        if name in meta:
+    names = [str(n) for n in pockets["Pocket Filename"]]
+    code: dict[str, int] = {}
+    for i, name in enumerate(names):
+        if name in code:
             raise ValueError(f"pocket file name {name} is listed twice")
-        meta[name] = row
-    genes = _gene_names(protein_info)
-
-    rows = []
+        code[name] = i
+    a, b, pmin, pmax = array("i"), array("i"), array("d"), array("d")
+    unknown: set[str] = set()
+    nan = float("nan")
     with open(score_file, encoding="latin-1") as fh:
-        for i, line in enumerate(fh):
-            f = line.split()
+        for ln, line in enumerate(fh):
+            f = line.split(None, 4)
             if len(f) < 4:
-                raise ValueError(f"{score_file}:{i + 1}: malformed line {line[:80]!r}")
-            rows.append((i, f[0].rstrip("_"), f[1].rstrip("_"), f[2], f[3]))
-    df = pd.DataFrame(rows, columns=["line", "n1", "n2", "Pmin", "Pmax"]).set_index("line")
-    df.index.name = None
-    unknown = sorted((set(df["n1"]) | set(df["n2"])) - meta.keys())
+                raise ValueError(f"{score_file}:{ln + 1}: malformed line {line[:80]!r}")
+            n1, n2 = f[0].rstrip("_"), f[1].rstrip("_")
+            x, y = code.get(n1, -1), code.get(n2, -1)
+            if x < 0 or y < 0:
+                unknown.update(n for n, c in ((n1, x), (n2, y)) if c < 0)
+            a.append(x)
+            b.append(y)
+            pmin.append(nan if f[2] == NULL else float(f[2]))
+            pmax.append(nan if f[3] == NULL else float(f[3]))
     if unknown:
-        raise ValueError(f"{len(unknown)} pocket name(s) in {score_file} are not in the pocket "
-                         f"table: " + ", ".join(unknown[:20]))
+        unknown_s = sorted(unknown)
+        raise ValueError(f"{len(unknown_s)} pocket name(s) in {score_file} are not in the "
+                         f"pocket table: " + ", ".join(unknown_s[:20]))
+    a, b = np.frombuffer(a, dtype=np.intc), np.frombuffer(b, dtype=np.intc)
+    pmin, pmax = np.frombuffer(pmin, dtype=np.float64), np.frombuffer(pmax, dtype=np.float64)
 
-    df = df[(df["Pmin"] != NULL) & (df["Pmax"] != NULL)].copy()
-    df["Pmin"] = pd.to_numeric(df["Pmin"])
-    df["Pmax"] = pd.to_numeric(df["Pmax"])
-    df = df[(df["Pmin"] != 1) & (df["Pmax"] != 1)]
+    accs = np.asarray([str(x) for x in pockets["UniProt ID"]], dtype=object)
+    acc_code, _ = pd.factorize(accs)
+    keep = (~np.isnan(pmin) & ~np.isnan(pmax) & (pmin != 1) & (pmax != 1)
+            & (acc_code[a] != acc_code[b]))
+    idx = np.flatnonzero(keep)
+    idx = idx[np.argsort(-pmax[idx], kind="stable")]
+    ia, ib = a[idx], b[idx]
+    del a, b, keep
 
-    out = pd.DataFrame(index=df.index)
-    for suffix, col in (("", "n1"), ("_2", "n2")):
-        m = df[col].map(meta)
-        acc = m.map(lambda r: str(r["UniProt ID"]))
-        out["UniProt ID" + suffix] = acc
-        out["Gene Name" + suffix] = [genes.get(a) or str(r["Gene Name"]) for a, r in zip(acc, m)]
-        out["Protein" + suffix] = m.map(lambda r: str(r["Protein"]))
-        out["Pocket" + suffix] = m.map(lambda r: str(r["Pocket"]))
-        out["Pocket_Path" + suffix] = [f"{POCKETS_REL}/{a}/{n}" for a, n in zip(acc, df[col])]
-    out["Pmin"] = df["Pmin"]
-    out["Pmax"] = df["Pmax"]
-    out = out[out["UniProt ID"] != out["UniProt ID_2"]]
-    out = out.sort_values("Pmax", ascending=False, kind="mergesort")
-    return out[POCKETSIM_COLUMNS]
+    genes = _gene_names(protein_info)
+    per_pocket = {
+        "UniProt ID": list(accs),
+        "Gene Name": [genes.get(acc) or str(g) for acc, g in zip(accs, pockets["Gene Name"])],
+        "Protein": [str(x) for x in pockets["Protein"]],
+        "Pocket": [str(x) for x in pockets["Pocket"]],
+        "Pocket_Path": [f"{POCKETS_REL}/{acc}/{n}" for acc, n in zip(accs, names)],
+    }
+    cols = {}
+    for suffix, sel in (("", ia), ("_2", ib)):
+        for col, values in per_pocket.items():
+            codes, cats = pd.factorize(np.asarray(values, dtype=object))
+            cols[col + suffix] = pd.Categorical.from_codes(codes[sel], categories=cats)
+    cols["Pmin"] = pmin[idx]
+    cols["Pmax"] = pmax[idx]
+    return pd.DataFrame(cols, index=pd.Index(idx))[POCKETSIM_COLUMNS]
 
 
 # --- stage ---------------------------------------------------------------------------
 
 def _inputs(layout):
-    table = pocket_table(layout.pockets)
-    return table, _paths(layout.pockets, table)
+    table, missing = pocket_table(layout.pockets)
+    return table, _paths(layout.pockets, table), missing
+
+
+def _guard(layout, paths, record: bool, fresh: bool = True) -> None:
+    """The name guard; with record, its findings go to failed.tsv first (a fresh one, and
+    any manifest removed, unless the caller already started them)."""
+    rows, summary = _name_problems(paths)
+    if not summary:
+        return
+    if record:
+        d = layout.similarity
+        if fresh:
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "manifest.json").unlink(missing_ok=True)
+            (d / "failed.tsv").write_text("item\tstage\treason\n")
+        for item, reason in rows:
+            append_failure(d, item, STAGE, reason)
+    raise ValueError(summary)
+
+
+def _pm_or_none(args) -> Path | None:
+    try:
+        return _pm_bin_dir(args)
+    except FileNotFoundError:
+        return None
 
 
 def units(layout, args) -> WorkUnits:
-    _, paths = _inputs(layout)
-    plan = _plan(paths, args.nprocs, layout.similarity)
+    """Pairs still to compute: present pockets minus the ones the cabbage cache knows
+    cabbage-core rejects, minus finished jobs. Fails on the name guard (in --dry-run too;
+    otherwise the findings are written to failed.tsv). Without the PocketMatch binaries
+    no job can be matched, so every pair counts."""
+    _, paths, _ = _inputs(layout)
+    _guard(layout, paths, record=not getattr(args, "dry_run", False))
+    pm = _pm_or_none(args)
+    bins = _bin_hashes(pm) if pm is not None else None
+    digests = [sha256_file(p) for p in paths]
+    _, failed = _cached(layout.similarity, paths, digests, bins and bins[CABBAGE])
+    keep = [i for i in range(len(paths)) if i not in failed]
+    plan = _plan([paths[i] for i in keep], args.nprocs, layout.similarity,
+                 [digests[i] for i in keep], bins)
     return WorkUnits(plan.remaining, "pair")
 
 
 def _versions(pm: Path) -> dict:
     return {"pocketmatch_commit": os.environ.get("PM_COMMIT") or "unknown",
-            "pocketmatch_sha256": {b: sha256_file(pm / b) for b in PM_BINARIES}}
+            "pocketmatch_sha256": _bin_hashes(pm)}
 
 
 def run(layout, args, progress) -> dict:
@@ -677,22 +883,24 @@ def run(layout, args, progress) -> dict:
     d.mkdir(parents=True, exist_ok=True)
     (d / "manifest.json").unlink(missing_ok=True)   # outputs below are about to change
     (d / "failed.tsv").write_text("item\tstage\treason\n")
-    table, paths = _inputs(layout)
-    check_pocket_names(paths)   # before anything touches PocketMatch
+    table, paths, missing = _inputs(layout)
+    for item in missing:
+        append_failure(d, item, STAGE, REASON_MISSING)
+    _guard(layout, paths, record=True, fresh=False)   # before anything touches PocketMatch
     pm = _pm_bin_dir(args)
     (d / SCORE_FILE).unlink(missing_ok=True)
     (d / "Pocketsim.csv").unlink(missing_ok=True)
 
-    plan = _plan(paths, args.nprocs, d)
-    skipped = plan.total - plan.remaining
     try:
-        score = run_pocketmatch_parallel(paths, pm, d, args.nprocs, progress)
+        res = _similarity(paths, pm, d, args.nprocs, progress)
     except JobsFailed as exc:
         for item, reason in exc.failures:
             append_failure(d, item, STAGE, reason)
         raise
+    for path, reason in res.dropped.items():
+        append_failure(d, _item(path), STAGE, reason)
 
-    df = parse_scores(score, table, layout.protein_info)
+    df = parse_scores(res.score, table, layout.protein_info)
     fd, tmp = tempfile.mkstemp(dir=d, prefix=".Pocketsim.csv.", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="") as fh:
@@ -702,9 +910,14 @@ def run(layout, args, progress) -> dict:
     except BaseException:
         Path(tmp).unlink(missing_ok=True)
         raise
+    rows = len(df)
+    del df
+    shutil.rmtree(d / JOBS, ignore_errors=True)   # merged; ~100 bytes a pair
 
-    counts = {"pockets": len(paths), "pairs": plan.total, "jobs": len(plan.jobs),
-              "skipped_existing": skipped, "rows": len(df), "failed": 0}
+    counts = {"pockets": len(res.plan.paths), "pairs": res.plan.total,
+              "jobs": len(res.plan.jobs), "skipped_existing": res.skipped, "rows": rows,
+              "missing": len(missing), "cabbage_failed": len(res.dropped),
+              "failed": len(missing) + len(res.dropped)}
     # The manifest is written last: its presence marks the stage as finished.
     write_manifest(d, STAGE, args={"nprocs": args.nprocs, "drugscore_cutoff": DRUGSCORE_CUTOFF},
                    inputs=[layout.drugscore_csv, layout.protein_info], versions=_versions(pm),
