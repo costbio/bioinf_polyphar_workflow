@@ -314,6 +314,33 @@ def test_missing_protein_info_row_is_a_clear_error():
                            protein_info=_protein_info(extra_missing=("P00003",)))
 
 
+def _lowercase_chain_info(*chains):
+    """Protein_info with P00003 / 3CCC on the given real (case-sensitive) chain IDs."""
+    info = _protein_info(extra_missing=("P00003",))
+    rows = [["P00003", "2AAA_HUMAN", "3CCC", c, "False", "2.0", "X-ray", "0.9",
+             f"02_structures/P00003/3ccc_{c}.pdb"] for c in chains]
+    return pd.concat([info, pd.DataFrame(rows, columns=info.columns)], ignore_index=True)
+
+
+def test_lowercase_author_chain_is_found_and_reported_with_its_real_case():
+    """Pocketsim's Protein field is upper-cased (3CCC_B); Protein_info keeps the real
+    author chain `b`: the receptor is found and Chain says `b`."""
+    _, g = _graph()
+    ranking = sel.rank_hubs(g, "weighted")
+    t = sel.select_targets(g, ranking, {"O15350"}, "weighted",
+                           protein_info=_lowercase_chain_info("b")).set_index("Node")
+    assert t.loc[N3, "Receptor_Path"] == "03_pdbfixer/P00003/3ccc_b.pdb"
+    assert t.loc[N3, "Chain"] == "b" and t.loc[N3, "Protein"] == "3CCC_B"
+
+
+def test_chains_differing_only_by_case_are_never_merged():
+    _, g = _graph()
+    ranking = sel.rank_hubs(g, "weighted")
+    with pytest.raises(ValueError, match="ambiguous.*P00003.*3CCC"):
+        sel.select_targets(g, ranking, {"O15350"}, "weighted",
+                           protein_info=_lowercase_chain_info("b", "B"))
+
+
 # --- stage ---------------------------------------------------------------------------
 
 def _run_folder(tmp_path, info=None):

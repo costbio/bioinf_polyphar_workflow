@@ -31,8 +31,10 @@ Receptor_Path, Is_Hub), centrality.csv, unique_pairs.csv, failed.tsv, manifest.j
 
 Pocket_Path and Receptor_Path are relative to the run folder. Receptor_Path comes from
 Protein_info.csv: 03_pdbfixer/<UniProt>/<file name> for a PDB chain (looked up by UniProt
-ID, PDB, chain) and the AlphaFold row's File as listed. A target without a row there means
-the run folder is inconsistent and is an error.
+ID, PDB, chain; the chain case-insensitively, because the Pocketsim Protein field is
+upper-cased, e.g. 2MJW_B for author chain `b`; Chain then gives the real author chain) and
+the AlphaFold row's File as listed. A target without a row there means the run folder is
+inconsistent and is an error; so is one matching chains that differ only by case.
 """
 
 from __future__ import annotations
@@ -213,6 +215,10 @@ def tied_top(ranking, exclude=()) -> list[str]:
 
 
 def _receptor_index(protein_info):
+    """PDB rows keyed by (UniProt ID, PDB, chain upper-cased) -> [(real chain, File)], and
+    AlphaFold rows by UniProt ID. The Pocketsim Protein field upper-cases the chain (legacy
+    `2MJW_B`), so the lookup ignores case; a key with several real chains (`a` and `A`) is
+    ambiguous and never resolved by guessing."""
     pdb, af = {}, {}
     for acc, p, chain, is_af, file in zip(protein_info["UniProt ID"], protein_info["PDB"],
                                           protein_info["Chain ID"], protein_info["AlphaFold"],
@@ -220,13 +226,16 @@ def _receptor_index(protein_info):
         if str(is_af).strip().lower() == "true":
             af.setdefault(acc, file)
         else:
-            pdb.setdefault((acc, str(p).upper(), chain), file)
+            entries = pdb.setdefault((acc, str(p).upper(), str(chain).upper()), [])
+            if all(c != chain for c, _ in entries):
+                entries.append((str(chain), file))
     return pdb, af
 
 
-def _receptor_paths(G, nodes, protein_info) -> dict[str, str]:
+def _receptor_paths(G, nodes, protein_info) -> tuple[dict[str, str], dict[str, str]]:
+    """(Receptor_Path by node, real author chain by PDB node)."""
     pdb, af = _receptor_index(protein_info)
-    paths, missing = {}, []
+    paths, chains, missing, ambiguous = {}, {}, [], []
     for n in nodes:
         a = G.nodes[n]
         if a["structure_id"].startswith("AF-"):
@@ -236,16 +245,27 @@ def _receptor_paths(G, nodes, protein_info) -> dict[str, str]:
                 continue
             paths[n] = str(PurePosixPath(file))
         else:
-            file = pdb.get((a["uniprot"], a["structure_id"].upper(), a["chain"]))
-            if file is None:
+            entries = pdb.get((a["uniprot"], a["structure_id"].upper(), a["chain"].upper()), [])
+            if not entries:
                 missing.append(f"{a['uniprot']} PDB {a['structure_id']} chain {a['chain']}")
                 continue
+            if len(entries) > 1:
+                ambiguous.append(f"{a['uniprot']} PDB {a['structure_id']} chains "
+                                 + "/".join(c for c, _ in entries))
+                continue
+            chain, file = entries[0]
             paths[n] = f"03_pdbfixer/{a['uniprot']}/{PurePosixPath(file).name}"
+            chains[n] = chain
+    if ambiguous:
+        raise ValueError(
+            f"{len(ambiguous)} target(s) are ambiguous: Protein_info.csv has chains that "
+            f"differ only by case and Pocketsim's Protein field cannot tell them apart: "
+            + "; ".join(ambiguous[:20]))
     if missing:
         raise ValueError(
             f"{len(missing)} target(s) have no row in Protein_info.csv (the run folder is "
             f"inconsistent): " + "; ".join(missing[:20]) + ("; ..." if len(missing) > 20 else ""))
-    return paths
+    return paths, chains
 
 
 def _one_row_per_protein(G, sim: dict, hub_set: set) -> dict:
@@ -294,7 +314,8 @@ def select_targets(G, ranking, exclude, tie_break: str = "union", hub: str | Non
                 continue
             sim[nb] = max(sim.get(nb, 0.0), data["weight"])
     sim = _one_row_per_protein(G, sim, hub_set)
-    receptors = _receptor_paths(G, sim, protein_info) if protein_info is not None else {}
+    receptors, real_chains = (_receptor_paths(G, sim, protein_info)
+                              if protein_info is not None else ({}, {}))
     rows = []
     for n, s in sim.items():
         a = G.nodes[n]
@@ -302,7 +323,7 @@ def select_targets(G, ranking, exclude, tie_break: str = "union", hub: str | Non
         rows.append({
             "Node": n, "UniProt_ID": a["uniprot"], "Gene_Name": gene, "Organism": organism,
             "Structure_ID": a["structure_id"], "Similarity": s, "Protein": a["protein"],
-            "Chain": a["chain"], "Pocket": a["pocket"], "Pocket_Path": a["pocket_path"],
+            "Chain": real_chains.get(n, a["chain"]), "Pocket": a["pocket"], "Pocket_Path": a["pocket_path"],
             "Receptor_Path": receptors.get(n, ""), "Is_Hub": n in hub_set})
     df = pd.DataFrame(rows, columns=TARGET_COLUMNS)
     return df.sort_values(["Similarity", "Node"], ascending=[False, True],
