@@ -232,6 +232,7 @@ def test_run_writes_results_per_target(run_folder):
     counts = dock.run(layout, args, prog)
     assert sum(prog.calls) == 40
     assert counts["complete"] == 2 and counts["failed"] == 0 and counts["chunks"] == 6
+    assert counts["incomplete_targets"] == 0 and counts["obsoleted"] == 0
     for label in ("2mjw_A_P_1", "AF-P01350-F1_P_1"):
         df = pd.read_csv(layout.docking / f"df_results_{label}_fixed.csv", dtype={"ID": str})
         assert df.columns.tolist() == ["Pose", "SMINA_Score", "Ligand", "ID", "Pocket"]
@@ -241,9 +242,12 @@ def test_run_writes_results_per_target(run_folder):
         assert (layout.docking / label / "poses.sdf").is_file()
     assert (layout.docking / "AF-P01350-F1_P_1" / "receptor_h.pdb").is_file()
     assert not (layout.docking / "2mjw_A_P_1" / "receptor_h.pdb").exists()
-    assert {l.split()[1] for l in calls.read_text().splitlines()} == {"cpu=1"}
+    assert {tuple(l.split()[1:4:2]) for l in calls.read_text().splitlines()} == {
+        ("cpu=1", "addH=1")}
     m = json.loads((layout.docking / "manifest.json").read_text())
     assert m["seed"] == 42 and m["smina"] == "smina fake 0.0"
+    assert m["args"]["ligand_addH"] is True and m["args"]["chunk_timeout"] == 43200
+    assert m["obsoleted"] == []
     assert m["library_md5"] == dock._md5(HEAD20)
     rec = m["receptors"]["2mjw_A_P_1"]
     assert rec["receptor"] == "03_pdbfixer/P25815/2mjw_A.pdb"
@@ -273,10 +277,12 @@ def test_incomplete_target_flagged(run_folder, monkeypatch):
     layout, _ = run_folder
     monkeypatch.setenv("FAKE_SMINA_SKIP_IDS", "3,5,7")   # one chunk loses 3 ligands
     counts = dock.run(layout, _args(), Prog())
-    assert counts["complete"] == 0 and counts["incomplete"] == 2
+    assert counts["complete"] == 0 and counts["incomplete_targets"] == 2
+    assert counts["failed"] == 0   # no chunk failed; the ligands just have no poses
     failed = pd.read_csv(layout.docking / "failed.tsv", sep="\t", dtype=str)
     row = failed.set_index("item").loc["2mjw_A_P_1", "reason"]
-    assert row.endswith("3 ligand ID(s) without poses: 3,5,7")
+    assert row == ("incomplete: 3 ligand ID(s) without poses: 3,5,7; "
+                   "log: 07_docking/2mjw_A_P_1/chunks/c8_00000.log")
     assert not (layout.docking / "df_results_2mjw_A_P_1_fixed.csv").exists()
     assert not (layout.docking / "2mjw_A_P_1" / "poses.sdf").exists()
 
@@ -293,10 +299,13 @@ def test_failed_chunk_marks_target_incomplete(run_folder, monkeypatch, tmp_path)
         f.unlink()
     counts = dock.run(layout, _args(), Prog())
     failed = pd.read_csv(layout.docking / "failed.tsv", sep="\t", dtype=str).set_index("item")
-    assert "smina exited with 3: boom" in failed.loc["2mjw_A_P_1/c8_00001", "reason"]
+    assert failed.loc["2mjw_A_P_1/c8_00001", "reason"] == (
+        "smina exited with 3: boom; log: 07_docking/2mjw_A_P_1/chunks/c8_00001.log")
     assert failed.loc["2mjw_A_P_1", "reason"].endswith(
-        "8 ligand ID(s) without poses: 9,10,11,12,13,14,15,16")
-    assert counts["incomplete"] == 2 and counts["failed"] == 4
+        "8 ligand ID(s) without poses: 9,10,11,12,13,14,15,16; "
+        "log: 07_docking/2mjw_A_P_1/chunks/c8_00001.log")
+    assert "boom" in (layout.docking / "2mjw_A_P_1/chunks/c8_00001.log").read_text()
+    assert counts["incomplete_targets"] == 2 and counts["failed"] == 2   # 2 chunks
     assert not list(layout.docking.glob("df_results_*"))
 
 
@@ -322,7 +331,7 @@ def test_missing_receptor_file_is_a_failed_target(run_folder):
     failed = pd.read_csv(layout.docking / "failed.tsv", sep="\t", dtype=str).set_index("item")
     assert "missing file: 02_structures/P01350/AF-P01350-F1.pdb" in failed.loc[
         "AF-P01350-F1_P_1", "reason"]
-    assert counts["complete"] == 1 and counts["incomplete"] == 1
+    assert counts["complete"] == 1 and counts["incomplete_targets"] == 1
 
 
 def test_cli_dry_run_and_library_outside_inputs(run_folder, tmp_path, capsys):
@@ -340,3 +349,75 @@ def test_cli_dry_run_and_library_outside_inputs(run_folder, tmp_path, capsys):
     assert (layout.inputs / "elsewhere.sdf").read_bytes() == HEAD20.read_bytes()
     m = json.loads((layout.docking / "manifest.json").read_text())
     assert m["args"]["library"] == "inputs/elsewhere.sdf" and m["args"]["chunk_size"] == 5
+
+
+def test_chunk_timeout_kills_smina_and_fails_the_chunk(run_folder, monkeypatch):
+    import time
+
+    layout, _ = run_folder
+    monkeypatch.setenv("FAKE_SMINA_SLEEP_ON", "c8_00001")   # sleeps 60 s
+    t0 = time.monotonic()
+    counts = dock.run(layout, _args(chunk_timeout=1), Prog())
+    assert time.monotonic() - t0 < 40
+    failed = pd.read_csv(layout.docking / "failed.tsv", sep="\t", dtype=str).set_index("item")
+    for label in ("2mjw_A_P_1", "AF-P01350-F1_P_1"):
+        assert failed.loc[f"{label}/c8_00001", "reason"] == (
+            f"timeout after 1 s; log: 07_docking/{label}/chunks/c8_00001.log")
+        log = (layout.docking / label / "chunks" / "c8_00001.log").read_text()
+        assert "Using random seed" in log and "timeout after 1 s" in log
+        assert not (layout.docking / label / "chunks" / "c8_00001.done").exists()
+        assert (layout.docking / label / "chunks" / "c8_00002.done").exists()   # others ran
+    assert counts["failed"] == 2 and counts["incomplete_targets"] == 2
+    assert not list(layout.docking.glob("df_results_*"))
+    assert subprocess.run(["pgrep", "-f", str(FAKE_SMINA)], capture_output=True).returncode == 1
+
+
+def test_orphan_target_outputs_are_obsoleted_not_counted(run_folder):
+    layout, _ = run_folder
+    dock.run(layout, _args(), Prog())
+    ft = pd.read_csv(layout.final_targets_csv)
+    ft[ft.Protein == "2mjw_A"].to_csv(layout.final_targets_csv, index=False)   # select changed
+    assert dock.units(layout, _args()).count == 0   # 2mjw chunks are all still done
+    counts = dock.run(layout, _args(), Prog())
+    assert counts["obsoleted"] == 2 and counts["complete"] == 1
+    d = layout.docking
+    assert not (d / "df_results_AF-P01350-F1_P_1_fixed.csv").exists()
+    assert not (d / "AF-P01350-F1_P_1").exists()
+    m = json.loads((d / "manifest.json").read_text())
+    assert sorted(m["outputs"]) == ["2mjw_A_P_1/poses.sdf", "df_results_2mjw_A_P_1_fixed.csv"]
+    moved = {o["from"]: o["to"] for o in m["obsoleted"]}
+    assert set(moved) == {"AF-P01350-F1_P_1", "df_results_AF-P01350-F1_P_1_fixed.csv"}
+    for to in moved.values():
+        assert to.startswith("obsolete/") and (d / to).exists()   # moved, not deleted
+    # finished: an orphan dropped in by hand later is not silently accepted
+    assert dock.units(layout, _args()).count == 0
+    (d / "df_results_OLD_P_1_fixed.csv").write_text("x\n")
+    assert dock.run(layout, _args(), Prog())["obsoleted"] == 1
+    assert not (d / "df_results_OLD_P_1_fixed.csv").exists()
+
+
+def _pose(lid, score=-5.0):
+    return (f"EDRUG3D_{lid}\n x\n\n  0  0  0  0  0  0  0  0  0  0999 V2000\nM  END\n"
+            f"> <minimizedAffinity>\n{score}\n\n$$$$\n")
+
+
+def test_parse_poses_requires_contiguous_runs_of_at_most_num_modes(tmp_path):
+    lib = dock.read_library(HEAD20)
+    f = tmp_path / "p.sdf"
+    f.write_text(_pose(1) + _pose(1) + _pose(2))
+    assert dock.parse_poses(f, lib, "L").Pose.tolist() == [1, 2, 1]
+    f.write_text(_pose(1) + _pose(2) + _pose(1))
+    with pytest.raises(ValueError, match="ligand ID 1 are not contiguous"):
+        dock.parse_poses(f, lib, "L")
+    f.write_text(_pose(3) * 13)
+    with pytest.raises(ValueError, match="ligand ID 3 has more than 12 poses"):
+        dock.parse_poses(f, lib, "L")
+    f.write_text(_pose(3) * 12)
+    assert len(dock.parse_poses(f, lib, "L")) == 12
+
+
+@pytest.mark.docking
+def test_real_smina_version_is_available(monkeypatch):
+    monkeypatch.delenv("SMINA_BIN", raising=False)
+    v = dock.smina_version()
+    assert v != "unavailable" and v.startswith("smina")

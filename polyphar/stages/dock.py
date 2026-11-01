@@ -18,7 +18,8 @@ each receptor PDBQT's sha256 is recorded in the manifest.
 
 Kept legacy parameters (smina_screen_P_2_2023_08_15.py): box = the pocket's atom extent,
 unpadded (centre (max+min)/2, size max-min); `--exhaustiveness 12 --num_modes 12`; the
-ligand records as supplied. New: a fixed recorded `--seed` (default 42), and ligand
+ligand records as supplied, with smina's ligand hydrogen addition pinned explicitly to its
+default `--addH 1` (recorded in the manifest and the job key). New: a fixed recorded `--seed` (default 42), and ligand
 identity from the library `ID` field: every record's title line is set to EDRUG3D_<ID>
 (the library's titles are blank or placeholders, and 35 different drugs are named
 "Molecule-1"), and poses are mapped back to the library by it.
@@ -28,14 +29,21 @@ Work units are (target x chunk of --chunk-size ligands, in library order), docke
 ligand's result depends neither on --cpu nor on its chunk or position in it (pinned by
 test_cpu_and_chunk_invariance), so the output is the same for any chunking and nprocs.
 A chunk is done when 07_docking/<label>/chunks/<chunk>.done holds its job key (receptor
-and pocket sha256, chunk sha256, seed, exhaustiveness, num_modes, smina version, receptor
-preparation); outputs are atomic, so a killed run redoes only unfinished chunks.
+and pocket sha256, chunk sha256, seed, exhaustiveness, num_modes, ligand addH, smina
+version, receptor preparation); outputs are atomic, so a killed run redoes only unfinished
+chunks. A smina call running longer than --chunk-timeout (default 12 h) is killed and the
+chunk failed; its log (07_docking/<label>/chunks/<chunk>.log, also kept on failure) is
+named in failed.tsv. counts["failed"] is the number of failed chunks; incomplete targets
+are counted in counts["incomplete_targets"].
 
 Outputs per target, label = f"{Protein}_{Pocket}": 07_docking/<label>/poses.sdf and
 07_docking/df_results_<label>_fixed.csv (Pose, SMINA_Score, Ligand, ID, Pocket; Ligand is
 the library `name`, ID the library ID, SMINA_Score smina's minimizedAffinity). A target
 with any ligand ID missing from its poses (a failed chunk, or a ligand smina skipped) is
 incomplete: failed.tsv lists the missing IDs and NO df_results/poses.sdf is written for it.
+Outputs of labels no longer in final_targets.csv (df_results_<label>_fixed.csv, <label>/)
+are moved, never deleted, to 07_docking/obsolete/<timestamp>/ and listed in the manifest
+(`obsoleted`); the manifest's `outputs` lists the current targets' files only.
 manifest.json is written last; a rerun on the same inputs changes nothing.
 """
 
@@ -56,6 +64,8 @@ DEFAULT_CHUNK = 50
 DEFAULT_TPJ = 1
 EXHAUSTIVENESS = 12
 NUM_MODES = 12
+LIGAND_ADDH = True   # smina --addH: add ligand hydrogens (smina's default, pinned explicitly)
+DEFAULT_CHUNK_TIMEOUT = 43200   # seconds per smina call (12 h)
 AF_H_SEED = H_SEED   # seeds OpenMM's random hydrogen placement (deterministic output)
 AF_PH = 7.0   # AlphaFold receptors: pdbfixer addMissingHydrogens, as the fix stage
 TITLE_PREFIX = "EDRUG3D_"
@@ -236,9 +246,11 @@ def smina_version() -> str:
 
 
 def run_smina(receptor, ligands, center, size, out_sdf, log, seed: int, cpu: int,
-              exhaustiveness: int = EXHAUSTIVENESS, num_modes: int = NUM_MODES) -> None:
+              exhaustiveness: int = EXHAUSTIVENESS, num_modes: int = NUM_MODES,
+              add_h: bool = LIGAND_ADDH, timeout: float | None = None) -> None:
     """Dock `ligands` into the box; out_sdf and log are written atomically. Raises
-    SminaError on a non-zero exit."""
+    SminaError on a non-zero exit or after `timeout` seconds (smina is killed). On
+    failure no out_sdf is written and the log holds smina's log so far plus its stderr."""
     out_sdf, log = Path(out_sdf), Path(log)
     tok = f"{os.getpid()}.{os.urandom(4).hex()}"
     # smina picks the output format from the extension
@@ -250,38 +262,56 @@ def run_smina(receptor, ligands, center, size, out_sdf, log, seed: int, cpu: int
     for axis, s in zip("xyz", size):
         cmd += [f"--size_{axis}", repr(float(s))]
     cmd += ["--out", str(tmp_out), "--log", str(tmp_log), "--num_modes", str(num_modes),
-            "--exhaustiveness", str(exhaustiveness), "--cpu", str(cpu), "--seed", str(seed)]
+            "--exhaustiveness", str(exhaustiveness), "--cpu", str(cpu), "--seed", str(seed),
+            "--addH", "1" if add_h else "0"]
+    stderr = ""
     try:
-        p = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-                           text=True, errors="replace")
+        try:
+            p = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                               text=True, errors="replace", timeout=timeout)
+        except subprocess.TimeoutExpired as exc:   # subprocess.run killed smina
+            err = exc.stderr or b""
+            stderr = err.decode(errors="replace") if isinstance(err, bytes) else err
+            raise SminaError(f"timeout after {timeout:g} s") from None
+        stderr = p.stderr or ""
         if p.returncode != 0:
-            tail = " | ".join((p.stderr or "").strip().splitlines()[-5:])
+            tail = " | ".join(stderr.strip().splitlines()[-5:])
             raise SminaError(f"smina exited with {p.returncode}: {tail}")
         if not tmp_out.exists():
             raise SminaError("smina wrote no output file")
         if tmp_log.exists():
             os.replace(tmp_log, log)
         os.replace(tmp_out, out_sdf)
+    except SminaError as exc:
+        so_far = tmp_log.read_text(errors="replace") if tmp_log.exists() else ""
+        _atomic_text(log, f"{so_far}\n--- polyphar: {exc} ---\n--- smina stderr ---\n{stderr}")
+        raise
     finally:
         tmp_out.unlink(missing_ok=True)
         tmp_log.unlink(missing_ok=True)
 
 
-def parse_poses(out_sdf, library, label: str):
+def parse_poses(out_sdf, library, label: str, max_poses: int = NUM_MODES):
     """DataFrame[Pose, SMINA_Score, Ligand, ID, Pocket] from a smina output SDF whose
     titles are EDRUG3D_<ID>: Pose counts 1.. within each ligand's consecutive records,
-    SMINA_Score is minimizedAffinity, Ligand the library name."""
+    SMINA_Score is minimizedAffinity, Ligand the library name. Each ligand's poses must
+    be one contiguous run of at most max_poses records; otherwise ValueError."""
     import pandas as pd
 
     names = dict(zip(library["ID"].astype(str), library["name"]))
-    rows, prev, pose = [], None, 0
+    rows, prev, pose, seen = [], None, 0, set()
     for rec in _records(_read_text(out_sdf)):
         title = rec.lines[0].strip()
         if not title.startswith(TITLE_PREFIX) or title[len(TITLE_PREFIX):] not in names:
             raise ValueError(f"{out_sdf}: pose title {title!r} is not a library ID")
         lid = title[len(TITLE_PREFIX):]
+        if lid != prev and lid in seen:
+            raise ValueError(f"{out_sdf}: the poses of ligand ID {lid} are not contiguous")
+        seen.add(lid)
         pose = pose + 1 if lid == prev else 1
         prev = lid
+        if pose > max_poses:
+            raise ValueError(f"{out_sdf}: ligand ID {lid} has more than {max_poses} poses")
         if "minimizedAffinity" not in rec.fields:
             raise ValueError(f"{out_sdf}: pose {pose} of {title} has no minimizedAffinity")
         rows.append([pose, float(rec.fields["minimizedAffinity"]), names[lid], lid, label])
@@ -315,10 +345,14 @@ def add_arguments(parser) -> None:
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED,
                         help=f"smina --seed, recorded (default {DEFAULT_SEED})")
     parser.add_argument("--chunk-size", type=_positive_int, default=DEFAULT_CHUNK,
-                        help=f"ligands per job (default {DEFAULT_CHUNK})")
+                        help=f"ligands per job (default {DEFAULT_CHUNK}); results do not "
+                             f"depend on it, but changing it re-docks everything")
     parser.add_argument("--threads-per-job", type=_positive_int, default=DEFAULT_TPJ,
                         help=f"smina --cpu per job; nprocs // this jobs run at once "
                              f"(default {DEFAULT_TPJ})")
+    parser.add_argument("--chunk-timeout", type=_positive_int, default=DEFAULT_CHUNK_TIMEOUT,
+                        help=f"seconds before one chunk's smina call is killed and the chunk "
+                             f"failed (default {DEFAULT_CHUNK_TIMEOUT})")
 
 
 @dataclass
@@ -456,7 +490,8 @@ def _job_key(src_key: str, pocket_sha: str, chunk: Chunk, opts: dict) -> str:
 
 def _options(args, smina: str) -> dict:
     return {"seed": int(getattr(args, "seed", DEFAULT_SEED)),
-            "exhaustiveness": EXHAUSTIVENESS, "num_modes": NUM_MODES, "smina": smina}
+            "exhaustiveness": EXHAUSTIVENESS, "num_modes": NUM_MODES,
+            "ligand_addH": LIGAND_ADDH, "smina": smina}
 
 
 def _chunk_paths(layout, t: Target, chunk: Chunk) -> tuple[Path, Path, Path]:
@@ -529,8 +564,9 @@ def _prepare_receptor(layout, t: Target) -> Path:
 
 # --- workers (spawn processes) -------------------------------------------------------
 
-def _dock_chunk(receptor, ligands, center, size, sdf, log, done, seed, cpu, key) -> int:
-    run_smina(receptor, ligands, center, size, sdf, log, seed=seed, cpu=cpu)
+def _dock_chunk(receptor, ligands, center, size, sdf, log, done, seed, cpu, key,
+                timeout) -> int:
+    run_smina(receptor, ligands, center, size, sdf, log, seed=seed, cpu=cpu, timeout=timeout)
     _atomic_text(Path(done), key + "\n")
     return 0
 
@@ -590,7 +626,7 @@ def _merge(layout, t: Target, chunks: list[Chunk], library, failed_chunks: set) 
 def _stage_fingerprint(layout, plan: _Plan, lib_md5: str, opts: dict) -> str | None:
     """What the finished outputs depend on (not nprocs, chunk size or threads): the
     final_targets.csv, each target's receptor, pocket and receptor PDBQT sha256, the
-    library md5, seed, exhaustiveness, num_modes and smina version. None when a receptor
+    library md5, seed, exhaustiveness, num_modes, ligand addH and smina version. None when a receptor
     PDBQT is not prepared yet."""
     from polyphar.common import sha256_file
 
@@ -608,10 +644,55 @@ def _stage_fingerprint(layout, plan: _Plan, lib_md5: str, opts: dict) -> str | N
                                  "targets": rows, "library_md5": lib_md5, **opts}))
 
 
-def _outputs(layout) -> dict:
+def _outputs(layout, plan: _Plan) -> dict:
+    """Sizes of the current targets' result files (never of an orphan label's)."""
     d = layout.docking
-    files = sorted(d.glob("df_results_*_fixed.csv")) + sorted(d.glob("*/poses.sdf"))
-    return {p.relative_to(d).as_posix(): p.stat().st_size for p in files}
+    files = [p for t in plan.targets
+             for p in (_df_path(layout, t), _target_dir(layout, t) / "poses.sdf")
+             if p.is_file()]
+    return {p.relative_to(d).as_posix(): p.stat().st_size for p in sorted(files)}
+
+
+RESERVED_DIRS = ("ligands", "obsolete")
+_DF_RE = re.compile(r"^df_results_(.+)_fixed\.csv$")
+
+
+def _orphans(layout, plan: _Plan) -> list[Path]:
+    """df_results_<label>_fixed.csv files and <label>/ dirs in 07_docking whose label is
+    not a current target."""
+    d = layout.docking
+    if not d.is_dir():
+        return []
+    labels = {t.label for t in plan.targets}
+    out = []
+    for p in sorted(d.iterdir()):
+        m = _DF_RE.match(p.name)
+        if p.is_file() and m and m.group(1) not in labels:
+            out.append(p)
+        elif p.is_dir() and p.name not in labels and p.name not in RESERVED_DIRS:
+            out.append(p)
+    return out
+
+
+def _obsolete(layout, orphans: list[Path]) -> list[dict]:
+    """Move orphans (never delete) to 07_docking/obsolete/<timestamp>/."""
+    import time
+
+    if not orphans:
+        return []
+    root = layout.docking / "obsolete"
+    stamp = time.strftime("%Y%m%dT%H%M%S")
+    dest, k = root / stamp, 1
+    while dest.exists():
+        k += 1
+        dest = root / f"{stamp}_{k}"
+    dest.mkdir(parents=True)
+    moved = []
+    for p in orphans:
+        os.replace(p, dest / p.name)
+        moved.append({"from": p.relative_to(layout.docking).as_posix(),
+                      "to": (dest / p.name).relative_to(layout.docking).as_posix()})
+    return moved
 
 
 def _finished(layout, plan: _Plan, lib_md5: str, opts: dict) -> dict | None:
@@ -622,7 +703,8 @@ def _finished(layout, plan: _Plan, lib_md5: str, opts: dict) -> dict | None:
     except (OSError, ValueError):
         return None
     fp = _stage_fingerprint(layout, plan, lib_md5, opts)
-    if fp is None or manifest.get("fingerprint") != fp or manifest.get("outputs") != _outputs(layout):
+    if (fp is None or manifest.get("fingerprint") != fp
+            or manifest.get("outputs") != _outputs(layout, plan) or _orphans(layout, plan)):
         return None
     if plan.todo(layout):   # a chunk lost its .done marker: redo it
         return None
@@ -661,6 +743,7 @@ def run(layout, args, progress) -> dict:
     d.mkdir(parents=True, exist_ok=True)
     (d / "manifest.json").unlink(missing_ok=True)   # outputs below are about to change
     (d / "failed.tsv").write_text("item\tstage\treason\n")
+    obsoleted = _obsolete(layout, _orphans(layout, plan))   # targets dropped by `select`
     library = read_library(lib)
     rows: list[tuple[str, str]] = list(plan.missing)
 
@@ -681,6 +764,7 @@ def run(layout, args, progress) -> dict:
             _atomic_text(f, c.text)
 
     tpj = int(getattr(args, "threads_per_job", DEFAULT_TPJ))
+    timeout = int(getattr(args, "chunk_timeout", DEFAULT_CHUNK_TIMEOUT))
     slots = max(1, args.nprocs // tpj)
     todo = [(t, c) for t, c in plan.todo(layout) if t.label in prepared]
     n_of = {c.name: len(c.ids) for c in plan.chunks}
@@ -692,14 +776,23 @@ def run(layout, args, progress) -> dict:
         tasks.append(((t.label, c.name), _chunk_worker,
                       (str(pdbqt), str(ligdir / f"{c.name}.sdf"), center, size, str(sdf),
                        str(log), str(marker), opts["seed"], tpj,
-                       plan.keys[(t.label, c.name)])))
+                       plan.keys[(t.label, c.name)], timeout)))
+    chunk_of = {i: c for c in plan.chunks for i in c.ids}
+    by_label = {t.label: t for t in plan.targets}
+
+    def log_rel(label: str, chunk: Chunk) -> str:
+        return _rel(_chunk_paths(layout, by_label[label], chunk)[1], layout.run_dir)
+
     failed_chunks: dict[str, set] = {}
     try:
         outcome = _run_pool(tasks, slots,
                             on_result=lambda item, _r: progress.advance(n_of[item[1]]))
+        chunk_by_name = {c.name: c for c in plan.chunks}
         for (label, chunk), reason in outcome.failures:
             failed_chunks.setdefault(label, set()).add(chunk)
-            rows.append((f"{label}/{chunk}", reason))
+            reason = reason.removeprefix("SminaError: ")
+            rows.append((f"{label}/{chunk}",
+                         f"{reason}; log: {log_rel(label, chunk_by_name[chunk])}"))
             progress.advance(n_of[chunk])
 
         complete = incomplete = 0
@@ -711,8 +804,9 @@ def run(layout, args, progress) -> dict:
             missing = _merge(layout, t, plan.chunks, library, failed_chunks.get(t.label, set()))
             if missing:
                 incomplete += 1
+                logs = sorted({log_rel(t.label, chunk_of[i]) for i in missing})
                 rows.append((t.label, f"incomplete: {len(missing)} ligand ID(s) without "
-                                      f"poses: {','.join(missing)}"))
+                                      f"poses: {','.join(missing)}; log: {', '.join(logs)}"))
             else:
                 complete += 1
     finally:
@@ -720,11 +814,13 @@ def run(layout, args, progress) -> dict:
             append_failure(d, item, STAGE, reason)
 
     incomplete += len(plan.missing)
-    counts = {"targets": len(plan.targets), "complete": complete, "incomplete": incomplete,
+    n_failed_chunks = sum(map(len, failed_chunks.values()))
+    counts = {"targets": len(plan.targets), "complete": complete,
+              "incomplete_targets": incomplete,
               "ligands": len(library), "chunks": len(plan.chunks) * len(plan.usable),
-              "chunks_docked": len(tasks) - sum(map(len, failed_chunks.values())),
+              "chunks_docked": len(tasks) - n_failed_chunks,
               "skipped_existing": len(plan.chunks) * len(prepared) - len(tasks),
-              "failed": len(rows)}
+              "obsoleted": len(obsoleted), "failed": n_failed_chunks}
     receptors = {t.label: {"receptor": t.receptor_rel, "pocket": t.pocket_rel,
                            "preparation": t.prep,
                            "pdbqt_sha256": sha256_file(prepared[t.label][0])}
@@ -734,12 +830,13 @@ def run(layout, args, progress) -> dict:
                    args={"nprocs": args.nprocs, "seed": opts["seed"],
                          "chunk_size": int(getattr(args, "chunk_size", DEFAULT_CHUNK)),
                          "threads_per_job": tpj, "exhaustiveness": EXHAUSTIVENESS,
-                         "num_modes": NUM_MODES, "library": _rel(lib, layout.run_dir)},
+                         "num_modes": NUM_MODES, "ligand_addH": LIGAND_ADDH,
+                         "chunk_timeout": timeout, "library": _rel(lib, layout.run_dir)},
                    inputs=[layout.final_targets_csv, lib], versions=_versions(smina),
                    counts=counts, timing={},
-                   extra={"fingerprint": fingerprint, "outputs": _outputs(layout),
+                   extra={"fingerprint": fingerprint, "outputs": _outputs(layout, plan),
                           "library_md5": lib_md5, "seed": opts["seed"], "smina": smina,
-                          "receptors": receptors})
+                          "receptors": receptors, "obsoleted": obsoleted})
     return counts
 
 

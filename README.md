@@ -36,3 +36,7 @@ The image contains no DoGSiteScorer and no credentials; Pushover settings are re
   - The legacy `CorrectForPH(7.4)` + `addh` step is gone. It re-placed hydrogens at random on every conversion, and that alone moved scores by up to 0.9 kcal/mol.
 - **`--threads-per-job` defaults to 1.** A ligand's result does not depend on smina's `--cpu`, on its chunk, or on its position in the chunk (`test_cpu_and_chunk_invariance`). Single-threaded jobs on `nprocs` processes are therefore safe and use the cores best.
 - **Incomplete targets.** If any ligand ID of a target has no poses, the target is incomplete. `07_docking/failed.tsv` lists the missing IDs, and no `df_results_<label>_fixed.csv` is written for that target.
+- **Ligand hydrogens.** smina's ligand hydrogen addition is pinned explicitly with `--addH 1`, smina's default. It is recorded in the manifest and in the job key.
+- **`--chunk-size`.** Results do not depend on the chunk size, but changing it re-docks everything.
+- **`--chunk-timeout`.** The default is 43200 s. A smina call that runs longer is killed, and its chunk is failed with `timeout after N s` plus the path to its log.
+- **Dropped targets.** When `select` drops a target, its old `df_results_<label>_fixed.csv` and `<label>/` folder are moved, not deleted, to `07_docking/obsolete/<timestamp>/`. They are listed under `obsoleted` in the manifest.
