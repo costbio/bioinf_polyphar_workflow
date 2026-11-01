@@ -18,7 +18,9 @@ Phase 1, cabbage: cabbage-core's output depends only on the pocket file (content
 so it runs once per pocket, in parallel, into the persistent cache 05_similarity/cabbage/
 <sha256>_<name>.cabbage (atomic writes; the cache is cleared when the cabbage-core binary
 changes). A pocket cabbage-core rejects is recorded in failed.tsv with the tool's stderr
-tail (and cached as <key>.failed, so a resume does not rerun it) and dropped.
+tail (and cached as <key>.failed, so a resume does not rerun it) and dropped. A kill from
+outside (SIGKILL/OOM, SIGTERM, SIGINT, SIGHUP, SIGQUIT, or exit 128+those) or a failure
+while the worker is being stopped is recorded for this run only and retried next run.
 
 Phase 2, PocketMatch: the surviving list is cut into k contiguous blocks B_0..B_{k-1}, k
 the smallest with k(k-1)/2 >= nprocs. Job (i, j), i < j, concatenates the records of
@@ -32,7 +34,10 @@ merged PocketMatch_score.txt is byte-identical for every nprocs. jobs/ is delete
 PocketMatch_score.txt and Pocketsim.csv are written.
 
 Outputs: 05_similarity/PocketMatch_score.txt, Pocketsim.csv (legacy columns and filters;
-Pocket_Path relative to the run folder), failed.tsv, manifest.json (written last).
+Pocket_Path relative to the run folder), failed.tsv, manifest.json (written last). The
+manifest records a stage fingerprint (surviving pockets and their sha256, PocketMatch
+binaries, cutoff, DrugScore.csv, Protein_info.csv; not nprocs) and the output sizes; a
+rerun on the same inputs reports 0 units and changes nothing.
 """
 
 from __future__ import annotations
@@ -77,7 +82,24 @@ def add_arguments(parser) -> None:
 
 class PocketMatchError(RuntimeError):
     """A PocketMatch step failed or wrote unexpected output (a plain message, so it
-    always pickles across the process boundary)."""
+    always pickles across the process boundary; `returncode` does not cross it)."""
+
+    def __init__(self, message, returncode=None):
+        super().__init__(message)
+        self.returncode = returncode
+
+
+# Signals that come from outside (OOM killer, docker stop, Ctrl-C), not from the tool:
+# such a failure says nothing about the pocket and is never cached. A tool's own crash
+# (SIGABRT / SIGSEGV, e.g. cabbage-core on a one-atom pocket) is deterministic and is.
+EXTERNAL_SIGNALS = frozenset({signal.SIGHUP, signal.SIGINT, signal.SIGQUIT,
+                              signal.SIGKILL, signal.SIGTERM})
+
+
+def _external_kill(returncode) -> bool:
+    if returncode is None:
+        return False
+    return (-returncode if returncode < 0 else returncode - 128) in EXTERNAL_SIGNALS
 
 
 class JobsFailed(RuntimeError):
@@ -189,10 +211,18 @@ def _pm_bin_dir(args) -> Path:
 
 
 def _check(proc, what: str) -> None:
-    if proc.returncode != 0:
-        tail = (proc.stderr or b"")[-500:].decode(errors="replace").strip()
-        raise PocketMatchError(f"{what} failed (exit {proc.returncode})"
-                               + (f": {tail}" if tail else ""))
+    rc = proc.returncode
+    if rc == 0:
+        return
+    tail = (proc.stderr or b"")[-500:].decode(errors="replace").strip()
+    if _external_kill(rc):
+        sig = signal.Signals(-rc if rc < 0 else rc - 128)
+        status = f"killed by signal {sig.value} ({sig.name}, exit {rc}); not cached, retried next run"
+    elif rc < 0:
+        status = f"crashed with signal {-rc} ({signal.Signals(-rc).name})"
+    else:
+        status = f"failed (exit {rc})"
+    raise PocketMatchError(f"{what} {status}" + (f": {tail}" if tail else ""), rc)
 
 
 def cabbage_record(pocket, pm_bin_dir, out) -> None:
@@ -434,13 +464,17 @@ def _cabbage(pocket: Path, pm_bin_dir, record: Path, failed: Path) -> str | None
             cabbage_record(pocket, pm_bin_dir, tmp)
         except PocketMatchError as exc:
             reason = str(exc)
+            # only the tool's own verdict on this pocket is cached: not a kill from
+            # outside, and nothing while this worker is being stopped
+            cache = not (_STOP or _external_kill(exc.returncode))
         else:
             os.chmod(tmp, 0o644)
             os.replace(tmp, record)
             return None
     finally:
         Path(tmp).unlink(missing_ok=True)
-    _atomic_write_lines(failed, [reason + "\n"], encoding="utf-8")
+    if cache:
+        _atomic_write_lines(failed, [reason + "\n"], encoding="utf-8")
     return reason
 
 
@@ -706,13 +740,14 @@ class _Result:
     plan: _Plan
     skipped: int                 # pairs of jobs already done before this run
     dropped: dict[Path, str]     # pockets dropped in phase 1 -> reason
+    digests: list[str]           # sha256 of plan.paths
 
 
-def _similarity(pockets, pm_bin_dir, work_dir, nprocs, progress=None) -> _Result:
+def _similarity(pockets, pm_bin_dir, work_dir, nprocs, progress=None, digests=None) -> _Result:
     work, pm = Path(work_dir), Path(pm_bin_dir)
     paths = [Path(p) for p in pockets]
     bins = _bin_hashes(pm)
-    digests = [sha256_file(p) for p in paths]
+    digests = digests if digests is not None else [sha256_file(p) for p in paths]
     records, failed = _cabbage_phase(paths, digests, pm, bins, work, nprocs)
     keep = [i for i in range(len(paths)) if i not in failed]
     plan = _plan([paths[i] for i in keep], nprocs, work, [digests[i] for i in keep], bins)
@@ -729,7 +764,7 @@ def _similarity(pockets, pm_bin_dir, work_dir, nprocs, progress=None) -> _Result
     else:
         _atomic_write_lines(out, [])
     return _Result(out, plan, plan.total - plan.remaining,
-                   {paths[i]: failed[i] for i in sorted(failed)})
+                   {paths[i]: failed[i] for i in sorted(failed)}, [digests[i] for i in keep])
 
 
 def run_pocketmatch_parallel(pockets, pm_bin_dir, work_dir, nprocs, progress=None) -> Path:
@@ -856,6 +891,46 @@ def _pm_or_none(args) -> Path | None:
         return None
 
 
+OUTPUTS = (SCORE_FILE, "Pocketsim.csv")
+
+
+def _stage_fingerprint(layout, survivors, digests, bins) -> str:
+    """What the finished outputs depend on, independent of nprocs: the ordered surviving
+    pockets (item, sha256), the PocketMatch binaries, the drugScore cutoff, DrugScore.csv
+    and Protein_info.csv."""
+    payload = {"pockets": [[_item(p), dg] for p, dg in zip(survivors, digests)],
+               "pocketmatch_sha256": bins, "drugscore_cutoff": DRUGSCORE_CUTOFF,
+               "drugscore_sha256": sha256_file(layout.drugscore_csv),
+               "protein_info_sha256": sha256_file(layout.protein_info)}
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+
+
+def _finished(layout, paths, digests, pm) -> dict | None:
+    """The recorded counts when the stage already finished on exactly these inputs:
+    manifest and both outputs present (sizes as written) and the stage fingerprint equal
+    to the current one. Every pocket must have a cached cabbage verdict (one dropped for
+    a worker death or an outside kill has none, so the stage is redone and it is retried)."""
+    d = layout.similarity
+    if pm is None:
+        return None
+    try:
+        manifest = json.loads((d / "manifest.json").read_text())
+        sizes = {name: (d / name).stat().st_size for name in OUTPUTS}
+    except (OSError, ValueError):
+        return None
+    if manifest.get("outputs") != sizes or "fingerprint" not in manifest:
+        return None
+    bins = _bin_hashes(pm)
+    records, failed = _cached(d, paths, digests, bins[CABBAGE])
+    if len(records) + len(failed) != len(paths):
+        return None
+    keep = [i for i in range(len(paths)) if i in records]
+    fp = _stage_fingerprint(layout, [paths[i] for i in keep], [digests[i] for i in keep], bins)
+    if manifest["fingerprint"] != fp:
+        return None
+    return dict(manifest["counts"])
+
+
 def units(layout, args) -> WorkUnits:
     """Pairs still to compute: present pockets minus the ones the cabbage cache knows
     cabbage-core rejects, minus finished jobs. Fails on the name guard (in --dry-run too;
@@ -866,6 +941,8 @@ def units(layout, args) -> WorkUnits:
     pm = _pm_or_none(args)
     bins = _bin_hashes(pm) if pm is not None else None
     digests = [sha256_file(p) for p in paths]
+    if _finished(layout, paths, digests, pm) is not None:
+        return WorkUnits(0, "pair")   # finished on these inputs: run() changes nothing
     _, failed = _cached(layout.similarity, paths, digests, bins and bins[CABBAGE])
     keep = [i for i in range(len(paths)) if i not in failed]
     plan = _plan([paths[i] for i in keep], args.nprocs, layout.similarity,
@@ -880,10 +957,16 @@ def _versions(pm: Path) -> dict:
 
 def run(layout, args, progress) -> dict:
     d = layout.similarity
+    table, paths, missing = _inputs(layout)
+    digests = None
+    if not _name_problems(paths)[1]:
+        digests = [sha256_file(p) for p in paths]
+        done = _finished(layout, paths, digests, _pm_or_none(args))
+        if done is not None:   # finished on exactly these inputs: touch nothing
+            return done
     d.mkdir(parents=True, exist_ok=True)
     (d / "manifest.json").unlink(missing_ok=True)   # outputs below are about to change
     (d / "failed.tsv").write_text("item\tstage\treason\n")
-    table, paths, missing = _inputs(layout)
     for item in missing:
         append_failure(d, item, STAGE, REASON_MISSING)
     _guard(layout, paths, record=True, fresh=False)   # before anything touches PocketMatch
@@ -892,7 +975,7 @@ def run(layout, args, progress) -> dict:
     (d / "Pocketsim.csv").unlink(missing_ok=True)
 
     try:
-        res = _similarity(paths, pm, d, args.nprocs, progress)
+        res = _similarity(paths, pm, d, args.nprocs, progress, digests)
     except JobsFailed as exc:
         for item, reason in exc.failures:
             append_failure(d, item, STAGE, reason)
@@ -919,7 +1002,12 @@ def run(layout, args, progress) -> dict:
               "missing": len(missing), "cabbage_failed": len(res.dropped),
               "failed": len(missing) + len(res.dropped)}
     # The manifest is written last: its presence marks the stage as finished.
+    versions = _versions(pm)
+    fingerprint = _stage_fingerprint(layout, res.plan.paths, res.digests,
+                                     versions["pocketmatch_sha256"])
     write_manifest(d, STAGE, args={"nprocs": args.nprocs, "drugscore_cutoff": DRUGSCORE_CUTOFF},
-                   inputs=[layout.drugscore_csv, layout.protein_info], versions=_versions(pm),
-                   counts=counts, timing={})
+                   inputs=[layout.drugscore_csv, layout.protein_info], versions=versions,
+                   counts=counts, timing={},
+                   extra={"fingerprint": fingerprint,
+                          "outputs": {name: (d / name).stat().st_size for name in OUTPUTS}})
     return counts

@@ -153,9 +153,10 @@ def _git_commit() -> str:
 
 
 def write_manifest(stage_dir, stage, args: dict, inputs: list, versions: dict,
-                   counts: dict, timing: dict) -> Path:
+                   counts: dict, timing: dict, extra: dict | None = None) -> Path:
     """Write <stage_dir>/manifest.json recording inputs (with sha256), tool
-    versions, counts, timing (estimated_s / actual_s) and the code's git commit."""
+    versions, counts, timing (estimated_s / actual_s) and the code's git commit.
+    `extra` adds stage-specific top-level keys (it cannot replace the standard ones)."""
     stage_dir = Path(stage_dir)
     stage_dir.mkdir(parents=True, exist_ok=True)
     manifest = {
@@ -169,6 +170,10 @@ def write_manifest(stage_dir, stage, args: dict, inputs: list, versions: dict,
         "counts": counts,
         "timing": timing,
     }
+    for key, value in (extra or {}).items():
+        if key in manifest:
+            raise ValueError(f"manifest key {key!r} is reserved")
+        manifest[key] = value
     path = stage_dir / "manifest.json"
     tmp = path.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(manifest, indent=2, default=str) + "\n")

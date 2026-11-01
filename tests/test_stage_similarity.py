@@ -256,6 +256,63 @@ def _echo_pm_bin(tmp_path):
     return d
 
 
+def _script_pm_bin(tmp_path, cabbage_sh):
+    d = _fake_pm_bin(tmp_path)
+    (d / sim.CABBAGE).write_text("#!/bin/sh\n" + cabbage_sh)
+    return d
+
+
+@pytest.mark.parametrize("script,cached,text", [
+    ("exit 1\n", True, "failed (exit 1)"),
+    ("kill -SEGV $$\n", True, "crashed with signal 11 (SIGSEGV)"),   # the tool's own crash
+    ("kill -KILL $$\n", False, "killed by signal 9 (SIGKILL, exit -9)"),   # OOM killer
+    ("kill -TERM $$\n", False, "killed by signal 15 (SIGTERM, exit -15)"),
+    ("exit 137\n", False, "killed by signal 9 (SIGKILL, exit 137)"),
+    ("exit 130\n", False, "killed by signal 2 (SIGINT, exit 130)"),
+])
+def test_only_the_tools_own_verdict_is_cached(tmp_path, script, cached, text):
+    pm = _script_pm_bin(tmp_path, script)
+    pocket = tmp_path / "P1" / "a.pdb"
+    pocket.parent.mkdir()
+    pocket.write_text("x\n")
+    rec, fl = tmp_path / "a.cabbage", tmp_path / "a.failed"
+    reason = sim._cabbage(pocket, pm, rec, fl)
+    assert text in reason
+    assert fl.exists() == cached and not rec.exists()
+    assert ("not cached, retried next run" in reason) == (not cached)
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_failure_while_stopping_is_not_cached(tmp_path, monkeypatch):
+    pm = _script_pm_bin(tmp_path, "exit 1\n")
+    pocket = tmp_path / "P1" / "a.pdb"
+    pocket.parent.mkdir()
+    pocket.write_text("x\n")
+    monkeypatch.setattr(sim, "_STOP", True)   # this worker is being stopped
+    assert "failed (exit 1)" in sim._cabbage(pocket, pm, tmp_path / "r", tmp_path / "f")
+    assert not (tmp_path / "f").exists()
+
+
+def test_killed_pocket_is_retried_next_run(tmp_path, monkeypatch):
+    """A pocket whose cabbage-core is killed from outside is dropped for this run only:
+    the stage does not count as finished and the pocket is counted again."""
+    src = FIX / "pockets_net2_P53350" / "P53350" / "P53350_4o56_A.pdb_res_P_1.pdb"
+    layout = _run_folder(tmp_path, {("P1", "a.pdb"): src, ("P2", "b.pdb"): src})
+    flag = tmp_path / "oom"
+    flag.touch()
+    monkeypatch.setenv("FAKE_OOM_FLAG", str(flag))
+    pm = _script_pm_bin(tmp_path, '[ "$1" = ./b.pdb ] && [ -e "$FAKE_OOM_FLAG" ] && kill -KILL $$\n'
+                                  'echo "record $1"\n')
+    counts = sim.run(layout, _args(1, pm_bin_dir=pm), Prog())
+    assert counts["cabbage_failed"] == counts["failed"] == 1 and counts["pockets"] == 1
+    rows = (layout.similarity / "failed.tsv").read_text().splitlines()
+    assert len(rows) == 2 and rows[1].startswith("P2/b.pdb\tsimilarity\t")
+    assert "killed by signal 9 (SIGKILL" in rows[1]
+    assert not list((layout.similarity / "cabbage").glob("*.failed"))
+    flag.unlink()
+    assert sim.units(layout, _args(1, pm_bin_dir=pm)).count == 1   # a-b counted again
+
+
 def test_broken_pool_isolates_only_repeat_suspects(tmp_path, monkeypatch):
     """A crashing task sends the tasks in flight back to a fresh full-size pool; only
     tasks in flight during a second break run alone."""
@@ -315,6 +372,48 @@ def test_parallel_equals_serial_on_sample(tmp_path):
     assert not list(outs[4].rglob("*.tmp"))
     assert not (outs[4] / "jobs").exists()
     assert len(list((outs[4] / "cabbage").glob("*.cabbage"))) == 16
+
+
+@pytest.mark.pocketmatch
+def test_finished_stage_is_not_recomputed(tmp_path, capsys):
+    """A second run on the same inputs reports 0 units, runs no PocketMatch and leaves
+    every file as it was; any nprocs. Changed inputs invalidate it."""
+    layout = _sample_layout(tmp_path)
+    first = sim.run(layout, _args(4), Prog())
+    files = {p: p.stat().st_mtime_ns for p in layout.similarity.rglob("*")}
+    assert sim.units(layout, _args(4)).count == 0
+    assert sim.units(layout, _args(1)).count == 0   # independent of nprocs
+
+    def boom(*a, **kw):
+        raise AssertionError("PocketMatch must not run")
+    with unittest.mock.patch.object(sim, "_similarity", boom), \
+            unittest.mock.patch.object(sim, "run_pocketmatch", boom), \
+            unittest.mock.patch.object(sim, "cabbage_record", boom):
+        assert sim.run(layout, _args(1), Prog()) == first
+        capsys.readouterr()
+        assert cli.main(["similarity", "--run-dir", str(tmp_path), "--no-notify",
+                         "--nprocs", "4"]) == 0
+    assert "similarity: 0 units (pair)" in capsys.readouterr().out
+    assert {p: p.stat().st_mtime_ns for p in layout.similarity.rglob("*")} == files
+
+    # a truncated output, changed Protein_info, or a changed pocket invalidates it
+    score = layout.similarity / "PocketMatch_score.txt"
+    data = score.read_bytes()
+    score.write_bytes(data[:-1])
+    assert sim.units(layout, _args(4)).count == 120
+    score.write_bytes(data)
+    assert sim.units(layout, _args(4)).count == 0
+    info = layout.protein_info.read_text()
+    layout.protein_info.write_text(info + "\n")
+    assert sim.units(layout, _args(4)).count == 120
+    layout.protein_info.write_text(info)
+    assert sim.units(layout, _args(4)).count == 0
+    victim = sim.select_pockets(layout.pockets)[3]
+    victim.write_text(victim.read_text() + "REMARK changed\n")
+    assert sim.units(layout, _args(4)).count == 120
+    again = sim.run(layout, _args(4), Prog())
+    assert again["skipped_existing"] == 0 and again["pairs"] == 120
+    assert sim.units(layout, _args(4)).count == 0
 
 
 @pytest.mark.pocketmatch
@@ -429,7 +528,8 @@ def test_rejected_and_missing_pockets_are_dropped(tmp_path):
     assert counts["missing"] == 1 and counts["cabbage_failed"] == 1 and counts["failed"] == 2
     rows = (layout.similarity / "failed.tsv").read_text().splitlines()
     assert rows[:2] == ["item\tstage\treason", "P4/d.pdb\tsimilarity\tpocket file missing"]
-    assert rows[2].startswith("P2/b.pdb\tsimilarity\tStep0-cabbage-core ./b.pdb failed (exit ")
+    assert rows[2].startswith("P2/b.pdb\tsimilarity\tStep0-cabbage-core ./b.pdb crashed with "
+                              "signal 6 (SIGABRT)")
     assert "malloc" in rows[2] and len(rows) == 3   # the tool's stderr tail
     assert (layout.similarity / "manifest.json").is_file()
     assert [l.split()[:2] for l in (layout.similarity / "PocketMatch_score.txt").read_text()
@@ -439,6 +539,8 @@ def test_rejected_and_missing_pockets_are_dropped(tmp_path):
     entries = {p.name: p.stat().st_mtime_ns for p in cache.iterdir()}
     assert sorted(n.rsplit(".", 1)[1] for n in entries if n != sim.CABBAGE_STAMP) == [
         "cabbage", "cabbage", "failed"]
+    assert sim.units(layout, _args(1)).count == 0   # finished on these inputs
+    (layout.similarity / "Pocketsim.csv").unlink()   # force a recompute
     assert sim.units(layout, _args(1)).count == 1   # b is known to fail now
     again = sim.run(layout, _args(1), Prog())
     assert again == counts
@@ -576,3 +678,12 @@ def test_reproduces_net2_2023(net2_run, tmp_path, nprocs):
     assert got_rows == ref_rows, (
         f"only new: {list((got_rows - ref_rows).items())[:5]}; "
         f"only legacy: {list((ref_rows - got_rows).items())[:5]}")
+
+    # a second invocation on the same folder recognises the finished stage
+    files = {p: p.stat().st_mtime_ns for p in layout.similarity.rglob("*")}
+    t0 = time.monotonic()
+    assert sim.units(layout, _args(nprocs)).count == 0
+    assert sim.run(layout, _args(nprocs), Prog()) == counts
+    print(f"net2 similarity nprocs={nprocs} second invocation (units + run): "
+          f"{time.monotonic() - t0:.1f} s")
+    assert {p: p.stat().st_mtime_ns for p in layout.similarity.rglob("*")} == files
