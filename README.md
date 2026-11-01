@@ -25,24 +25,33 @@ Build the image once from the repo root. The git commit is recorded in every sta
 
 Make a run folder (one per subtype), put the inputs in `inputs/`, and run everything:
 
+    REPO=~/repos/bioinf_polyphar_workflow           # this repository
     mkdir -p ~/runs/net1/inputs
     cp clusters_features_ppi.xlsx e-Drug3D_2083.sdf ~/runs/net1/inputs/
     cd ~/runs/net1
     export POLYPHAR_VERSION=dev DOGSITE_BIN=/opt/dogsite/dogsite NPROCS=32
-    bin/polyphar-docker run --dry-run                       # ETA table, does nothing
-    bin/polyphar-docker run --xlsx inputs/clusters_features_ppi.xlsx --sheet net1 \
-        --id-column Entry --reviewed-column Status
+    "$REPO"/bin/polyphar-docker run --dry-run        # ETA table, does nothing
+    "$REPO"/bin/polyphar-docker run --xlsx inputs/clusters_features_ppi.xlsx --sheet net1 \
+        --id-column "uniprot Entry" --reviewed-column "Reviewed/unreviewed"
 
-(`bin/polyphar-docker` is in this repo; call it by its full path from the run folder, or set
-`POLYPHAR_RUN_DIR`.) The wrapper mounts the run folder at `/work` and `~/.polyphar` (or
+The HCC workbook `clusters_features_ppi.xlsx` has tabs `net1`, `net2`, `net3`. The Alzheimer
+workbook has no reviewed column:
+
+    "$REPO"/bin/polyphar-docker run --xlsx inputs/PPIN_ROSMAP_clusterFeatures_v7.xlsx \
+        --sheet clusterN --id-column UNIPROTID
+
+The wrapper uses the current directory as the run folder (or `$POLYPHAR_RUN_DIR`). It mounts the run folder at `/work` and `~/.polyphar` (or
 `$POLYPHAR_HOME`) at `/polyphar_home`, runs as your user, and passes `NPROCS` through.
 
 **Long runs.** A full subtype takes hours to days. Run it in `tmux` (or `nohup`) and keep the
 wrapper in the foreground:
 
-    tmux new -s net1 'NPROCS=32 bin/polyphar-docker run'
+    cd ~/runs/net1
+    tmux new -s net1 "NPROCS=32 $REPO/bin/polyphar-docker run"
     # or
-    nohup bin/polyphar-docker run > logs/run.out 2>&1 &
+    mkdir -p logs && nohup "$REPO"/bin/polyphar-docker run > logs/run.out 2>&1 &
+
+(Once `00_ids/ids.txt` exists, `run` needs no ids options: see below.)
 
 Do not use `docker run -d`. The wrapper must stay alive because it supervises the host
 DoGSiteScorer worker, and stops it when the container exits.
@@ -59,15 +68,33 @@ It accepts every stage's own options (`--xlsx/--txt/--sheet/--id-column/--review
   milestones and done or FAILED.
 - `ids` runs when `--txt` or `--xlsx` is given. Without them, an existing `00_ids/ids.txt`
   counts as done, and a missing one is an error before anything starts.
-- A stage that has no calibration on this machine is benchmarked first
+- **Resume.** Each stage's remaining units are computed first. A stage with 0 units left and
+  a `manifest.json` is `skipped (done)`: it is not benchmarked, not run, and sends no
+  notifications. Its manifest counts still feed the failure flags. A stage with 0 units but
+  no manifest still runs, to finish its bookkeeping. A restarted run therefore shows ETAs
+  only for the work that is left.
+- Options of stages outside `--from`..`--to` get a one-line warning on stderr and are ignored.
+- A stage that still has units left and no calibration on this machine is benchmarked first
   (`benchmark --stages <stage>`). `pockets` is the exception: the wrapper calibrates it on the
   host before `run` starts. If it is still uncalibrated, its ETA arrives at the 5 % milestone.
-- The first failed stage stops the run with a priority-1 notification.
+- The first failed stage stops the run with a priority-1 notification. `docker stop` (SIGTERM)
+  counts as a failure at any point, including during an automatic benchmark.
 - A stage that finishes with failed units (`counts["failed"] > 0`), or `dock` with
-  `incomplete_targets > 0`, does not stop the run, but it is flagged in the final summary.
-- The summary (per stage: status, units, estimate, actual time, failed, incomplete targets,
-  skipped stages) is printed, notified, and appended to `logs/run.log`.
+  `incomplete_targets > 0`, does not stop the run. It is flagged in the final summary, which
+  is then sent at priority 1.
+- The summary (per stage: status, units, estimate, actual time, failed, incomplete targets)
+  is printed, notified, and appended to `logs/run.log`. The notified text starts with the
+  `failures:` line, because Pushover messages are cut at 1024 characters.
 - `run --dry-run` prints the same table as `polyphar estimate` and does nothing else.
+
+Exit codes of `polyphar run`:
+
+| code | meaning |
+|---|---|
+| 0 | every stage finished, nothing flagged |
+| 1 | a stage failed and the run stopped (143 when stopped by SIGTERM / `docker stop`) |
+| 2 | usage error (bad options, `--from` after `--to`, no ids source) |
+| 3 | the run finished, but failed units or incomplete targets were flagged |
 
 ## Run folder
 
@@ -97,8 +124,10 @@ All stages take `--run-dir` (default `/work` in the container, else the current 
 `--nprocs` (default `$NPROCS`, else 4; results are identical for any value), `--dry-run`
 (print units and ETA, then exit) and `--no-notify`.
 
-    polyphar ids --xlsx inputs/clusters_features_ppi.xlsx --sheet net1 --id-column Entry \
-                 [--reviewed-column Status]          # or: --txt inputs/ids.txt
+    polyphar ids --xlsx inputs/clusters_features_ppi.xlsx --sheet net1 \
+                 --id-column "uniprot Entry" --reviewed-column "Reviewed/unreviewed"
+                 # AD: --xlsx inputs/PPIN_ROSMAP_clusterFeatures_v7.xlsx --sheet clusterN
+                 #     --id-column UNIPROTID      or: --txt inputs/ids.txt
     polyphar uniprot                                  # reviewed human entries only
     polyphar structures                               # SIFTS chains + AlphaFold F1 models
     polyphar fix [--ph 7.0]
@@ -198,8 +227,9 @@ These are sent:
 - `<stage> done`: time vs estimate, counts, failures
 - `<stage> FAILED` (priority 1): the last log lines
 - `pockets: no worker` (priority 1): no host worker heartbeat within `--worker-timeout`
-- `run done` / `run done with failures (N flagged)` / `run FAILED at <stage>` (priority 1):
-  the summary table
+- `run done` (priority 0), `run done with failures (N flagged)` (priority 1) and
+  `run FAILED at <stage>` (priority 1): the `failures:` line, then the summary table
+- a missing-credentials warning is logged once per process, not once per notification
 
 Every notification, sent or not (for example without credentials), is also recorded in
 `logs/notifications.log`.
@@ -269,7 +299,15 @@ image and never committed here.
     conda env create -f environment.yml && conda activate polyphar && pip install -e .
     pytest -W error                    # unit tests; network tests run by default
     pytest tests/test_docker.py        # needs the polyphar:dev image
-    DOGSITE_BIN=tests/fixtures/fake_dogsite pytest tests/test_run_e2e.py   # full run, ~1 h
+    POLYPHAR_E2E_PMAX=0.3 DOGSITE_BIN=$PWD/tests/fixtures/fake_dogsite \
+        pytest tests/test_run_e2e.py   # full run through the image, ~3 min
+
+The end-to-end test runs `polyphar run` on P25815 + P53350 with a 3-ligand library through
+`bin/polyphar-docker`. It needs docker, the `polyphar:dev` image (or `$POLYPHAR_VERSION`) and
+network access. With `fake_dogsite` the pockets are copies of a few real pockets, so the best
+pair reaches only Pmax 0.39: set `POLYPHAR_E2E_PMAX=0.3`, or `select` correctly stops the run
+with "no protein pair has Pmax >= 0.7". With the real binary
+(`DOGSITE_BIN=/path/to/dogsite`), run it without `POLYPHAR_E2E_PMAX`.
 
 Markers `dogsite`, `pocketmatch`, `docking`, `docker`, `regression` (`ADEP_DATA`) and
 `pushover` skip unless their tool or environment is available.

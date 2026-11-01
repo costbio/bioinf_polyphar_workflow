@@ -1,5 +1,8 @@
 """`polyphar run`: every stage in order through the same ETA gate (fake stages)."""
 import argparse
+import json
+import os
+import signal
 import sys
 import types
 
@@ -11,6 +14,8 @@ from polyphar.eta import Calibration
 from polyphar.stages import run as run_mod
 
 ORDER = ("ids", "uniprot", "structures", "fix", "pockets", "similarity", "select", "dock")
+DIRS = dict(zip(ORDER, ("00_ids", "01_uniprot", "02_structures", "03_pdbfixer", "04_pockets",
+                        "05_similarity", "06_targets", "07_docking")))
 
 
 @pytest.fixture
@@ -19,7 +24,9 @@ def fake(monkeypatch, tmp_path):
     one ordered log of units / run / notifications / benchmarks / prints."""
     monkeypatch.setenv("POLYPHAR_HOME", str(tmp_path / "home"))
     events, notes = [], []
-    state = {"fail": None, "counts": {}}
+    # remaining: units left per stage (default 2); a finished stage writes its manifest
+    # and has 0 left; a failed one keeps 1 left (part of the work done)
+    state = {"fail": None, "counts": {}, "remaining": {}}
 
     for name in ORDER:
         real = cli._load_stage(name)
@@ -27,15 +34,23 @@ def fake(monkeypatch, tmp_path):
 
         def units(layout, args, name=name):
             events.append(("units", name))
-            return WorkUnits(2, "things")
+            return WorkUnits(state["remaining"].get(name, 2), "things")
 
         def run(layout, args, progress, name=name):
             events.append(("run", name))
-            progress.advance()
-            progress.advance()
+            for _ in range(state["remaining"].get(name, 2)):
+                progress.advance()
             if state["fail"] == name:
+                state["remaining"][name] = 1
                 raise RuntimeError(f"{name} blew up")
-            return {"failed": 0, **state["counts"].get(name, {})}
+            counts = {"failed": 0, **state["counts"].get(name, {})}
+            d = layout.run_dir / DIRS[name]
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "manifest.json").write_text(json.dumps({"counts": counts}))
+            if name == "ids":
+                layout.ids_txt.write_text("P25815\n")
+            state["remaining"][name] = 0
+            return counts
 
         mod.units, mod.run = units, run
         if hasattr(real, "add_arguments"):
@@ -52,6 +67,8 @@ def fake(monkeypatch, tmp_path):
 
     def fake_bench(stages, calib, log=print):
         events.append(("benchmark", tuple(stages)))
+        if state.get("bench_sigterm"):
+            os.kill(os.getpid(), signal.SIGTERM)
         for s in stages:
             calib.update(s, 1.0)
         calib.save()
@@ -110,9 +127,9 @@ def test_from_to_select_a_contiguous_range(fake):
     assert _runs(fake.events) == ["fix", "pockets", "similarity", "select"]
 
 
-def test_from_after_to_is_an_error(fake):
-    with pytest.raises(SystemExit, match="--from"):
-        _main(fake, "--from", "dock", "--to", "fix")
+def test_from_after_to_is_a_usage_error(fake, capsys):
+    assert _main(fake, "--from", "dock", "--to", "fix") == 2
+    assert "--from" in capsys.readouterr().err
     assert _runs(fake.events) == []
 
 
@@ -127,9 +144,9 @@ def test_ids_skipped_as_done_when_ids_txt_exists_and_no_ids_options(fake, capsys
     assert "skipped (done)" in fake.notes[-1][1]
 
 
-def test_ids_options_required_without_ids_txt(fake):
-    with pytest.raises(SystemExit, match="--txt or --xlsx"):
-        _main(fake, "--to", "uniprot")
+def test_ids_options_required_without_ids_txt(fake, capsys):
+    assert _main(fake, "--to", "uniprot") == 2
+    assert "--txt or --xlsx" in capsys.readouterr().err
     assert _runs(fake.events) == []
 
 
@@ -144,7 +161,7 @@ def test_first_failed_stage_stops_the_run(fake, capsys):
     title, msg, prio = fake.notes[-1]
     assert prio == 1 and "fix" in title and "FAILED" in title
     assert "not run" in msg                             # later stages listed as not run
-    assert "failures: fix FAILED" in msg                # never "failures: none"
+    assert msg.splitlines()[0] == "failures: fix FAILED"   # never "failures: none"
     assert "FAILED" in capsys.readouterr().out
 
 
@@ -152,12 +169,12 @@ def test_failed_units_and_incomplete_targets_are_flagged_not_fatal(fake, capsys)
     _calibrate_all(fake.home)
     fake.state["counts"] = {"structures": {"failed": 3},
                             "dock": {"failed": 0, "incomplete_targets": 2}}
-    assert _main(fake, "--from", "uniprot") == 0
+    assert _main(fake, "--from", "uniprot") == 3
     assert _runs(fake.events)[-1] == "dock"
     title, msg, prio = fake.notes[-1]
-    assert "failures" in title.lower()
-    assert "structures failed=3" in msg
-    assert "dock incomplete_targets=2" in msg
+    assert "failures" in title.lower() and prio == 1
+    # the failures line comes first: notify truncates long messages
+    assert msg.splitlines()[0] == "failures: structures failed=3; dock incomplete_targets=2"
     out = capsys.readouterr().out
     assert "structures failed=3" in out and "dock incomplete_targets=2" in out
 
@@ -176,9 +193,12 @@ def test_uncalibrated_stage_is_benchmarked_first_except_pockets(fake, capsys):
     assert _main(fake, "--from", "uniprot", "--to", "similarity") == 0
     benches = [e[1] for e in fake.events if e[0] == "benchmark"]
     assert benches == [("structures",), ("fix",), ("similarity",)]
-    # each benchmark runs right before its stage's units()
+    # each benchmark runs after its stage's units() (no benchmark when 0 units are left)
+    # and before the stage's ETA / start notification
     for s in ("structures", "fix", "similarity"):
-        assert fake.events.index(("benchmark", (s,))) < fake.events.index(("units", s))
+        i = fake.events.index(("benchmark", (s,)))
+        assert fake.events.index(("units", s)) < i < fake.events.index(("notify",
+                                                                        f"{s} starting"))
     assert "pockets: 2 units (things) - ETA uncalibrated" in capsys.readouterr().out
 
 
@@ -239,3 +259,83 @@ def test_notify_records_every_notification_in_the_run_log(monkeypatch, tmp_path)
     assert prio == "1" and sent == "not sent" and title == "fix starting"
     assert msg == "fix: 2 units\\nsecond line"
     assert "T" in stamp
+
+
+def test_resume_skips_finished_stages_and_estimates_only_remaining_units(fake, capsys):
+    _calibrate_all(fake.home)
+    (fake.run / "inputs").mkdir()
+    (fake.run / "inputs" / "ids.txt").write_text("P25815\n")
+    fake.state["fail"] = "fix"
+    with pytest.raises(RuntimeError):
+        _main(fake, "--txt", "inputs/ids.txt")
+    capsys.readouterr()
+    fake.events.clear()
+    fake.notes.clear()
+    fake.state["fail"] = None
+
+    assert _main(fake) == 0     # no ids options: 00_ids/ids.txt exists
+    assert _runs(fake.events) == ["fix", "pockets", "similarity", "select", "dock"]
+    out = capsys.readouterr().out
+    # ETA only for the remaining work: fix has 1 unit left
+    assert "fix: 1 units (things) - ETA" in out
+    starts = [t for t, _, _ in fake.notes if t.endswith(" starting")]
+    assert starts == [f"{s} starting" for s in ("fix", "pockets", "similarity", "select",
+                                                 "dock")]
+    summary = fake.notes[-1][1]
+    for s in ("ids", "uniprot", "structures"):
+        line = next(l for l in summary.splitlines() if l.startswith(s + " "))
+        assert "skipped (done)" in line
+    assert "fix" in summary and "failures: none" in summary
+
+
+def test_stage_without_manifest_and_zero_units_still_runs(fake, capsys):
+    _calibrate_all(fake.home)
+    fake.state["remaining"]["uniprot"] = 0      # no manifest yet: bookkeeping still to do
+    assert _main(fake, "--from", "uniprot", "--to", "uniprot") == 0
+    assert _runs(fake.events) == ["uniprot"]
+
+
+def test_skipped_stage_with_flagged_manifest_counts_is_still_flagged(fake):
+    _calibrate_all(fake.home)
+    d = fake.run / "07_docking"
+    d.mkdir()
+    (d / "manifest.json").write_text(json.dumps({"counts": {"failed": 0,
+                                                            "incomplete_targets": 1}}))
+    fake.state["remaining"]["dock"] = 0
+    assert _main(fake, "--from", "dock") == 3
+    assert _runs(fake.events) == []
+    title, msg, prio = fake.notes[-1]
+    assert prio == 1 and msg.splitlines()[0] == "failures: dock incomplete_targets=1"
+
+
+def test_no_benchmark_for_a_stage_with_no_units_left(fake):
+    fake.state["remaining"]["dock"] = 0
+    d = fake.run / "07_docking"
+    d.mkdir()
+    (d / "manifest.json").write_text(json.dumps({"counts": {"failed": 0}}))
+    assert _main(fake, "--from", "dock") == 0
+    assert [e for e in fake.events if e[0] == "benchmark"] == []
+
+
+def test_sigterm_during_auto_benchmark_ends_in_run_failed_summary(fake):
+    fake.state["bench_sigterm"] = True
+    previous = signal.getsignal(signal.SIGTERM)
+    with pytest.raises(SystemExit) as exc:
+        _main(fake, "--from", "uniprot", "--to", "fix")
+    assert exc.value.code == 143
+    assert _runs(fake.events) == []
+    title, msg, prio = fake.notes[-1]
+    assert title == "run FAILED at uniprot" and prio == 1
+    assert signal.getsignal(signal.SIGTERM) is previous      # handler restored
+
+
+def test_options_of_stages_outside_the_range_are_warned(fake, capsys):
+    _calibrate_all(fake.home)
+    assert _main(fake, "--from", "uniprot", "--to", "uniprot", "--pmax", "0.5",
+                 "--library", "inputs/x.sdf", "--threads-per-job", "1") == 0
+    err = capsys.readouterr().err.splitlines()
+    warned = [l for l in err if "warning" in l]
+    assert any("--pmax" in l and "select" in l for l in warned)
+    assert any("--library" in l and "dock" in l for l in warned)
+    assert not any("--threads-per-job" in l for l in warned)   # default value: not "given"
+    assert len(warned) == 2

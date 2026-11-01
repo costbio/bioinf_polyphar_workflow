@@ -39,6 +39,7 @@ def _stub(monkeypatch, session):
 
 
 def test_notify_without_credentials_returns_false(monkeypatch, caplog):
+    monkeypatch.setattr(notify_mod, "_warned_no_credentials", False)
     monkeypatch.delenv("PUSHOVER_APP_TOKEN", raising=False)
     monkeypatch.delenv("PUSHOVER_USER_KEY", raising=False)
 
@@ -48,6 +49,16 @@ def test_notify_without_credentials_returns_false(monkeypatch, caplog):
     monkeypatch.setattr(notify_mod, "http_session", no_network)
     with caplog.at_level(logging.WARNING, logger="polyphar.notify"):
         assert notify("t", "m") is False
+    assert len(caplog.records) == 1
+
+
+def test_missing_credentials_warn_once_per_process(monkeypatch, caplog):
+    monkeypatch.setattr(notify_mod, "_warned_no_credentials", False)
+    monkeypatch.delenv("PUSHOVER_APP_TOKEN", raising=False)
+    monkeypatch.delenv("PUSHOVER_USER_KEY", raising=False)
+    with caplog.at_level(logging.WARNING, logger="polyphar.notify"):
+        for _ in range(3):
+            assert notify("t", "m") is False
     assert len(caplog.records) == 1
 
 

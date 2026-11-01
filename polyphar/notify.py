@@ -32,6 +32,7 @@ def run_name(run_dir=None) -> str:
 
 
 NOTIFICATIONS_LOG = Path("logs") / "notifications.log"
+_warned_no_credentials = False
 
 
 def _record(run_dir, stamp: str, priority: int, sent: bool, title: str, message: str) -> None:
@@ -65,7 +66,11 @@ def _send(title: str, message: str, priority: int, run_dir) -> bool:
         token = os.environ.get("PUSHOVER_APP_TOKEN")
         user = os.environ.get("PUSHOVER_USER_KEY")
         if not token or not user:
-            log.warning("pushover credentials not set; notification skipped")
+            global _warned_no_credentials
+            if not _warned_no_credentials:   # once per process, not per notification
+                _warned_no_credentials = True
+                log.warning("pushover credentials not set; notifications are skipped "
+                            "(still recorded in logs/notifications.log)")
             return False
         data = {
             "token": token,

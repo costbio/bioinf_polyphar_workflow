@@ -7,12 +7,21 @@ the first unit, milestone progress, done / FAILED.
   add_arguments(); two stages defining one option differently is an error).
 * ids: runs when --txt / --xlsx is given; without them an existing 00_ids/ids.txt counts
   as done (skipped), and a missing one is an error before anything starts.
-* A stage without calibration on this machine is benchmarked first (`benchmark --stages
+* Every stage's units() is computed first. A stage with 0 units and a manifest.json is
+  "skipped (done)": not benchmarked, not run, no notifications (its manifest counts still
+  feed the failure flags). A stage with 0 units but no manifest runs through the gate (it
+  only finishes its bookkeeping).
+* Options of stages outside --from..--to are warned about (stderr) and ignored.
+* A stage with remaining units and no calibration on this machine is benchmarked first (`benchmark --stages
   <stage>`), except pockets: DoGSiteScorer is host-only (bin/polyphar-docker calibrates it
   before `run`); uncalibrated, its ETA comes with the 5 % milestone.
-* The first failed stage stops the run (priority-1 notification). A stage that finishes with
-  counts["failed"] > 0, or dock with counts["incomplete_targets"] > 0, does not stop it but is
-  flagged in the final summary (printed, notified, appended to logs/run.log).
+* The first failed stage stops the run (priority-1 notification). SIGTERM (docker stop) is
+  turned into a failure for the whole run, so an interrupted benchmark or units() also ends
+  in the "run FAILED" summary. A stage that finishes with counts["failed"] > 0, or dock with
+  counts["incomplete_targets"] > 0, does not stop the run but is flagged in the final
+  summary (printed, notified at priority 1, appended to logs/run.log).
+* Exit codes: 0 success; 1 a stage failed (the exception propagates; 143 for SIGTERM);
+  2 usage error; 3 the run finished but failures were flagged.
 * --dry-run prints the `polyphar estimate` table and does nothing else.
 
 Heavy imports stay inside functions (cli.build_parser imports this module at parse time).
@@ -21,14 +30,20 @@ Heavy imports stay inside functions (cli.build_parser imports this module at par
 from __future__ import annotations
 
 import argparse
+import json
+import signal
+import sys
 from datetime import datetime
 
-from polyphar.benchmark import BENCH_STAGES, ORDER, estimate_rows, format_table, run_benchmark
-from polyphar.common import WorkUnits
+from polyphar.benchmark import (BENCH_STAGES, ORDER, STAGE_DIRS, estimate_rows, format_table,
+                                run_benchmark)
 from polyphar.eta import Calibration, format_duration, polyphar_home
 
 IDS_SOURCE = ("xlsx", "txt", "sheet", "id_column", "reviewed_column")
 FLAG_KEYS = ("failed", "incomplete_targets")
+EXIT_USAGE = 2
+EXIT_FLAGGED = 3
+SKIPPED = "skipped (done)"
 
 
 # --- options -------------------------------------------------------------------------------
@@ -39,11 +54,13 @@ def _signature(action) -> tuple:
             tuple(action.choices) if action.choices is not None else None)
 
 
-def merge_stage_options(parser, stage_hooks) -> None:
+def merge_stage_options(parser, stage_hooks) -> dict:
     """Add the options of every (stage name, add_arguments) in `stage_hooks` to `parser`,
     one argument group per stage. An option (or dest) defined identically by several stages
     is added once; defined differently, it raises ValueError. Mutually exclusive groups stay
-    exclusive but are never required here (each stage validates its own inputs)."""
+    exclusive but are never required here (each stage validates its own inputs).
+    Returns {dest: (option string, default, [stages defining it])}."""
+    by_dest = {}
     owners = {}   # option string or "dest:<dest>" -> (stage, signature)
     for action in parser._actions:
         for key in [*action.option_strings, f"dest:{action.dest}"]:
@@ -65,6 +82,8 @@ def merge_stage_options(parser, stage_hooks) -> None:
                         raise ValueError(
                             f"polyphar run: option {key.removeprefix('dest:')} is defined "
                             f"differently by stages {owner!r} and {stage!r}")
+                if action.dest in by_dest:
+                    by_dest[action.dest][2].append(stage)
                 continue
             g = exclusive.get(id(action))
             if g is not None and id(g) not in new_exclusive:
@@ -73,6 +92,9 @@ def merge_stage_options(parser, stage_hooks) -> None:
             target._add_action(action)
             for key in keys:
                 owners[key] = (stage, sig)
+            if action.option_strings:
+                by_dest[action.dest] = (action.option_strings[-1], action.default, [stage])
+    return by_dest
 
 
 def add_arguments(parser) -> None:
@@ -88,32 +110,30 @@ def add_arguments(parser) -> None:
         module = cli._load_stage(name)
         if module is not None and hasattr(module, "add_arguments"):
             hooks.append((name, module.add_arguments))
-    merge_stage_options(parser, hooks)
+    # which stage each option belongs to, for the out-of-range warning
+    parser.set_defaults(run_option_owners=merge_stage_options(parser, hooks))
 
 
 # --- run -----------------------------------------------------------------------------------
 
-def units(layout, args) -> WorkUnits:
-    return WorkUnits(1, "run")
+# `run` has no units()/run(): cli.main calls main() for it (hasattr(stage, "main")).
 
 
-def run(layout, args, progress) -> dict:   # unused: cli.main calls main()
-    return {"failed": 0} if main(layout, args) == 0 else {"failed": 1}
-
-
-def _ensure_calibrated(stage: str) -> None:
-    """benchmark --stages <stage> when this machine has no calibration for it. Never
-    for pockets (host-calibrated) or trivial stages; a failed benchmark only leaves the
-    stage uncalibrated."""
+def _needs_benchmark(stage: str) -> bool:
+    """No calibration for `stage` on this machine and it can be benchmarked here (never
+    pockets: host-calibrated; never trivial stages)."""
     if stage not in BENCH_STAGES or stage == "pockets":
-        return
-    calib = Calibration.load(polyphar_home())
-    if calib.cost(stage) is not None:
-        return
+        return False
+    return Calibration.load(polyphar_home()).cost(stage) is None
+
+
+def _benchmark(stage: str) -> None:
+    """benchmark --stages <stage>; a failed benchmark only leaves the stage uncalibrated."""
     print(f"{stage}: not calibrated on this machine; running polyphar benchmark "
           f"--stages {stage}", flush=True)
     try:
-        run_benchmark([stage], calib, log=lambda m: print(m, flush=True))
+        run_benchmark([stage], Calibration.load(polyphar_home()),
+                      log=lambda m: print(m, flush=True))
     except Exception as exc:
         print(f"{stage}: benchmark failed ({type(exc).__name__}: {exc}); continuing "
               "uncalibrated", flush=True)
@@ -126,7 +146,8 @@ def _fmt_s(seconds) -> str:
 
 
 def _flags(rows) -> list[str]:
-    """Failed stages and finished stages with failed units / incomplete targets."""
+    """Failed stages, and stages (run or skipped as done) with failed units / incomplete
+    targets."""
     out = []
     for r in rows:
         if r["status"] == "FAILED":
@@ -134,9 +155,14 @@ def _flags(rows) -> list[str]:
             continue
         for key in FLAG_KEYS:
             v = (r.get("counts") or {}).get(key)
-            if isinstance(v, (int, float)) and v > 0:
+            if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0:
                 out.append(f"{r['stage']} {key}={v:g}")
     return out
+
+
+def failures_line(rows) -> str:
+    flags = _flags(rows)
+    return f"failures: {'; '.join(flags) if flags else 'none'}"
 
 
 def summary_table(rows, run_name: str) -> str:
@@ -154,8 +180,7 @@ def summary_table(rows, run_name: str) -> str:
         actual = format_duration(r["elapsed_s"]) if r.get("elapsed_s") is not None else "-"
         lines.append(f"{r['stage']:<12}{r['status']:<16}{r.get('units', '-'):<22}{est:<14}"
                      f"{actual:<12}{failed:<8}{incomplete}")
-    flags = _flags(rows)
-    lines.append(f"failures: {'; '.join(flags) if flags else 'none'}")
+    lines.append(failures_line(rows))
     return "\n".join(lines)
 
 
@@ -171,11 +196,40 @@ def _finish(layout, rows, notifier, title, priority) -> str:
                      f"{title}\n{text}\n")
     except OSError as exc:
         print(f"could not write logs/run.log: {exc}", flush=True)
+    # notify() truncates at 1024 characters: the failures line goes first
     try:
-        notifier(title, text, priority=priority)
+        notifier(title, failures_line(rows) + "\n" + text, priority=priority)
     except Exception:
         pass   # notifications never fail a run
     return text
+
+
+def _usage(message: str) -> int:
+    print(f"polyphar run: {message}", file=sys.stderr)
+    return EXIT_USAGE
+
+
+def _warn_out_of_range(args, stages) -> None:
+    """One stderr line per given option whose stages are all outside the range."""
+    for dest, (option, default, owners) in (getattr(args, "run_option_owners", None)
+                                             or {}).items():
+        if any(o in stages for o in owners):
+            continue
+        if getattr(args, dest, default) != default:
+            print(f"polyphar run: warning: {option} belongs to {', '.join(owners)}, outside "
+                  f"--from {args.from_stage} --to {args.to_stage}; ignored", file=sys.stderr)
+
+
+def _manifest_counts(layout, stage) -> dict | None:
+    """counts of the stage's manifest.json, or None when the stage has no manifest."""
+    path = layout.run_dir / STAGE_DIRS[stage] / "manifest.json"
+    if not path.is_file():
+        return None
+    try:
+        counts = json.loads(path.read_text(encoding="utf-8")).get("counts")
+        return counts if isinstance(counts, dict) else {}
+    except (OSError, ValueError, AttributeError):
+        return {}
 
 
 def main(layout, args) -> int:
@@ -187,35 +241,56 @@ def main(layout, args) -> int:
         return 0
     first, last = ORDER.index(args.from_stage), ORDER.index(args.to_stage)
     if first > last:
-        raise SystemExit(f"polyphar run: --from {args.from_stage} comes after "
-                         f"--to {args.to_stage}")
+        return _usage(f"--from {args.from_stage} comes after --to {args.to_stage}")
     stages = ORDER[first:last + 1]
     ids_given = any(getattr(args, k, None) for k in IDS_SOURCE)
     if "ids" in stages and not ids_given and not layout.ids_txt.is_file():
-        raise SystemExit("polyphar run: 00_ids/ids.txt does not exist; give the ids source "
-                         "(--txt or --xlsx with --sheet and --id-column)")
+        return _usage("00_ids/ids.txt does not exist; give the ids source "
+                      "(--txt or --xlsx with --sheet and --id-column)")
+    _warn_out_of_range(args, stages)
 
     notifier = cli.make_notifier(layout, args)
+    previous = cli._install_sigterm_handler()   # docker stop -> SystemExit(143) -> summary
+    try:
+        return _run_stages(cli, layout, args, stages, ids_given, notifier)
+    finally:
+        if previous is not None:
+            signal.signal(signal.SIGTERM, previous)
+
+
+def _run_stages(cli, layout, args, stages, ids_given, notifier) -> int:
     rows = []
     for i, name in enumerate(stages):
-        if name == "ids" and not ids_given:
-            print("ids: 00_ids/ids.txt exists and no --txt/--xlsx given: skipped (done)",
-                  flush=True)
-            rows.append({"stage": name, "status": "skipped (done)"})
-            continue
-        _ensure_calibrated(name)
         row = {"stage": name, "status": "running"}
         rows.append(row)
         try:
-            row["counts"] = cli.gate(name, cli._load_stage(name), layout, args, notifier,
-                                     record=row)
+            if name == "ids" and not ids_given:
+                print(f"ids: 00_ids/ids.txt exists and no --txt/--xlsx given: {SKIPPED}",
+                      flush=True)
+                row.update(status=SKIPPED, counts=_manifest_counts(layout, name))
+                continue
+            stage = cli._load_stage(name)
+            units = stage.units(layout, args)
+            done_counts = _manifest_counts(layout, name) if units.count == 0 else None
+            if done_counts is not None:
+                print(f"{name}: 0 units left and a manifest exists: {SKIPPED}", flush=True)
+                row.update(status=SKIPPED, counts=done_counts,
+                           units=f"0 ({units.cost_basis})")
+                continue
+            if units.count > 0 and _needs_benchmark(name):
+                _benchmark(name)
+            row["counts"] = cli.gate(name, stage, layout, args, notifier, record=row,
+                                     units=units)
+            row["status"] = "done"
         except BaseException:
             row["status"] = "FAILED"
             rows.extend({"stage": s, "status": "not run"} for s in stages[i + 1:])
             _finish(layout, rows, notifier, f"run FAILED at {name}", priority=1)
             raise
-        row["status"] = "done"
     flags = _flags(rows)
-    title = f"run done with failures ({len(flags)} flagged)" if flags else "run done"
-    _finish(layout, rows, notifier, title, priority=0)
+    if flags:
+        _finish(layout, rows, notifier, f"run done with failures ({len(flags)} flagged)",
+                priority=1)
+        return EXIT_FLAGGED
+    _finish(layout, rows, notifier, "run done", priority=0)
     return 0

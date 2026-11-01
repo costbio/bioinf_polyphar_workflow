@@ -128,13 +128,15 @@ def make_notifier(layout, args):
     return notifier
 
 
-def gate(name, stage, layout, args, notifier, record=None) -> dict:
+def gate(name, stage, layout, args, notifier, record=None, units=None) -> dict:
     """ETA gate: units -> estimate -> print + notify start -> (dry-run: stop) ->
     run with Progress -> done/fail. Returns the stage's counts ({} for a dry run).
-    `record`, when given, receives units / estimate_s / elapsed_s (also on failure)."""
+    `record`, when given, receives units / estimate_s / elapsed_s (also on failure).
+    `units`, when given, is the stage's units() computed just before (by `run`)."""
     record = {} if record is None else record
     tpj = getattr(args, "threads_per_job", 1) or 1
-    units = stage.units(layout, args)
+    if units is None:
+        units = stage.units(layout, args)
     calib = Calibration.load(polyphar_home())
     est = estimate_stage(name, units, args.nprocs, calib, PARALLEL_EFFICIENCY,
                          threads_per_job=tpj)
