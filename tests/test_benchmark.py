@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from polyphar import benchmark, cli
-from polyphar.common import RunLayout, write_manifest
+from polyphar.common import RunLayout, WorkUnits, write_manifest
 from polyphar.eta import Calibration
 from polyphar.stages.uniprot import parse_uniprot_tsv
 
@@ -23,10 +23,8 @@ def _calib(tmp_path, **entries):
 
 @pytest.mark.pocketmatch
 def test_benchmark_writes_calibration(tmp_path, monkeypatch):
-    """Real fix + similarity workloads. Inside the container pockets is reported as
+    """Real fix + similarity workloads. pockets is reported as
     host-calibrated and an existing entry is left exactly as it was."""
-    monkeypatch.setenv("POLYPHAR_IN_CONTAINER", "1")
-    assert benchmark.in_container()
     calib = _calib(tmp_path, pockets=3.2e-4)
     before = json.dumps(calib.data["pockets"], sort_keys=True)
     log = []
@@ -160,3 +158,101 @@ def test_estimate_on_empty_run_and_finished_run(tmp_path, monkeypatch):
     rows, observed = benchmark.estimate_rows(layout, 4, _calib(tmp_path, uniprot=1.0))
     assert rows[0]["stage"] == "ids" and rows[0]["kind"] == "trivial"
     assert benchmark.format_table([], []) .startswith("all stages are complete")
+
+
+def test_uniprot_bench_request_is_one_stage_batch():
+    from polyphar.stages import uniprot
+
+    assert benchmark.UNIPROT_BATCH == uniprot.BATCH
+
+
+def test_uniprot_bench_sends_full_batches(tmp_path, monkeypatch):
+    from polyphar.stages import uniprot
+
+    seen = []
+
+    def fake_fetch(ids, session, batch=100, on_batch=None):
+        seen.append((len(ids), batch))
+    monkeypatch.setattr(uniprot, "fetch_uniprot", fake_fetch)
+    spc, extra = benchmark._bench_uniprot(tmp_path)
+    assert seen == [(benchmark.UNIPROT_REQUESTS * uniprot.BATCH, uniprot.BATCH)]
+    assert extra["accessions_per_request"] == uniprot.BATCH and spc > 0
+
+
+def _snapshot(root):
+    return {str(p.relative_to(root)): (p.stat().st_mtime_ns, p.stat().st_size)
+            for p in sorted(root.rglob("*"))}
+
+
+def _write_pockets(layout, names):
+    import pandas as pd
+
+    rows = []
+    for name in names:
+        d = layout.pockets / "P12345"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / name).write_text("ATOM\n")
+        rows.append({"UniProt ID": "P12345", "Gene Name": "G", "Protein": "1abc_A",
+                     "Pocket": "P_1", "drugScore": 0.9, "Pocket Filename": name})
+    pd.DataFrame(rows).to_csv(layout.drugscore_csv)
+
+
+def test_estimate_is_read_only_even_when_the_name_guard_trips(tmp_path, monkeypatch):
+    """similarity.units would record the guard's findings (failed.tsv, unlink manifest)
+    unless dry-run; estimate must not touch the run folder."""
+    monkeypatch.setenv("POLYPHAR_HOME", str(tmp_path / "home"))
+    layout, _ = _run_with_uniprot_done(tmp_path)
+    layout.structures.mkdir(parents=True, exist_ok=True)
+    for stage in ("structures", "fix", "pockets"):
+        write_manifest(layout.run_dir / benchmark.STAGE_DIRS[stage], stage, {}, [], {}, {}, {})
+    _write_pockets(layout, ["P12345_" + "x" * 40 + ".pdb"])   # > 32 characters
+    before = _snapshot(layout.run_dir)
+    rows, _ = benchmark.estimate_rows(layout, 4, _calib(tmp_path, similarity=0.002))
+    assert rows[0]["stage"] == "similarity" and rows[0]["kind"] == "projected"
+    assert "exact units unavailable" in rows[0]["note"]   # the guard raised ...
+    assert _snapshot(layout.run_dir) == before            # ... and recorded nothing
+    assert benchmark._stage_args("similarity", layout, 4).dry_run is True
+    assert not (layout.similarity / "failed.tsv").exists()
+
+
+def test_run_state_observes_structures_fix_and_pockets(tmp_path):
+    layout, _ = _run_with_uniprot_done(tmp_path)   # 4 accessions
+    layout.structures.mkdir()
+    (layout.structures / "A").mkdir()
+    (layout.structures / "A" / "1abc_A.pdb").write_bytes(b"x" * 1000)
+    (layout.structures / "A" / "2abc_A.pdb").write_bytes(b"x" * 3000)
+    (layout.structures / "A" / "AF-A-F1.pdb").write_bytes(b"x" * 5000)
+    layout.protein_info.write_text(
+        "UniProt ID,File,AlphaFold\nA,02_structures/A/1abc_A.pdb,False\n"
+        "A,02_structures/A/2abc_A.pdb,False\nA,02_structures/A/AF-A-F1.pdb,True\n")
+    fixed = layout.pdbfixer / "A"
+    fixed.mkdir(parents=True)
+    (fixed / "1abc_A.pdb").write_bytes(b"x" * 2500)
+    write_manifest(layout.pockets, "pockets", {}, [], {}, {"models": 4}, {})
+    (layout.pockets / "DrugScore.csv").write_text(
+        "idx,drugScore\n0,0.9\n1,0.7\n2,0.5\n3,0.4\n")   # 3 kept
+    state, observed = benchmark.run_state(
+        layout, ["ids", "uniprot", "structures", "fix", "pockets"])
+    assert state["accessions"] == 4
+    assert state["af_models_per_accession"] == pytest.approx(1 / 4)
+    assert state["pdb_chain_bytes"] == pytest.approx(2000)
+    assert state["af_model_bytes"] == pytest.approx(5000)
+    assert state["fixed_chain_bytes"] == pytest.approx(2500)
+    assert state["pdb_chains_per_accession"] == pytest.approx(1 / 4)   # fix outputs
+    assert state["kept_pockets_per_model"] == pytest.approx(3 / 4)
+    for key in ("af_models_per_accession", "pdb_chain_bytes", "af_model_bytes",
+                "fixed_chain_bytes", "kept_pockets_per_model"):
+        assert key in observed and state[key] != benchmark.PRIORS[key]
+
+
+def test_exact_row_comes_from_the_stage_units(tmp_path, monkeypatch):
+    from polyphar.stages import structures
+
+    monkeypatch.setenv("POLYPHAR_HOME", str(tmp_path / "home"))
+    layout, _ = _run_with_uniprot_done(tmp_path)
+    monkeypatch.setattr(structures, "units",
+                        lambda layout, args: WorkUnits(7777, "sentinel"))
+    rows, _ = benchmark.estimate_rows(layout, 4, _calib(tmp_path, structures=2.0))
+    assert rows[0]["stage"] == "structures" and rows[0]["kind"] == "exact"
+    assert rows[0]["units"] == "7777 (sentinel)"
+    assert rows[0]["seconds"] == pytest.approx(7777 * 2.0 / 4)

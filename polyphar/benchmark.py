@@ -36,7 +36,7 @@ DOCK_POCKET = "2mjw_A_pocket.pdb"
 DOCK_LIGANDS = "edrug3d_bench3.sdf"
 DOCK_SEED = 42
 UNIPROT_REQUESTS = 5
-UNIPROT_BATCH = 20   # accessions per bench request (the stage sends up to 100)
+UNIPROT_BATCH = 100   # = uniprot.BATCH (tested): one bench request is one stage request
 # (accession, PDB, author chain): five live mmCIF downloads + chain extraction; each pair
 # was verified against the entry's own UniProt annotation.
 STRUCTURE_JOBS = (("P49450", "6l49", "A"), ("P53350", "5nmm", "A"), ("P53350", "4lkm", "A"),
@@ -81,10 +81,6 @@ HOST_CALIBRATED = ("host-calibrated: DoGSiteScorer runs on the host only; calibr
 
 class Skip(Exception):
     """A stage that cannot be benchmarked here; the message is the reason."""
-
-
-def in_container() -> bool:
-    return bool(os.environ.get("POLYPHAR_IN_CONTAINER")) or Path("/.dockerenv").exists()
 
 
 # --- benchmark workloads (each returns (seconds_per_unit, extra calibration fields)) -------
@@ -158,19 +154,22 @@ def _bench_dock(tmp: Path):
 def _live_session():
     from polyphar.common import http_session
 
-    return http_session(retries=0)   # offline must fail fast, not back off for minutes
+    # a transient 5xx must not skip the stage, but offline must still fail within seconds
+    return http_session(retries=2, backoff=0.5)
 
 
 def _bench_uniprot(tmp: Path):
     from polyphar.stages import uniprot
 
-    ids = (BENCH_DIR / "accessions.txt").read_text().split()[:UNIPROT_REQUESTS * UNIPROT_BATCH]
+    ids = (BENCH_DIR / "accessions.txt").read_text().split()
+    # fill UNIPROT_REQUESTS full batches; repeated accessions are fine for timing
+    ids = (ids * UNIPROT_REQUESTS * UNIPROT_BATCH)[:UNIPROT_REQUESTS * UNIPROT_BATCH]
     session = _live_session()
     t0 = time.monotonic()
     try:
         uniprot.fetch_uniprot(ids, session, batch=UNIPROT_BATCH)
     except Exception as exc:
-        raise Skip(f"UniProt not reachable: {exc}") from None
+        raise Skip(f"UniProt not reachable: {str(exc)[:200]}") from None
     seconds = time.monotonic() - t0
     return seconds / UNIPROT_REQUESTS, {"basis": "requests", "bench_seconds": round(seconds, 2),
                                         "bench_requests": UNIPROT_REQUESTS,
@@ -186,7 +185,7 @@ def _bench_structures(tmp: Path):
         for acc, pdb, chain in STRUCTURE_JOBS:
             structures._pdb_job(tmp, acc, pdb, chain, session)
     except Exception as exc:
-        raise Skip(f"RCSB not reachable: {exc}") from None
+        raise Skip(f"RCSB not reachable: {str(exc)[:200]}") from None
     seconds = time.monotonic() - t0
     n = len(STRUCTURE_JOBS)
     return seconds / n, {"basis": "downloads", "bench_seconds": round(seconds, 2),
@@ -377,10 +376,12 @@ def projected_units(stage: str, s: dict) -> WorkUnits | None:
 # --- estimate ------------------------------------------------------------------------------
 
 def _stage_args(stage: str, layout, nprocs: int):
+    """Default arguments of `stage`. --dry-run is set so units() never records anything
+    (e.g. similarity's name guard would otherwise write failed.tsv): estimate is read-only."""
     from polyphar.cli import build_parser
 
     return build_parser().parse_args([stage, "--run-dir", str(layout.run_dir),
-                                      "--nprocs", str(nprocs)])
+                                      "--nprocs", str(nprocs), "--dry-run"])
 
 
 def estimate_rows(layout, nprocs: int, calib) -> tuple[list[dict], list[str]]:
