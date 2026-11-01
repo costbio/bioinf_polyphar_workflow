@@ -48,7 +48,7 @@ import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from polyphar.stages.fix import H_SEED, reference_platform, seeded_placement
+from polyphar.stages.fix import H_SEED, reference_platform, seeded_placement, strip_date_remark
 
 STAGE = "dock"
 DEFAULT_SEED = 42
@@ -158,12 +158,6 @@ def write_titled_library(sdf_in, sdf_out) -> None:
 
 # --- receptor and box ----------------------------------------------------------------
 
-def _strip_date_remark(text: str) -> str:
-    """Drop OpenMM's dated header line, so the same input gives the same bytes any day."""
-    return "".join(l for l in text.splitlines(keepends=True)
-                   if not l.startswith("REMARK   1 CREATED WITH OPENMM"))
-
-
 def protonate_alphafold(pdb_in, pdb_out, ph: float = AF_PH) -> None:
     """Add hydrogens to an AlphaFold model with pdbfixer (addMissingHydrogens(ph) only:
     no missing residues/atoms, no heterogen removal). Written atomically, without the
@@ -182,7 +176,7 @@ def protonate_alphafold(pdb_in, pdb_out, ph: float = AF_PH) -> None:
         fixer.addMissingHydrogens(ph)
     buf = io.StringIO()
     PDBFile.writeFile(fixer.topology, fixer.positions, buf, keepIds=True)
-    _atomic_text(Path(pdb_out), _strip_date_remark(buf.getvalue()))
+    _atomic_text(Path(pdb_out), strip_date_remark(buf.getvalue()))
 
 
 def receptor_to_pdbqt(pdb, pdbqt) -> None:

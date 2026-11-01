@@ -329,14 +329,14 @@ def test_regression_1q4k_B_matches_2023(tmp_path):
 # --- reproducibility -------------------------------------------------------------------
 
 def _fix_bytes(tmp_dir, text):
-    """Run fix_one on `text` in tmp_dir; return the output bytes without OpenMM's dated header."""
+    """Run fix_one on `text` in tmp_dir; return the raw output bytes."""
     src = Path(tmp_dir) / "structures" / "P25815" / "2mjw_B.pdb"
     src.parent.mkdir(parents=True)
     src.write_text(text)
     fix_one(src, Path(tmp_dir) / "structures", Path(tmp_dir) / "out")
-    out = (Path(tmp_dir) / "out" / "P25815" / "2mjw_B.pdb").read_text()
-    return "".join(l for l in out.splitlines(keepends=True)
-                   if not l.startswith("REMARK   1 CREATED WITH OPENMM")).encode()
+    out = (Path(tmp_dir) / "out" / "P25815" / "2mjw_B.pdb").read_bytes()
+    assert b"CREATED WITH OPENMM" not in out
+    return out
 
 
 def _fix_bytes_in_child(tmp_dir, text):   # module level: picklable for the spawn pool

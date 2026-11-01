@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import contextlib
 import glob
+import io
 import os
 import random
 import tempfile
@@ -39,6 +40,12 @@ def reference_platform():
     import openmm
 
     return openmm.Platform.getPlatformByName("Reference")
+
+
+def strip_date_remark(text: str) -> str:
+    """Drop OpenMM's dated header line, so the same input gives the same bytes any day."""
+    return "".join(l for l in text.splitlines(keepends=True)
+                   if not l.startswith("REMARK   1 CREATED WITH OPENMM"))
 
 
 @contextlib.contextmanager
@@ -130,9 +137,11 @@ def fix_one(src, structures_dir, out_dir, ph: float = DEFAULT_PH, token: str = "
             fixer.addMissingAtoms(seed=H_SEED)
             fixer.addMissingHydrogens(ph)
             fixer.removeHeterogens(keepWater=False)
+        buf = io.StringIO()
+        PDBFile.writeFile(fixer.topology, fixer.positions, buf)
         with os.fdopen(fd, "w") as fh:
             fd = None
-            PDBFile.writeFile(fixer.topology, fixer.positions, fh)
+            fh.write(strip_date_remark(buf.getvalue()))
         if not _done(tmp):
             raise ValueError("pdbfixer produced no ATOM records")
         os.chmod(tmp, 0o644)   # mkstemp creates 0600
