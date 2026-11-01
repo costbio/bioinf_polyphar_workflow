@@ -631,3 +631,138 @@ def test_wrapper_starts_and_stops_worker(tmp_path):
     q = layout.pockets / "queue"
     assert not [n for n in os.listdir(q) if n.startswith("WORKER.")]
     assert (q / "CLOSED").exists()
+
+
+# --- final review items 5, 6, 11 --------------------------------------------------------
+
+def test_job_timeout_kills_the_process_group_and_fails_the_job(tmp_path):
+    layout = _make_run(tmp_path, ["2mjw_B"])
+    t0 = time.monotonic()
+    r = subprocess.run(_worker_cmd(tmp_path, FAKE, "--job-timeout", "1"),
+                       env=_env(FAKE_DOGSITE_SLEEP="3"), capture_output=True, text=True,
+                       timeout=60)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert time.monotonic() - t0 < 3 + 3 + 2      # preflight sleeps 3 s, the job 1 s
+    assert _queue(layout) == ["P25815_2mjw_B.failed"]
+    failed = json.loads((layout.pockets / "queue" / "P25815_2mjw_B.failed").read_text())
+    assert failed["reason"] == "timeout after 1 s"
+    assert list((layout.pockets / "P25815").iterdir()) == []    # partial .pml removed
+    assert _no_fake_running()
+    assert pockets._failure_reason(failed).startswith("timeout after 1 s")
+
+
+def test_job_timeout_must_be_positive(tmp_path):
+    r = subprocess.run(_worker_cmd(tmp_path, FAKE, "--job-timeout", "0"), env=_env(),
+                       capture_output=True, text=True)
+    assert r.returncode == 2 and "--job-timeout" in r.stderr
+
+
+def test_closed_stdout_does_not_kill_the_worker(tmp_path):
+    """Once stdout breaks (ssh drop, closed pipe), logging must not fail a job after its
+    .done, and the worker goes on; messages still reach the worker log file."""
+    layout = _make_run(tmp_path, ["2mjw_B", "2mjw_C", "1abc_A"])
+    p = subprocess.Popen(_worker_cmd(tmp_path, FAKE, "--nprocs", "1"), env=_env(),
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    p.stdout.close()           # the reader is gone: every write to stdout fails (EPIPE)
+    _, err = p.communicate(timeout=60)
+    assert p.returncode == 0, err
+    assert _queue(layout) == ["P25815_1abc_A.done", "P25815_2mjw_B.done",
+                              "P25815_2mjw_C.done"]   # and no .failed
+    log = (layout.logs / "dogsite-worker.log").read_text()
+    assert "done P25815_2mjw_B" in log and "done P25815_1abc_A" in log
+
+
+def test_finish_never_writes_failed_after_done(tmp_path, monkeypatch):
+    w = _load_worker_module()
+    layout = _make_run(tmp_path, ["2mjw_B"])
+    worker = w.Worker(str(tmp_path), str(FAKE), 1, False)
+    jid, running = worker.claim_next()
+
+    def boom(*a, **kw):
+        raise OSError(5, "Input/output error")
+    real_log = w.log
+    calls = []
+
+    def log_after_done(msg):
+        calls.append(msg)
+        if msg.startswith("done"):
+            boom()
+        real_log(msg)
+    monkeypatch.setattr(w, "log", log_after_done)
+    worker.run_job(jid, running)
+    assert _queue(layout) == ["P25815_2mjw_B.done"]
+
+
+def test_log_swallows_broken_stdout(monkeypatch, capsys):
+    w = _load_worker_module()
+
+    class Broken:
+        def write(self, s):
+            raise BrokenPipeError(32, "Broken pipe")
+
+        def flush(self):
+            raise BrokenPipeError(32, "Broken pipe")
+    monkeypatch.setattr(w.sys, "stdout", Broken())
+    w.log("anything")    # does not raise
+    assert not isinstance(w.sys.stdout, Broken)   # stdout dropped for the rest of the run
+    w.sys.stdout.close()
+
+
+def test_heartbeat_sets_explicit_wall_clock_times(tmp_path, monkeypatch):
+    """NFS: utime(path, None) lets the server stamp its own clock; the heartbeat sets
+    time.time() explicitly, the clock the container compares with."""
+    w = _load_worker_module()
+    (tmp_path / "04_pockets" / "queue").mkdir(parents=True)
+    worker = w.Worker(str(tmp_path), str(FAKE), 1, False)
+    seen = []
+    real = os.utime
+    monkeypatch.setattr(w.os, "utime", lambda path, times=None: seen.append(times)
+                        or real(path, times))
+    monkeypatch.setattr(w.time, "time", lambda: 1_700_000_000.0)
+    worker.touch_heartbeat()
+    assert seen == [(1_700_000_000.0, 1_700_000_000.0)]
+    assert os.stat(worker.heartbeat).st_mtime == 1_700_000_000.0
+
+
+def test_wrapper_passes_job_timeout(tmp_path):
+    run_dir, env = _fake_docker_env(tmp_path, POLYPHAR_DOGSITE_JOB_TIMEOUT="123")
+    r = subprocess.run([str(WRAPPER), "pockets"], env=env, capture_output=True, text=True,
+                       timeout=60)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "--job-timeout 123" in (run_dir / "docker_saw_cmd").read_text()
+
+
+def test_wrapper_stops_the_container_when_the_worker_dies(tmp_path):
+    run_dir, env = _fake_docker_env(tmp_path, FAKE_DOCKER_SLEEP="30")
+    p = subprocess.Popen([str(WRAPPER), "pockets"], env=env, stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE, text=True)
+    try:
+        _wait_until(lambda: (run_dir / "docker_saw_cmd").exists(), proc=p)
+        q = run_dir / "04_pockets" / "queue"
+        pid = int(next(n for n in os.listdir(q) if n.startswith("WORKER.")).rsplit(".", 1)[1])
+        t0 = time.monotonic()
+        os.kill(pid, signal.SIGKILL)
+        _, err = p.communicate(timeout=30)
+    finally:
+        if p.poll() is None:
+            p.kill()
+    assert p.returncode != 0
+    assert time.monotonic() - t0 < 15
+    assert "DoGSiteScorer worker exited" in err and "stopping the container" in err
+    sleeping = subprocess.run(["pgrep", "-f", "sleep 30"], capture_output=True, text=True)
+    assert sleeping.stdout.strip() == ""
+
+
+def test_wrapper_lets_the_worker_exit_once_the_queue_is_closed(tmp_path):
+    run_dir, env = _fake_docker_env(tmp_path, FAKE_DOCKER_SLEEP="4")
+    p = subprocess.Popen([str(WRAPPER), "pockets"], env=env, stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE, text=True)
+    try:
+        _wait_until(lambda: (run_dir / "docker_saw_cmd").exists(), proc=p)
+        (run_dir / "04_pockets" / "queue" / "CLOSED").write_text("")   # pockets finished
+        _, err = p.communicate(timeout=30)
+    finally:
+        if p.poll() is None:
+            p.kill()
+    assert p.returncode == 0, err
+    assert "stopping the container" not in err

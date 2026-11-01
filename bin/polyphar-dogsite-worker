@@ -10,8 +10,9 @@ Queue protocol (paths in job files are relative to the run folder):
   <id>.job                    {"model": ..., "out": ..., "size": <bytes>}
   <id>.running.<host>.<pid>   claimed by os.rename (atomic): no job is run twice
   <id>.done                   {"exit": 0, "seconds": s, "dogsite_sha256": ...}
-  <id>.failed                 {"exit": n, "stderr_tail": ...}
-  WORKER.<host>.<pid>         heartbeat, touched every 30 s while the worker lives
+  <id>.failed                 {"exit": n, "stderr_tail": ...} (+ "reason" for a timeout)
+  WORKER.<host>.<pid>         heartbeat, touched every 30 s while the worker lives (mtime set
+                              explicitly to this host's time.time(), also on NFS)
   CLOSED                      written by the container when every job is done or failed
 """
 
@@ -36,6 +37,8 @@ POLL_S = 5.0
 HEARTBEAT_S = 30.0
 STALE_HEARTBEAT_S = 120.0     # a claim whose worker heartbeat is older than this is stale
 DEFAULT_PREFLIGHT_TIMEOUT = 600.0
+DEFAULT_JOB_TIMEOUT = 6 * 3600.0
+LOG_REL = os.path.join("logs", "dogsite-worker.log")
 DOGSITE_FLAGS = ["-s", "-i", "-y", "-d", "-w", "4"]
 STDERR_TAIL = 2000
 HINT = "license/installation problem — see README §DoGSiteScorer"
@@ -66,7 +69,12 @@ process is gone, or their WORKER.<host>.<pid> heartbeat is missing or older than
 (a reused pid after a reboot). On SIGTERM / SIGHUP / SIGINT, running DoGSiteScorer
 processes are killed, their partial outputs removed and their jobs put back in the queue.
 A job whose setup fails (e.g. its output directory cannot be created) is recorded as
-failed; the worker goes on. Input files are never modified.
+failed; the worker goes on. A DoGSiteScorer run longer than --job-timeout (default 6 h)
+is killed (its whole process group), its partial outputs removed and the job recorded
+as failed (`timeout after N s`). Input files are never modified.
+
+Log lines go to stdout and to <run>/logs/dogsite-worker.log; a broken stdout (closed
+terminal, ssh drop) never stops the worker.
 
 exit status: 0 ok (failed jobs are recorded in <id>.failed), 2 usage error,
              3 preflight / benchmark failure, 128+N killed by signal N
@@ -108,9 +116,28 @@ def ignore_signals():
         signal.signal(sig, _ignore)
 
 
+LOG_FILE = None   # <run>/logs/dogsite-worker.log once a Worker serves a run folder
+
+
 def log(msg):
-    sys.stdout.write("%s dogsite-worker: %s\n" % (datetime.now().strftime("%H:%M:%S"), msg))
-    sys.stdout.flush()
+    """One line to stdout and to the worker log file. Never raises: a broken stdout
+    (EPIPE / EIO after an ssh drop) must not turn a finished job into a failure."""
+    line = "%s dogsite-worker[%d]: %s\n" % (datetime.now().strftime("%H:%M:%S"),
+                                            os.getpid(), msg)
+    try:
+        sys.stdout.write(line)
+        sys.stdout.flush()
+    except (OSError, ValueError):
+        try:   # stop writing to it; also keeps the interpreter's exit flush quiet
+            sys.stdout = open(os.devnull, "w")
+        except OSError:
+            pass
+    if LOG_FILE:
+        try:
+            with open(LOG_FILE, "a", encoding="utf-8") as fh:
+                fh.write(datetime.now().strftime("%Y-%m-%d ") + line)
+        except OSError:
+            pass
 
 
 def sha256_file(path):
@@ -318,8 +345,9 @@ def benchmark(dogsite, timeout=DEFAULT_PREFLIGHT_TIMEOUT):
 # --- the queue --------------------------------------------------------------------------
 
 class Worker:
-    def __init__(self, run_dir, dogsite, nprocs, watch):
+    def __init__(self, run_dir, dogsite, nprocs, watch, job_timeout=DEFAULT_JOB_TIMEOUT):
         self.run_dir = os.path.realpath(run_dir)
+        self.job_timeout = job_timeout
         self.qdir = os.path.join(self.run_dir, QUEUE_REL)
         self.dogsite = dogsite
         self.sha = sha256_file(dogsite)
@@ -331,6 +359,7 @@ class Worker:
         self.heartbeat = os.path.join(self.qdir, "WORKER." + self.tag)
         self.lock = threading.Lock()
         self.procs = {}          # job id -> Popen, while DoGSiteScorer runs
+        self.finished = set()    # claims whose .done / .failed is written
         self.stopping = False
 
     # -- paths --
@@ -349,7 +378,10 @@ class Worker:
     def touch_heartbeat(self):
         with open(self.heartbeat, "a"):
             pass
-        os.utime(self.heartbeat, None)
+        # explicit times: utime(path, None) lets an NFS server stamp its own clock, while
+        # the container compares heartbeats with this host's time.time()
+        t = time.time()
+        os.utime(self.heartbeat, (t, t))
 
     # -- claims --
     def worker_gone(self, host, pid):
@@ -420,8 +452,8 @@ class Worker:
         try:
             self._run_job(jid, running)
         except Exception as exc:
-            if self.stopping:
-                return   # unclaimed by the main thread
+            if self.stopping or running in self.finished:
+                return   # unclaimed by the main thread / already done: never .failed after .done
             self.finish(jid, running, ".failed",
                         {"exit": -1, "stderr_tail": "worker error: %s: %s"
                          % (type(exc).__name__, exc)})
@@ -454,12 +486,25 @@ class Worker:
                             {"exit": -1, "stderr_tail": "cannot start DoGSiteScorer: %s" % exc})
                 return
             self.procs[jid] = proc
+        timed_out = False
         try:
-            _, err = proc.communicate()
+            try:
+                _, err = proc.communicate(timeout=self.job_timeout)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                killpg(proc, signal.SIGKILL)   # the whole group: no orphan keeps writing
+                _, err = proc.communicate()
         finally:
             with self.lock:
                 self.procs.pop(jid, None)
         seconds = time.monotonic() - t0
+        if timed_out and not self.stopping:
+            remove_outputs(out)
+            reason = "timeout after %g s" % self.job_timeout
+            self.finish(jid, running, ".failed", {"exit": proc.returncode, "reason": reason,
+                                                  "stderr_tail": tail(err or "")})
+            log("FAILED %s (%s)" % (jid, reason))
+            return
         if proc.returncode == 0 and os.path.isfile(desc):
             self.finish(jid, running, ".done",
                         {"exit": 0, "seconds": round(seconds, 3), "dogsite_sha256": self.sha})
@@ -475,6 +520,7 @@ class Worker:
 
     def finish(self, jid, running, suffix, obj):
         write_json(self.q(jid + suffix), obj)
+        self.finished.add(running)
         unlink(self.q(running))
 
     def kill_all(self):
@@ -534,7 +580,13 @@ class Worker:
                 self.unclaim(name[:-len(suffix)], name)
 
     def serve(self):
+        global LOG_FILE
         os.makedirs(self.qdir, exist_ok=True)
+        try:
+            os.makedirs(os.path.join(self.run_dir, "logs"), exist_ok=True)
+            LOG_FILE = os.path.join(self.run_dir, LOG_REL)
+        except OSError:
+            LOG_FILE = None
         self.reclaim_stale()
         self.touch_heartbeat()
         try:
@@ -573,7 +625,12 @@ def parse_args(argv):
     p.add_argument("--preflight-timeout", type=float, default=DEFAULT_PREFLIGHT_TIMEOUT,
                    help="seconds the preflight (and each benchmark run) may take "
                         "(default: %g)" % DEFAULT_PREFLIGHT_TIMEOUT)
+    p.add_argument("--job-timeout", type=float, default=DEFAULT_JOB_TIMEOUT,
+                   help="seconds one DoGSiteScorer job may take before it is killed and "
+                        "recorded as failed (default: %g)" % DEFAULT_JOB_TIMEOUT)
     args = p.parse_args(argv)
+    if not args.job_timeout > 0:
+        p.error("--job-timeout must be > 0")
     if args.nprocs < 1:
         p.error("--nprocs must be >= 1")
     if not args.preflight_timeout > 0:
@@ -600,7 +657,8 @@ def main(argv=None):
             status = preflight(args.dogsite, args.preflight_timeout)
         if status != 0 or not args.run_dir:
             return status
-        return Worker(args.run_dir, args.dogsite, args.nprocs, args.watch).serve()
+        return Worker(args.run_dir, args.dogsite, args.nprocs, args.watch,
+                      args.job_timeout).serve()
     except Stop as stop:
         log("stopped by signal %d" % stop.signum)
         return 128 + stop.signum

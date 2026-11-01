@@ -23,7 +23,9 @@ Queue protocol (paths in job files are RELATIVE to the run folder, so the contai
   <id>.running.<host>.<pid>      claimed by a worker (atomic os.rename)
   <id>.done                      {"exit": 0, "seconds": s, "dogsite_sha256": ...}
   <id>.failed                    {"exit": n, "stderr_tail": ...}
-  WORKER.<host>.<pid>            worker heartbeat (touched every 30 s)
+  WORKER.<host>.<pid>            worker heartbeat (touched every 30 s; a priority-1
+                                 warning repeats hourly while none is fresh, and the stage
+                                 fails after --worker-dead-after without any)
   CLOSED                         written here once every job is done or failed
 A model is done when <out>_desc.txt exists and no job for it is queued or running.
 Interrupting the wait is safe: the stage is resumable and queued jobs stay queued.
@@ -45,6 +47,8 @@ STAGE = "pockets"
 QUEUE = "queue"
 POLL_S = 5.0
 DEFAULT_WORKER_TIMEOUT = 600.0
+DEFAULT_WORKER_DEAD_AFTER = 6 * 3600.0
+NO_WORKER_REPEAT_S = 3600.0
 REASON_NO_FIXED = "no pdbfixer output"
 NO_WORKER = ("No DoGSiteScorer worker is consuming the queue — "
              "start bin/polyphar-dogsite-worker on the host")
@@ -53,8 +57,12 @@ NO_WORKER = ("No DoGSiteScorer worker is consuming the queue — "
 def add_arguments(parser) -> None:
     parser.add_argument(
         "--worker-timeout", type=float, default=DEFAULT_WORKER_TIMEOUT,
-        help="seconds without a host worker heartbeat before one warning notification "
-             f"(default: {DEFAULT_WORKER_TIMEOUT:g})")
+        help="seconds without a host worker heartbeat before a priority-1 warning, repeated "
+             f"hourly (default: {DEFAULT_WORKER_TIMEOUT:g})")
+    parser.add_argument(
+        "--worker-dead-after", type=float, default=DEFAULT_WORKER_DEAD_AFTER,
+        help="seconds without any host worker heartbeat before the stage fails (queued "
+             f"jobs stay queued; default: {DEFAULT_WORKER_DEAD_AFTER:g})")
 
 
 # --- inputs / outputs ----------------------------------------------------------------
@@ -208,6 +216,8 @@ def _read_json(path: Path) -> dict:
 
 def _failure_reason(info: dict) -> str:
     tail = " ".join(str(info.get("stderr_tail", "")).split())
+    if info.get("reason"):   # e.g. the worker's `timeout after N s`
+        return str(info["reason"]) + (f": {tail}" if tail else "")
     return f"dogsite exit {info.get('exit', '?')}" + (f": {tail}" if tail else "")
 
 
@@ -222,11 +232,14 @@ def _notify(progress, title, message, priority=1) -> None:
 
 
 def wait_for_queue(layout, progress, worker_timeout: float = DEFAULT_WORKER_TIMEOUT, *,
-                   jobs: list[str] | None = None) -> dict:
+                   jobs: list[str] | None = None,
+                   worker_dead_after: float = DEFAULT_WORKER_DEAD_AFTER) -> dict:
     """Wait until every job in `jobs` (default: those queued or running now) is done or
     failed, advancing `progress` per job weighted by model size. Failed jobs go to
-    failed.tsv. If no worker heartbeat is newer than `worker_timeout` seconds, one
-    priority-1 notification is sent and the wait goes on. Writes CLOSED at the end."""
+    failed.tsv. While no worker heartbeat is newer than `worker_timeout` seconds, a
+    priority-1 notification is sent every NO_WORKER_REPEAT_S (hourly); after
+    `worker_dead_after` seconds without any heartbeat the wait fails (RuntimeError; the
+    jobs stay queued). Writes CLOSED at the end of a successful wait."""
     qdir = _queue_dir(layout)
     qdir.mkdir(parents=True, exist_ok=True)
     if jobs is None:
@@ -236,7 +249,7 @@ def wait_for_queue(layout, progress, worker_timeout: float = DEFAULT_WORKER_TIME
     remaining = list(dict.fromkeys(jobs))
     done = failed = 0
     started = time.time()
-    warned = False
+    warned_at = None
     while True:
         state, heartbeats = _queue_state(qdir)
         still = []
@@ -261,10 +274,20 @@ def wait_for_queue(layout, progress, worker_timeout: float = DEFAULT_WORKER_TIME
                 last_seen = max(last_seen, hb.stat().st_mtime)
             except OSError:
                 pass
-        if not warned and time.time() - last_seen > worker_timeout:
-            warned = True
-            print(f"{STAGE}: {NO_WORKER}", flush=True)
-            _notify(progress, f"{STAGE}: no worker", NO_WORKER, priority=1)
+        now = time.time()   # the clock the worker stamps its heartbeat with (os.utime)
+        silent = now - last_seen
+        if silent > worker_dead_after:
+            raise RuntimeError(
+                f"no DoGSiteScorer worker heartbeat for {silent:.0f} s (--worker-dead-after "
+                f"{worker_dead_after:g}); {len(remaining)} job(s) stay queued in "
+                f"{qdir} for the next run")
+        if silent > worker_timeout:
+            if warned_at is None or now - warned_at >= NO_WORKER_REPEAT_S:
+                warned_at = now
+                print(f"{STAGE}: {NO_WORKER} (no heartbeat for {silent:.0f} s)", flush=True)
+                _notify(progress, f"{STAGE}: no worker", NO_WORKER, priority=1)
+        else:
+            warned_at = None
         time.sleep(POLL_S)
     (qdir / "CLOSED").write_text("")
     return {"done": done, "failed": failed}
@@ -497,7 +520,9 @@ def run(layout, args, progress) -> dict:
 
     jobs = enqueue(layout)
     res = wait_for_queue(layout, progress,
-                         getattr(args, "worker_timeout", DEFAULT_WORKER_TIMEOUT), jobs=jobs)
+                         getattr(args, "worker_timeout", DEFAULT_WORKER_TIMEOUT), jobs=jobs,
+                         worker_dead_after=getattr(args, "worker_dead_after",
+                                                   DEFAULT_WORKER_DEAD_AFTER))
     sha = _dogsite_sha(layout, models)
 
     info = _info(layout.protein_info)
@@ -519,7 +544,9 @@ def run(layout, args, progress) -> dict:
               "pockets": len(df), "outside_segment": len(outside),
               "segment_unverified": unverified, "failed": res["failed"] + len(missing)}
     # The manifest is written last: its presence marks the stage as finished.
-    write_manifest(d, STAGE, args={"worker_timeout": getattr(args, "worker_timeout", None)},
+    write_manifest(d, STAGE, args={"worker_timeout": getattr(args, "worker_timeout", None),
+                                   "worker_dead_after": getattr(args, "worker_dead_after",
+                                                                None)},
                    inputs=[layout.protein_info], versions={"dogsite_sha256": sha},
                    counts=counts, timing={})
     return counts

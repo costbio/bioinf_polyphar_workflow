@@ -10,6 +10,8 @@
 #   POLYPHAR_VERSION      image tag (default: latest)
 #   NPROCS                worker processes (passed through)
 #   POLYPHAR_PREFLIGHT_TIMEOUT  seconds the DoGSiteScorer preflight may take (default 600)
+#   POLYPHAR_DOGSITE_JOB_TIMEOUT  seconds one DoGSiteScorer job may take before the worker
+#                         kills it and records it as failed (default 21600 = 6 h)
 #   POLYPHAR_DOCKER_OPTS  extra `docker run` options (word-split on purpose)
 #
 # The container runs in the foreground; for long runs use tmux or nohup.
@@ -49,6 +51,9 @@ image="polyphar:${POLYPHAR_VERSION:-latest}"
 # same value). The container starts only once the worker's preflight passed (its
 # heartbeat appears), waiting at most POLYPHAR_PREFLIGHT_TIMEOUT + 60 s. The worker is
 # stopped by a trap on EXIT/INT/TERM/HUP; the wrapper's exit status stays the container's.
+# If the worker exits while the container runs and the queue is not CLOSED (pockets not
+# finished), the wrapper says so and stops the container (SIGTERM: the run ends with its
+# FAILED notification and summary) instead of letting pockets wait for a dead worker.
 # Host calibration of pockets (worker --benchmark) runs before the container for
 # `benchmark`, and for `run` (including pockets) when calibration.json has no pockets
 # entry yet.
@@ -64,6 +69,12 @@ preflight_timeout="${POLYPHAR_PREFLIGHT_TIMEOUT:-600}"
 case "$preflight_timeout" in
     ''|*[!0-9]*|0)
         echo "polyphar-docker: POLYPHAR_PREFLIGHT_TIMEOUT must be a whole number of seconds > 0" >&2
+        exit 2 ;;
+esac
+job_timeout="${POLYPHAR_DOGSITE_JOB_TIMEOUT:-21600}"
+case "$job_timeout" in
+    ''|*[!0-9]*|0)
+        echo "polyphar-docker: POLYPHAR_DOGSITE_JOB_TIMEOUT must be a whole number of seconds > 0" >&2
         exit 2 ;;
 esac
 worker_nprocs="${NPROCS:-4}"
@@ -168,7 +179,7 @@ if [ "$want_worker" = 1 ]; then
     mkdir -p "$queue"
     rm -f "$queue/CLOSED"   # left by an earlier run; it would stop the new worker
     "$worker" --run-dir "$run_dir" --dogsite "$DOGSITE_BIN" --nprocs "$worker_nprocs" \
-        --preflight-timeout "$preflight_timeout" --watch &
+        --preflight-timeout "$preflight_timeout" --job-timeout "$job_timeout" --watch &
     worker_pid=$!
     # The worker's heartbeat appears once its preflight passed.
     start_deadline=$((SECONDS + preflight_timeout + 60))
@@ -196,6 +207,26 @@ fi
 docker run "${opts[@]}" ${POLYPHAR_DOCKER_OPTS:-} "$image" "$@" &
 docker_pid=$!
 status=0
+if [ -n "$worker_pid" ]; then
+    # watch the worker while the container runs (signals interrupt the 1 s sleep)
+    while kill -0 "$docker_pid" 2>/dev/null; do
+        if [ -n "$worker_pid" ] && ! kill -0 "$worker_pid" 2>/dev/null; then
+            worker_status=0
+            wait "$worker_pid" || worker_status=$?
+            worker_pid=""
+            if [ ! -e "$queue/CLOSED" ]; then
+                echo "polyphar-docker: the DoGSiteScorer worker exited (status $worker_status)" \
+                     "before the pockets queue was closed; stopping the container" >&2
+                kill -TERM "$docker_pid" 2>/dev/null || true
+                wait "$docker_pid" || status=$?
+                docker_pid=""
+                exit "$(( status == 0 ? 1 : status ))"
+            fi
+        fi
+        sleep 1 &
+        wait $! || true
+    done
+fi
 wait "$docker_pid" || status=$?
 docker_pid=""
 exit "$status"

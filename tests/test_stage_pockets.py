@@ -247,6 +247,31 @@ def test_wait_warns_once_without_worker(tmp_path, monkeypatch):
     assert (layout.pockets / "queue" / "CLOSED").exists()
 
 
+def test_wait_repeats_the_warning_and_fails_once_the_worker_is_dead(tmp_path, monkeypatch):
+    monkeypatch.setattr(pockets, "POLL_S", 0.05)
+    monkeypatch.setattr(pockets, "NO_WORKER_REPEAT_S", 0.4)
+    layout = _model_run(tmp_path)
+    jobs = pockets.enqueue(layout)
+    prog = Prog()
+    t0 = time.monotonic()
+    with pytest.raises(RuntimeError, match="no DoGSiteScorer worker heartbeat for"):
+        pockets.wait_for_queue(layout, prog, worker_timeout=0.2, jobs=jobs,
+                               worker_dead_after=1.5)
+    assert 1.5 <= time.monotonic() - t0 < 5
+    assert len(prog.notes) >= 3                      # repeated, not once
+    assert all(n[1] == WARNING and n[2] == 1 for n in prog.notes)
+    assert not (layout.pockets / "queue" / "CLOSED").exists()
+    assert sorted(n for n in os.listdir(layout.pockets / "queue")) == sorted(
+        f"{j}.job" for j in jobs)                    # jobs stay queued for a later run
+
+
+def test_cli_exposes_worker_dead_after():
+    from polyphar import cli
+    assert cli.build_parser().parse_args(["pockets"]).worker_dead_after == 6 * 3600
+    args = cli.build_parser().parse_args(["pockets", "--worker-dead-after", "60"])
+    assert args.worker_dead_after == 60
+
+
 def test_wait_no_warning_with_fresh_heartbeat(tmp_path, monkeypatch):
     monkeypatch.setattr(pockets, "POLL_S", 0.05)
     layout = _model_run(tmp_path)
