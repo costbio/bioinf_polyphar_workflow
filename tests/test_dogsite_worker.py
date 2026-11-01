@@ -308,11 +308,13 @@ def test_cleanup_signal_mask_not_inherited_by_children():
 
 def test_benchmark_times_only_listed_chains(tmp_path, monkeypatch, capsys):
     mod = _load_worker_module()
-    assert mod.BENCH_CHAINS[0] == "2mjw_B.pdb"
+    assert mod.BENCH_CHAINS[0] == "2mjw_B.pdb"   # first = the preflight model
+    assert len(mod.BENCH_CHAINS) == 3
     assert Path(mod.PREFLIGHT_MODEL) == BENCH
     bench = tmp_path / "bench"
     bench.mkdir()
-    shutil.copy(BENCH, bench / "2mjw_B.pdb")
+    for name in mod.BENCH_CHAINS:
+        shutil.copy(BENCH.parent / name, bench / name)
     (bench / "some_pocket.pdb").write_text("ATOM pocket fragment, not a chain\n")
     log = tmp_path / "fake.log"
     monkeypatch.setattr(mod, "BENCH_DIR", str(bench))
@@ -320,10 +322,11 @@ def test_benchmark_times_only_listed_chains(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("FAKE_DOGSITE_LOG", str(log))
     monkeypatch.delenv("FAKE_DOGSITE_SLEEP", raising=False)
     assert mod.benchmark(str(FAKE), 60) == 0
-    assert [Path(l).name for l in log.read_text().splitlines()] == ["2mjw_B.pdb"]
+    assert [Path(l).name for l in log.read_text().splitlines()] == mod.BENCH_CHAINS
     assert (tmp_path / "home" / "calibration.json").is_file()
 
-    (bench / "2mjw_B.pdb").write_text("")          # 0 bytes: no per-byte calibration
+    for name in mod.BENCH_CHAINS:
+        (bench / name).write_text("")              # 0 bytes: no per-byte calibration
     assert mod.benchmark(str(FAKE), 60) == 3
     assert "0 bytes" in capsys.readouterr().err
     monkeypatch.setattr(mod, "BENCH_CHAINS", ["missing.pdb"])

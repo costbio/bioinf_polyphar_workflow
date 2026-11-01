@@ -43,7 +43,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 BENCH_DIR = os.path.join(REPO, "polyphar", "data", "bench")
 # The bench CHAINS (protein models) in BENCH_DIR, timed by --benchmark; the first one is
 # also the preflight model. Other files in BENCH_DIR (pockets, ligands) are not chains.
-BENCH_CHAINS = ["2mjw_B.pdb"]
+BENCH_CHAINS = ["2mjw_B.pdb", "6l49_A.pdb", "5nmm_A.pdb"]
 PREFLIGHT_MODEL = os.path.join(BENCH_DIR, BENCH_CHAINS[0])
 
 EPILOG = """\

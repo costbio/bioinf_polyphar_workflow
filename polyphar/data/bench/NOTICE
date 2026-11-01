@@ -1,0 +1,15 @@
+Benchmark fixtures for `polyphar benchmark` and `bin/polyphar-dogsite-worker --benchmark`.
+
+sample_pockets/   The 16 pocket files of PocketMatch v2.0 `alpha-file_maker/Sample_pockets`,
+                  copied unmodified from https://github.com/1337deepesh/PocketMatch_v2.0
+                  at commit 4648bff3c4d233104c6d1f4ced351b5f7944972a.
+                  PocketMatch is licensed GPL-3.0 (see the upstream repository);
+                  these files remain under that licence.
+2mjw_B.pdb, 6l49_A.pdb, 5nmm_A.pdb
+                  PDB chains extracted from RCSB entries 2MJW, 6L49 and 5NMM (public
+                  data), used as DoGSiteScorer / pdbfixer timing inputs.
+2mjw_A_fixed.pdb  chain A of 2MJW after polyphar.stages.fix.fix_one (pH 7.0).
+2mjw_A_pocket.pdb DoGSiteScorer pocket P_1 of that chain (docking box).
+edrug3d_bench3.sdf  records ID 89, 514 and 666 (24 heavy atoms each = the library median) of the e-Drug3D library (e-Drug3D_2083.sdf),
+                  unchanged (docking timing).
+accessions.txt    100 reviewed human UniProt accessions (UniProt request timing).
