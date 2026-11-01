@@ -14,6 +14,11 @@ independent:
   3. nodes are ranked by degree; the hub is the first non-excluded node, and the targets
      are the hub plus its neighbours (excluded neighbours dropped; hub Similarity 1.0,
      a neighbour's Similarity is its edge Pmax).
+A protein appears at most once in the targets (one row per UniProt ID): a hub row beats
+any non-hub row of the same protein (several hub nodes of one protein: the highest Degree,
+then the smallest Node); otherwise the row with the largest Similarity wins, then the
+smallest Node. This matters only with several hubs (union), where one protein can be reached
+through different pocket nodes.
 Ties at the top degree follow --hub-tie-break: `union` (default) takes every non-excluded
 top-degree node as a hub (targets = hubs + the union of their neighbours; a neighbour of
 several hubs gets its maximum Pmax to any hub); `weighted` and `betweenness` pick one hub
@@ -53,7 +58,8 @@ TARGET_COLUMNS = ["Node", "UniProt_ID", "Gene_Name", "Organism", "Structure_ID",
                   "Protein", "Chain", "Pocket", "Pocket_Path", "Receptor_Path", "Is_Hub"]
 RANK_COLUMNS = ["Node", "UniProt_ID", "Gene_Name", "Degree", "Weighted_Degree",
                 "Degree_Centrality", "Betweenness_Centrality", "Closeness_Centrality"]
-NO_CHAIN = "-"   # Chain for AlphaFold models, as in Protein_info.csv
+AF_CHAIN = "A"   # Chain ID of AlphaFold rows in Protein_info.csv (structures stage)
+NO_CHAIN = "-"   # a PDB-style Protein field without a chain
 
 
 def add_arguments(parser) -> None:
@@ -97,9 +103,9 @@ def split_entry_name(entry: str) -> tuple[str, str]:
 
 def split_protein(protein: str) -> tuple[str, str]:
     """The Pocketsim `Protein` field: `2MJW_B` -> (`2MJW`, `B`), `AF-P06493-F1` ->
-    (`AF-P06493-F1`, `-`). PDB IDs have no underscore, so the first one ends the ID."""
+    (`AF-P06493-F1`, `A`). PDB IDs have no underscore, so the first one ends the ID."""
     if protein.startswith("AF-"):
-        return protein, NO_CHAIN
+        return protein, AF_CHAIN
     pdb, _, chain = protein.partition("_")
     return pdb, chain or NO_CHAIN
 
@@ -242,6 +248,25 @@ def _receptor_paths(G, nodes, protein_info) -> dict[str, str]:
     return paths
 
 
+def _one_row_per_protein(G, sim: dict, hub_set: set) -> dict:
+    """Keep one node per UniProt ID: a hub (highest Degree, then smallest Node), else the
+    node with the largest Similarity (then smallest Node)."""
+    best: dict[str, str] = {}
+    for n in sim:
+        u = G.nodes[n]["uniprot"]
+        cur = best.get(u)
+        if cur is None or _rank_key(G, n, sim, hub_set) < _rank_key(G, cur, sim, hub_set):
+            best[u] = n
+    keep = set(best.values())
+    return {n: s for n, s in sim.items() if n in keep}
+
+
+def _rank_key(G, n, sim, hub_set):
+    if n in hub_set:
+        return (0, -G.degree(n), n)
+    return (1, -sim[n], n)
+
+
 def select_targets(G, ranking, exclude, tie_break: str = "union", hub: str | None = None,
                    protein_info=None):
     """The target table: the hub(s) with Similarity 1.0 and Is_Hub True, plus their
@@ -268,6 +293,7 @@ def select_targets(G, ranking, exclude, tie_break: str = "union", hub: str | Non
             if nb in hub_set or G.nodes[nb]["uniprot"] in exclude:
                 continue
             sim[nb] = max(sim.get(nb, 0.0), data["weight"])
+    sim = _one_row_per_protein(G, sim, hub_set)
     receptors = _receptor_paths(G, sim, protein_info) if protein_info is not None else {}
     rows = []
     for n, s in sim.items():
@@ -286,10 +312,11 @@ def select_targets(G, ranking, exclude, tie_break: str = "union", hub: str | Non
 # --- stage -----------------------------------------------------------------------------
 
 def _exclude(args) -> dict[str, str]:
-    """{UniProt ID: reason} from --exclude (each value may also be comma separated)."""
+    """{UniProt ID: reason} from --exclude: values stripped and upper-cased (each may also
+    be comma separated), so `o15350` works; the manifest records this normalised form."""
     ids = []
     for item in getattr(args, "exclude", list(DEFAULT_EXCLUDE)) or []:
-        ids += [x.strip() for x in str(item).split(",") if x.strip()]
+        ids += [x.strip().upper() for x in str(item).split(",") if x.strip()]
     return {u: EXCLUDE_REASONS.get(u, "excluded with --exclude") for u in sorted(set(ids))}
 
 

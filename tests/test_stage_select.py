@@ -45,7 +45,7 @@ def _protein_info(extra_missing=()):
             continue
         rows.append([acc, entry, pdb, chain, "False", "2.0", "X-ray", "0.9",
                      f"02_structures/{acc}/{pdb.lower()}_{chain}.pdb"])
-    rows.append(["P00004", "NEI4_HUMAN", "-", "-", "True", "-", "-", "-",
+    rows.append(["P00004", "NEI4_HUMAN", "-", "A", "True", "-", "-", "-",
                  "02_structures/P00004/AF-P00004-F1.pdb"])
     return pd.DataFrame(rows, columns=["UniProt ID", "Gene Name", "PDB", "Chain ID", "AlphaFold",
                                        "Resolution", "Structure method", "SIFTS coverage", "File"])
@@ -194,6 +194,74 @@ def test_tie_break_deterministic():
     assert expect["weighted"][1] == (HUB1,)
 
 
+def _toy(edges, proteins=None):
+    """Graph from (node, node, Pmax) edges; a node's protein is `proteins.get(node, node)`."""
+    import networkx as nx
+    g = nx.Graph()
+    for a, b, w in edges:
+        for n in (a, b):
+            if n not in g:
+                u = (proteins or {}).get(n, n)
+                g.add_node(n, uniprot=u, entry_name=f"{u}_HUMAN", protein="1AAA_A", pocket=n,
+                           pocket_path="x", structure_id="1AAA", chain="A")
+        g.add_edge(a, b, weight=w)
+    return g
+
+
+def _toy_targets(g, exclude=(), tie_break="union"):
+    ranking = sel.rank_hubs(g, tie_break)
+    return sel.select_targets(g, ranking, set(exclude), tie_break)
+
+
+def test_union_one_row_per_protein_neighbour_reached_twice():
+    # protein X has two pocket nodes, X1 next to hub A1 (0.9) and X2 next to hub B1 (0.8)
+    g = _toy([("A1", "X1", .9), ("A1", "C", .8), ("A1", "D", .75),
+              ("B1", "X2", .8), ("B1", "E", .75), ("B1", "F", .72)],
+             {"X1": "X", "X2": "X"})
+    t = _toy_targets(g)
+    assert set(t[t["Is_Hub"]]["Node"]) == {"A1", "B1"}
+    assert t["UniProt_ID"].is_unique
+    sims = dict(zip(t["Node"], t["Similarity"]))
+    assert "X2" not in sims and sims["X1"] == pytest.approx(0.9)   # max Similarity wins
+    assert len(t) == 7
+
+
+def test_union_one_row_per_protein_hub_protein_reappears_as_neighbour():
+    # protein A is a hub (A1) and another pocket of A (A2) is a neighbour of hub B1
+    g = _toy([("A1", "C", .8), ("A1", "D", .75), ("A1", "E", .72),
+              ("B1", "A2", .99), ("B1", "F", .75), ("B1", "G", .72)],
+             {"A1": "A", "A2": "A"})
+    t = _toy_targets(g)
+    assert t["UniProt_ID"].is_unique and "A2" not in set(t["Node"])
+    row = t.set_index("Node").loc["A1"]
+    assert row["Is_Hub"] and row["Similarity"] == 1.0     # the hub row wins over 0.99
+
+
+def test_union_two_hub_nodes_of_one_protein_keep_the_smallest_node():
+    g = _toy([("A1", "C", .8), ("A1", "D", .75), ("A2", "E", .8), ("A2", "F", .75)],
+             {"A1": "A", "A2": "A"})
+    t = _toy_targets(g)
+    assert t["UniProt_ID"].is_unique
+    assert t[t["Is_Hub"]]["Node"].tolist() == ["A1"]
+    assert set(t["Node"]) == {"A1", "C", "D", "E", "F"}
+
+
+def test_all_tied_two_node_network_gives_two_hubs():   # Cluster4 shape
+    g = _toy([("Q14318", "Q9NUI1", 0.8)])
+    t = _toy_targets(g)
+    assert set(t["Node"]) == {"Q14318", "Q9NUI1"} and t["Is_Hub"].all()
+    assert (t["Similarity"] == 1.0).all() and len(t) == 2
+
+
+def test_excluded_node_tied_at_top_degree_is_not_a_hub():
+    g = _toy([("O15350", "A", .9), ("O15350", "B", .8), ("Y", "C", .9), ("Y", "D", .8)])
+    ranking = sel.rank_hubs(g, "union")
+    assert set(ranking["Node"].iloc[:2]) == {"O15350", "Y"}
+    t = sel.select_targets(g, ranking, {"O15350"}, "union")
+    assert t[t["Is_Hub"]]["Node"].tolist() == ["Y"]
+    assert set(t["Node"]) == {"Y", "C", "D"}
+
+
 def test_no_non_excluded_node_raises():
     _, g = _graph()
     ranking = sel.rank_hubs(g, "weighted")
@@ -212,6 +280,7 @@ def test_entry_name_starting_with_digits():
     assert row["Chain"] == "B" and row["Pocket"] == "P_1"
     af = t.loc[N4]
     assert af["Structure_ID"] == "AF-P00004-F1" and af["Pocket"] == "P_12_1"
+    assert af["Chain"] == "A"   # as in the AlphaFold rows of Protein_info.csv
 
 
 def test_final_targets_columns_and_receptor_paths():
@@ -337,6 +406,23 @@ def test_run_with_inconsistent_run_folder_raises_and_writes_no_outputs(tmp_path)
         sel.run(layout, _args(), Prog())
     assert not layout.final_targets_csv.exists()
     assert not (layout.targets / "manifest.json").exists()
+
+
+def test_empty_network_after_pmax_filter_raises_and_writes_nothing(tmp_path):
+    layout = _run_folder(tmp_path)
+    with pytest.raises(ValueError, match="no protein pair has Pmax >= 0.99"):
+        sel.run(layout, _args(pmax=0.99), Prog())
+    assert not layout.targets.exists() or not any(layout.targets.iterdir())
+
+
+def test_exclude_is_normalised_and_recorded(tmp_path):
+    layout = _run_folder(tmp_path)
+    sel.run(layout, _args(exclude=[" o15350 ", "p00002,p00004"]), Prog())
+    m = json.loads((layout.targets / "manifest.json").read_text())
+    assert list(m["args"]["exclude"]) == ["O15350", "P00002", "P00004"]
+    final = pd.read_csv(layout.final_targets_csv)
+    assert not set(final["UniProt_ID"]) & {"O15350", "P00002", "P00004"}
+    assert sel._exclude(_args(exclude=["o15350"])) == sel._exclude(_args())
 
 
 def test_cli_dry_run_and_defaults(tmp_path, capsys):
