@@ -19,6 +19,7 @@ failures are listed in failed.tsv with the reason.
 
 from __future__ import annotations
 
+import glob
 import os
 import tempfile
 from pathlib import Path
@@ -81,9 +82,10 @@ def units(layout, args) -> WorkUnits:
 
 # --- the work ------------------------------------------------------------------------
 
-def fix_one(src, structures_dir, out_dir, ph: float = DEFAULT_PH) -> None:
+def fix_one(src, structures_dir, out_dir, ph: float = DEFAULT_PH, token: str = "") -> None:
     """Fix `src` and write it to out_dir/<path relative to structures_dir>, atomically.
-    Raises on failure, leaving no output and the input untouched."""
+    `token` (one per stage run) goes into the temp name so the stage can recognise its own
+    leftovers. Raises on failure, leaving no output and the input untouched."""
     from openmm.app import PDBFile
     from pdbfixer import PDBFixer
 
@@ -92,7 +94,7 @@ def fix_one(src, structures_dir, out_dir, ph: float = DEFAULT_PH) -> None:
     out.parent.mkdir(parents=True, exist_ok=True)
     # A unique temp file in the output directory: an orphaned worker, a rerun or a second
     # polyphar process on the same run folder never share a temp name.
-    fd, tmp_name = tempfile.mkstemp(dir=out.parent, prefix=out.name + ".", suffix=".tmp")
+    fd, tmp_name = tempfile.mkstemp(dir=out.parent, prefix=f"{out.name}.{token}." if token else out.name + ".", suffix=".tmp")
     tmp = Path(tmp_name)
     try:
         fixer = PDBFixer(filename=str(src))
@@ -123,11 +125,11 @@ class FixError(RuntimeError):
 _CRASH_ENV = "POLYPHAR_FIX_TEST_CRASH_ON"   # test hook: worker dies hard on this file name
 
 
-def _worker(src, structures_dir, out_dir, ph):
+def _worker(src, structures_dir, out_dir, ph, token=""):
     if os.environ.get(_CRASH_ENV) == Path(src).name:
         os._exit(1)
     try:
-        fix_one(src, structures_dir, out_dir, ph)
+        fix_one(src, structures_dir, out_dir, ph, token)
     except Exception as exc:   # fix_one already removed its .tmp
         raise FixError(f"{type(exc).__name__}: {exc}") from None
 
@@ -137,6 +139,22 @@ def _reason(exc) -> str:
 
 
 REASON_DIED = "worker process died (BrokenProcessPool)"
+
+
+def _new_token() -> str:
+    import uuid
+
+    return uuid.uuid4().hex[:8]
+
+
+def _sweep_own_temps(units, structures_dir, out_dir, token) -> None:
+    """Delete this run's temp files of `units`. Only called once the pool that wrote them
+    is gone (a killed worker leaves its temp behind); other runs' temps (other token) are
+    never touched."""
+    for src in units:
+        out = _out_path(src, structures_dir, out_dir)
+        for tmp in out.parent.glob(f"{glob.escape(out.name)}.{token}.*.tmp"):
+            tmp.unlink(missing_ok=True)
 
 
 def _versions() -> dict:
@@ -164,6 +182,7 @@ def run(layout, args, progress) -> dict:
 
     fixed = 0
     failures: list[tuple[str, str]] = []
+    token = _new_token()
     ctx = multiprocessing.get_context("spawn")   # workers start clean (no fork of a threaded parent)
 
     def item_of(src):
@@ -174,7 +193,12 @@ def run(layout, args, progress) -> dict:
         if todo:
             with ProcessPoolExecutor(max_workers=max(1, args.nprocs), mp_context=ctx) as ex:
                 try:
-                    futures = {ex.submit(_worker, p, layout.structures, d, ph): p for p in todo}
+                    futures = {}
+                    for p in todo:
+                        try:
+                            futures[ex.submit(_worker, p, layout.structures, d, ph, token)] = p
+                        except BrokenProcessPool:   # pool died while submitting: redone alone
+                            broken.append(p)
                     for fut in as_completed(futures):
                         src = futures[fut]
                         try:
@@ -193,11 +217,14 @@ def run(layout, args, progress) -> dict:
         # The pool is dead for everything that was still in flight. Redo those one at a
         # time, each in a fresh single-worker pool, so a crashing structure is attributed
         # to itself and the rest are fixed.
+        # (the pool and its workers are gone, so temps of those units are ours to delete)
+        _sweep_own_temps(broken, layout.structures, d, token)
         for src in sorted(broken, key=todo.index):
             with ProcessPoolExecutor(max_workers=1, mp_context=ctx) as ex:
                 try:
-                    ex.submit(_worker, src, layout.structures, d, ph).result()
+                    ex.submit(_worker, src, layout.structures, d, ph, token).result()
                 except BrokenProcessPool:
+                    _sweep_own_temps([src], layout.structures, d, token)
                     failures.append((item_of(src), REASON_DIED))
                 except Exception as exc:
                     failures.append((item_of(src), _reason(exc)))

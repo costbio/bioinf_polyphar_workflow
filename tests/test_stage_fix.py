@@ -223,6 +223,14 @@ def test_worker_crash_is_attributed_and_stage_continues(tmp_path, small_pdb_text
     layout = _setup(tmp_path, texts)
     _write_info(layout, list(texts))
     monkeypatch.setenv(fix._CRASH_ENV, "2mjw_C.pdb")   # inherited by spawned workers
+    monkeypatch.setattr(fix, "_new_token", lambda: "tok")
+    # temp a killed sibling of the crasher would leave (this run's token), and a foreign one
+    out_dir = layout.pdbfixer / "P25815"
+    out_dir.mkdir(parents=True)
+    ours = out_dir / "2mjw_C.pdb.tok.killed.tmp"
+    foreign = out_dir / "2mjw_C.pdb.othertok.killed.tmp"
+    ours.write_text("ATOM trunc")
+    foreign.write_text("ATOM trunc")
     prog = Prog()
     counts = fix.run(layout, _args(2), prog)
     assert counts == {"inputs": 4, "fixed": 3, "skipped_existing": 0, "failed": 1}
@@ -232,10 +240,39 @@ def test_worker_crash_is_attributed_and_stage_continues(tmp_path, small_pdb_text
     for c in "BDE":
         assert len(_atoms(layout.pdbfixer / "P25815" / f"2mjw_{c}.pdb")) > 100
     assert not (layout.pdbfixer / "P25815" / "2mjw_C.pdb").exists()
-    assert not list(layout.pdbfixer.rglob("*.tmp"))
+    # the run's own leftovers of units redone in isolation are swept; other runs' are not
+    assert list(layout.pdbfixer.rglob("*.tmp")) == [foreign]
     assert (layout.structures / "P25815" / "2mjw_C.pdb").read_text() == small_pdb_text
     assert (layout.pdbfixer / "manifest.json").is_file()
     assert fix.units(layout, _args()).count == 1   # a rerun only retries the crasher
+
+
+def test_submit_race_routes_remaining_units_to_isolation(tmp_path, small_pdb_text, monkeypatch):
+    import concurrent.futures as cf
+    from concurrent.futures.process import BrokenProcessPool
+
+    class BreakingPool(cf.ProcessPoolExecutor):
+        """The main pool breaks while units are still being submitted (3rd submit on)."""
+        n = 0
+
+        def submit(self, *a, **kw):
+            if self._max_workers > 1:
+                BreakingPool.n += 1
+                if BreakingPool.n >= 3:
+                    raise BrokenProcessPool("simulated")
+            return super().submit(*a, **kw)
+
+    monkeypatch.setattr(cf, "ProcessPoolExecutor", BreakingPool)
+    texts = {f"P25815/2mjw_{c}.pdb": small_pdb_text for c in "BCDE"}
+    layout = _setup(tmp_path, texts)
+    _write_info(layout, list(texts))
+    prog = Prog()
+    counts = fix.run(layout, _args(2), prog)
+    assert counts == {"inputs": 4, "fixed": 4, "skipped_existing": 0, "failed": 0}
+    assert len(prog.calls) == 4
+    assert BreakingPool.n >= 3   # the race really was hit
+    assert len(list(layout.pdbfixer.rglob("*.pdb"))) == 4
+    assert not list(layout.pdbfixer.rglob("*.tmp"))
 
 
 def test_worker_exception_crosses_process_boundary_as_message(tmp_path):
