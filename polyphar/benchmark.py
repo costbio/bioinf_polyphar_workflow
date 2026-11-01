@@ -154,8 +154,30 @@ def _bench_dock(tmp: Path):
 def _live_session():
     from polyphar.common import http_session
 
-    # a transient 5xx must not skip the stage, but offline must still fail within seconds
-    return http_session(retries=2, backoff=0.5)
+    return http_session(retries=0)   # attempts and their backoff are handled by _timed_request
+
+
+REQUEST_ATTEMPTS = 3
+RETRY_PAUSE_S = 0.5
+
+
+def _timed_request(fn, attempts: int = REQUEST_ATTEMPTS, pause: float | None = None):
+    """Run fn() until it succeeds (at most `attempts` times, pausing between failures).
+    Returns (seconds of the successful attempt only, number of failed attempts before it):
+    a transient 5xx must not skip the stage, and neither its time nor the pause may inflate
+    the calibration. Raises the last error when every attempt failed."""
+    failed = 0
+    while True:
+        t0 = time.monotonic()
+        try:
+            fn()
+        except Exception:
+            failed += 1
+            if failed >= attempts:
+                raise
+            time.sleep(RETRY_PAUSE_S if pause is None else pause)
+        else:
+            return time.monotonic() - t0, failed
 
 
 def _bench_uniprot(tmp: Path):
@@ -165,31 +187,37 @@ def _bench_uniprot(tmp: Path):
     # fill UNIPROT_REQUESTS full batches; repeated accessions are fine for timing
     ids = (ids * UNIPROT_REQUESTS * UNIPROT_BATCH)[:UNIPROT_REQUESTS * UNIPROT_BATCH]
     session = _live_session()
-    t0 = time.monotonic()
-    try:
-        uniprot.fetch_uniprot(ids, session, batch=UNIPROT_BATCH)
-    except Exception as exc:
-        raise Skip(f"UniProt not reachable: {str(exc)[:200]}") from None
-    seconds = time.monotonic() - t0
-    return seconds / UNIPROT_REQUESTS, {"basis": "requests", "bench_seconds": round(seconds, 2),
-                                        "bench_requests": UNIPROT_REQUESTS,
-                                        "accessions_per_request": UNIPROT_BATCH}
+    total, retries = 0.0, 0
+    for i in range(UNIPROT_REQUESTS):
+        chunk = ids[i * UNIPROT_BATCH:(i + 1) * UNIPROT_BATCH]
+        try:
+            seconds, failed = _timed_request(
+                lambda: uniprot.fetch_uniprot(chunk, session, batch=UNIPROT_BATCH))
+        except Exception as exc:
+            raise Skip(f"UniProt not reachable: {str(exc)[:200]}") from None
+        total += seconds
+        retries += failed
+    return total / UNIPROT_REQUESTS, {"basis": "requests", "bench_seconds": round(total, 2),
+                                      "bench_requests": UNIPROT_REQUESTS, "retries": retries,
+                                      "accessions_per_request": UNIPROT_BATCH}
 
 
 def _bench_structures(tmp: Path):
     from polyphar.stages import structures
 
     session = _live_session()
-    t0 = time.monotonic()
-    try:
-        for acc, pdb, chain in STRUCTURE_JOBS:
-            structures._pdb_job(tmp, acc, pdb, chain, session)
-    except Exception as exc:
-        raise Skip(f"RCSB not reachable: {str(exc)[:200]}") from None
-    seconds = time.monotonic() - t0
+    total, retries = 0.0, 0
+    for acc, pdb, chain in STRUCTURE_JOBS:
+        try:
+            seconds, failed = _timed_request(
+                lambda: structures._pdb_job(tmp, acc, pdb, chain, session))
+        except Exception as exc:
+            raise Skip(f"RCSB not reachable: {str(exc)[:200]}") from None
+        total += seconds
+        retries += failed
     n = len(STRUCTURE_JOBS)
-    return seconds / n, {"basis": "downloads", "bench_seconds": round(seconds, 2),
-                         "bench_requests": n}
+    return total / n, {"basis": "downloads", "bench_seconds": round(total, 2),
+                       "bench_requests": n, "retries": retries}
 
 
 WORKLOADS = {"uniprot": _bench_uniprot, "structures": _bench_structures, "fix": _bench_fix,
@@ -323,10 +351,10 @@ def run_state(layout, done: list[str]) -> tuple[dict, list[str]]:
                 if "pdb_chains_per_accession" not in observed:
                     observed.append("pdb_chains_per_accession")
     if "fix" in done:
-        fixed = list(layout.pdbfixer.glob("*/*.pdb"))
-        put("fixed_chain_bytes", _mean_size(fixed))
-        if fixed:
-            put("pdb_chains_per_accession", len(fixed) / n_acc)
+        # Chains per accession are NOT re-counted here: Protein_info.csv (structures) is the
+        # authority on how many PDB chains exist; fix may drop some, which only shows up in
+        # the pockets-stage size, so only the mean size of the fixed chains is observed.
+        put("fixed_chain_bytes", _mean_size(layout.pdbfixer.glob("*/*.pdb")))
     if "pockets" in done:
         models = _manifest_counts(layout, "pockets").get("models")
         kept = sum(1 for r in _csv_rows(layout.drugscore_csv)

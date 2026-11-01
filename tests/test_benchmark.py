@@ -175,7 +175,7 @@ def test_uniprot_bench_sends_full_batches(tmp_path, monkeypatch):
         seen.append((len(ids), batch))
     monkeypatch.setattr(uniprot, "fetch_uniprot", fake_fetch)
     spc, extra = benchmark._bench_uniprot(tmp_path)
-    assert seen == [(benchmark.UNIPROT_REQUESTS * uniprot.BATCH, uniprot.BATCH)]
+    assert seen == [(uniprot.BATCH, uniprot.BATCH)] * benchmark.UNIPROT_REQUESTS
     assert extra["accessions_per_request"] == uniprot.BATCH and spc > 0
 
 
@@ -231,16 +231,21 @@ def test_run_state_observes_structures_fix_and_pockets(tmp_path):
     write_manifest(layout.pockets, "pockets", {}, [], {}, {"models": 4}, {})
     (layout.pockets / "DrugScore.csv").write_text(
         "idx,drugScore\n0,0.9\n1,0.7\n2,0.5\n3,0.4\n")   # 3 kept
+    layout.targets.mkdir()
+    layout.final_targets_csv.write_text("Protein\nA\nB\n")           # 2 targets
+    layout.inputs.mkdir()
+    (layout.inputs / "e-Drug3D_2083.sdf").write_text("a\n$$$$\nb\n$$$$\nc\n$$$$\n")   # 3
     state, observed = benchmark.run_state(
-        layout, ["ids", "uniprot", "structures", "fix", "pockets"])
-    assert state["accessions"] == 4
+        layout, ["ids", "uniprot", "structures", "fix", "pockets", "select"])
+    assert state["accessions"] == 4 and state["targets"] == 2 and state["ligands"] == 3
     assert state["af_models_per_accession"] == pytest.approx(1 / 4)
     assert state["pdb_chain_bytes"] == pytest.approx(2000)
     assert state["af_model_bytes"] == pytest.approx(5000)
     assert state["fixed_chain_bytes"] == pytest.approx(2500)
-    assert state["pdb_chains_per_accession"] == pytest.approx(1 / 4)   # fix outputs
+    assert state["pdb_chains_per_accession"] == pytest.approx(2 / 4)   # Protein_info PDB rows
     assert state["kept_pockets_per_model"] == pytest.approx(3 / 4)
-    for key in ("af_models_per_accession", "pdb_chain_bytes", "af_model_bytes",
+    for key in ("accessions", "pdb_chains_per_accession", "targets", "ligands",
+                "af_models_per_accession", "pdb_chain_bytes", "af_model_bytes",
                 "fixed_chain_bytes", "kept_pockets_per_model"):
         assert key in observed and state[key] != benchmark.PRIORS[key]
 
@@ -256,3 +261,43 @@ def test_exact_row_comes_from_the_stage_units(tmp_path, monkeypatch):
     assert rows[0]["stage"] == "structures" and rows[0]["kind"] == "exact"
     assert rows[0]["units"] == "7777 (sentinel)"
     assert rows[0]["seconds"] == pytest.approx(7777 * 2.0 / 4)
+
+
+def test_timed_request_counts_only_the_successful_attempt(monkeypatch):
+    import time as _t
+
+    calls = []
+
+    def flaky():
+        calls.append(1)
+        _t.sleep(0.3 if len(calls) == 1 else 0.01)
+        if len(calls) == 1:
+            raise RuntimeError("500")
+
+    seconds, failed = benchmark._timed_request(flaky, pause=0.2)
+    assert failed == 1 and len(calls) == 2
+    assert seconds < 0.2   # neither the failed attempt (0.3 s) nor the pause (0.2 s)
+    with pytest.raises(RuntimeError):
+        benchmark._timed_request(lambda: (_ for _ in ()).throw(RuntimeError("x")),
+                                 attempts=2, pause=0)
+
+
+def test_uniprot_bench_records_retries_and_excludes_failed_attempts(tmp_path, monkeypatch):
+    import time as _t
+
+    from polyphar.stages import uniprot
+
+    state = {"n": 0}
+
+    def flaky_fetch(ids, session, batch=100, on_batch=None):
+        state["n"] += 1
+        _t.sleep(0.01)
+        if state["n"] == 2:   # the second request fails once
+            _t.sleep(0.4)
+            raise RuntimeError("500 error")
+
+    monkeypatch.setattr(uniprot, "fetch_uniprot", flaky_fetch)
+    monkeypatch.setattr(benchmark, "RETRY_PAUSE_S", 0)
+    spc, extra = benchmark._bench_uniprot(tmp_path)
+    assert extra["retries"] == 1 and state["n"] == benchmark.UNIPROT_REQUESTS + 1
+    assert spc < 0.1   # 0.4 s of the failed attempt is not in the cost
