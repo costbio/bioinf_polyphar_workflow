@@ -19,8 +19,10 @@ failures are listed in failed.tsv with the reason.
 
 from __future__ import annotations
 
+import contextlib
 import glob
 import os
+import random
 import tempfile
 from pathlib import Path
 
@@ -28,6 +30,30 @@ from polyphar.common import WorkUnits, append_failure, write_manifest
 
 STAGE = "fix"
 DEFAULT_PH = 7.0
+H_SEED = 0   # seeds OpenMM's random hydrogen / missing-atom placement (deterministic output)
+
+
+def reference_platform():
+    """OpenMM's CPU-independent Reference platform: minimisation results do not depend on
+    the host's CPU/GPU or thread count."""
+    import openmm
+
+    return openmm.Platform.getPlatformByName("Reference")
+
+
+@contextlib.contextmanager
+def seeded_placement(seed: int = H_SEED):
+    """Make pdbfixer/OpenMM placement reproducible. OpenMM's Modeller.addHydrogens places new
+    atoms with Python's `random` (unseeded); the energy minimiser that follows runs on the
+    Reference platform (see reference_platform). The global `random` state is seeded for
+    the block and restored afterwards, so callers' own random streams are untouched.
+    pdbfixer and OpenMM use no numpy RNG here; addMissingAtoms takes `seed=` for its integrator."""
+    state = random.getstate()
+    try:
+        random.seed(seed)
+        yield
+    finally:
+        random.setstate(state)
 
 
 def add_arguments(parser) -> None:
@@ -97,12 +123,13 @@ def fix_one(src, structures_dir, out_dir, ph: float = DEFAULT_PH, token: str = "
     fd, tmp_name = tempfile.mkstemp(dir=out.parent, prefix=f"{out.name}.{token}." if token else out.name + ".", suffix=".tmp")
     tmp = Path(tmp_name)
     try:
-        fixer = PDBFixer(filename=str(src))
-        fixer.findMissingResidues()
-        fixer.findMissingAtoms()
-        fixer.addMissingAtoms()
-        fixer.addMissingHydrogens(ph)
-        fixer.removeHeterogens(keepWater=False)
+        fixer = PDBFixer(filename=str(src), platform=reference_platform())
+        with seeded_placement():
+            fixer.findMissingResidues()
+            fixer.findMissingAtoms()
+            fixer.addMissingAtoms(seed=H_SEED)
+            fixer.addMissingHydrogens(ph)
+            fixer.removeHeterogens(keepWater=False)
         with os.fdopen(fd, "w") as fh:
             fd = None
             PDBFile.writeFile(fixer.topology, fixer.positions, fh)
@@ -164,7 +191,7 @@ def _versions() -> dict:
     import pdbfixer
 
     pf = getattr(pdbfixer, "__version__", None) or importlib.metadata.version("pdbfixer")
-    return {"pdbfixer": pf, "openmm": openmm.__version__}
+    return {"pdbfixer": pf, "openmm": openmm.__version__, "platform": "Reference"}
 
 
 def run(layout, args, progress) -> dict:
@@ -242,7 +269,7 @@ def run(layout, args, progress) -> dict:
     counts = {"inputs": len(inputs), "fixed": fixed,
               "skipped_existing": len(inputs) - len(todo), "failed": len(failures)}
     # The manifest is written last: its presence marks the stage as finished.
-    write_manifest(d, STAGE, args={"nprocs": args.nprocs, "ph": ph},
+    write_manifest(d, STAGE, args={"nprocs": args.nprocs, "ph": ph, "h_seed": H_SEED},
                    inputs=[layout.protein_info], versions=_versions(),
                    counts=counts, timing={})
     return counts

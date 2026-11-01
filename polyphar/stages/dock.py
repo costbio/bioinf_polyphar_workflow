@@ -48,13 +48,15 @@ import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from polyphar.stages.fix import H_SEED, reference_platform, seeded_placement
+
 STAGE = "dock"
 DEFAULT_SEED = 42
 DEFAULT_CHUNK = 50
 DEFAULT_TPJ = 1
 EXHAUSTIVENESS = 12
 NUM_MODES = 12
-AF_H_SEED = 0   # seeds OpenMM's random hydrogen placement (deterministic output)
+AF_H_SEED = H_SEED   # seeds OpenMM's random hydrogen placement (deterministic output)
 AF_PH = 7.0   # AlphaFold receptors: pdbfixer addMissingHydrogens, as the fix stage
 TITLE_PREFIX = "EDRUG3D_"
 RESULT_COLUMNS = ["Pose", "SMINA_Score", "Ligand", "ID", "Pocket"]
@@ -171,20 +173,13 @@ def protonate_alphafold(pdb_in, pdb_out, ph: float = AF_PH) -> None:
     RNG is seeded (AF_H_SEED, state restored afterwards) and the Reference platform is
     used, so the same model always gives the same bytes."""
     import io
-    import random
 
-    import openmm
     from openmm.app import PDBFile
     from pdbfixer import PDBFixer
 
-    fixer = PDBFixer(filename=str(pdb_in),
-                     platform=openmm.Platform.getPlatformByName("Reference"))
-    state = random.getstate()
-    try:
-        random.seed(AF_H_SEED)
+    fixer = PDBFixer(filename=str(pdb_in), platform=reference_platform())
+    with seeded_placement(AF_H_SEED):
         fixer.addMissingHydrogens(ph)
-    finally:
-        random.setstate(state)
     buf = io.StringIO()
     PDBFile.writeFile(fixer.topology, fixer.positions, buf, keepIds=True)
     _atomic_text(Path(pdb_out), _strip_date_remark(buf.getvalue()))

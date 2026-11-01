@@ -170,6 +170,7 @@ def test_manifest_written_last(tmp_path, small_pdb_text):
     assert m["stage"] == "fix"
     assert m["args"]["ph"] == 7.0
     assert m["versions"]["pdbfixer"] and m["versions"]["openmm"]
+    assert m["args"]["h_seed"] == fix.H_SEED
     assert m["counts"] == {"inputs": 1, "fixed": 1, "skipped_existing": 0, "failed": 0}
     assert m["inputs"][0]["path"].endswith("Protein_info.csv")
 
@@ -323,3 +324,62 @@ def test_regression_1q4k_B_matches_2023(tmp_path):
     assert all(k[3] == "OXT" for k in moved), moved
     for k in moved:
         assert sum((a - b) ** 2 for a, b in zip(new[k], old[k])) ** 0.5 < 0.5
+
+
+# --- reproducibility -------------------------------------------------------------------
+
+def _fix_bytes(tmp_dir, text):
+    """Run fix_one on `text` in tmp_dir; return the output bytes without OpenMM's dated header."""
+    src = Path(tmp_dir) / "structures" / "P25815" / "2mjw_B.pdb"
+    src.parent.mkdir(parents=True)
+    src.write_text(text)
+    fix_one(src, Path(tmp_dir) / "structures", Path(tmp_dir) / "out")
+    out = (Path(tmp_dir) / "out" / "P25815" / "2mjw_B.pdb").read_text()
+    return "".join(l for l in out.splitlines(keepends=True)
+                   if not l.startswith("REMARK   1 CREATED WITH OPENMM")).encode()
+
+
+def _fix_bytes_in_child(tmp_dir, text):   # module level: picklable for the spawn pool
+    return _fix_bytes(tmp_dir, text)
+
+
+def _drop_residue_atoms(text):
+    """Strip the side chain of one residue so pdbfixer also has missing atoms to add."""
+    out, seen = [], 0
+    for line in text.splitlines(keepends=True):
+        if line.startswith("ATOM") and line[22:27].strip() == "5" and line[12:16].strip() not in ("N", "CA", "C", "O"):
+            seen += 1
+            continue
+        out.append(line)
+    assert seen, "fixture has no residue 5 side chain"
+    return "".join(out)
+
+
+def test_fix_one_is_reproducible_in_process(tmp_path, small_pdb_text):
+    text = _drop_residue_atoms(small_pdb_text)
+    a = _fix_bytes(tmp_path / "a", text)
+    b = _fix_bytes(tmp_path / "b", text)
+    assert any(l[76:78].strip() == "H" for l in a.decode().splitlines() if l.startswith("ATOM"))
+    assert a == b
+
+
+def test_fix_one_is_reproducible_across_processes(tmp_path, small_pdb_text):
+    from concurrent.futures import ProcessPoolExecutor
+
+    text = _drop_residue_atoms(small_pdb_text)
+    ctx = multiprocessing.get_context("spawn")
+    with ProcessPoolExecutor(max_workers=1, mp_context=ctx) as ex1:
+        a = ex1.submit(_fix_bytes_in_child, tmp_path / "a", text).result()
+    with ProcessPoolExecutor(max_workers=1, mp_context=ctx) as ex2:
+        b = ex2.submit(_fix_bytes_in_child, tmp_path / "b", text).result()
+    assert a == b
+
+
+def test_fix_one_leaves_global_random_state_alone(tmp_path, small_pdb_text):
+    import random
+
+    random.seed(123)
+    expected = [random.random() for _ in range(3)]
+    random.seed(123)
+    _fix_bytes(tmp_path, small_pdb_text)
+    assert [random.random() for _ in range(3)] == expected
