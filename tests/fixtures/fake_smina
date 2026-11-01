@@ -1,0 +1,37 @@
+#!/usr/bin/env python3
+"""Stand-in for smina in the stage tests: two poses per ligand record of -l, scores from
+the ID, ligands whose ID is in $FAKE_SMINA_SKIP_IDS skipped (a ligand without poses), one
+line per call appended to $FAKE_SMINA_CALLS."""
+import os
+import sys
+
+argv = sys.argv[1:]
+if "--version" in argv:
+    print("smina fake 0.0")
+    sys.exit(0)
+opt = {argv[i]: argv[i + 1] for i in range(0, len(argv) - 1) if argv[i].startswith("-")}
+skip = set(filter(None, os.environ.get("FAKE_SMINA_SKIP_IDS", "").split(",")))
+titles, first = [], True
+with open(opt["-l"]) as fh:
+    for line in fh:
+        if first:
+            titles.append(line.strip())
+            first = False
+        if line.strip() == "$$$$":
+            first = True
+out = []
+for t in titles:
+    lid = t.split("_", 1)[1]
+    if lid in skip:
+        continue
+    for pose in (1, 2):
+        out.append(f"{t}\n fake\n\n  0  0  0  0  0  0  0  0  0  0999 V2000\nM  END\n"
+                   f"> <minimizedAffinity>\n{-int(lid) / 10 - pose / 100:.5f}\n\n$$$$\n")
+with open(opt["--out"], "w") as fh:
+    fh.write("".join(out))
+with open(opt["--log"], "w") as fh:
+    fh.write(f"Using random seed: {opt['--seed']}\n")
+calls = os.environ.get("FAKE_SMINA_CALLS")
+if calls:
+    with open(calls, "a") as fh:
+        fh.write(f"{opt['-l']} cpu={opt['--cpu']} n={len(titles)}\n")

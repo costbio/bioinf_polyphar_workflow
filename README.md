@@ -24,3 +24,15 @@ Run any subcommand against a run folder (outputs are owned by you):
     POLYPHAR_RUN_DIR=/path/to/run POLYPHAR_VERSION=dev bin/polyphar-docker ids --txt inputs/ids.txt
 
 The image contains no DoGSiteScorer and no credentials; Pushover settings are read from `$POLYPHAR_HOME/pushover.env` on the host. Tests: `pytest tests/test_docker.py` (needs the built `polyphar:dev` image).
+
+## Docking (`polyphar dock`)
+
+`polyphar dock --library inputs/e-Drug3D_2083.sdf [--seed 42] [--chunk-size 50] [--threads-per-job 1]` docks every ligand into every target in `06_targets/final_targets.csv` with smina. It keeps the legacy settings: `--exhaustiveness 12 --num_modes 12`, and an unpadded box over the pocket's atoms. Each ligand is identified by its library `ID`, never by its title or name.
+
+- **Receptors are protonated once, by pdbfixer at pH 7.0.**
+  - A PDB receptor is the fix-stage output.
+  - An AlphaFold model gets hydrogens only, from pdbfixer `addMissingHydrogens(7.0)` with a seeded RNG.
+  - The PDBQT is written with Open Babel. It keeps those hydrogens, uses Gasteiger charges, and is rigid. It is byte-deterministic, and its sha256 is recorded in the manifest.
+  - The legacy `CorrectForPH(7.4)` + `addh` step is gone. It re-placed hydrogens at random on every conversion, and that alone moved scores by up to 0.9 kcal/mol.
+- **`--threads-per-job` defaults to 1.** A ligand's result does not depend on smina's `--cpu`, on its chunk, or on its position in the chunk (`test_cpu_and_chunk_invariance`). Single-threaded jobs on `nprocs` processes are therefore safe and use the cores best.
+- **Incomplete targets.** If any ligand ID of a target has no poses, the target is incomplete. `07_docking/failed.tsv` lists the missing IDs, and no `df_results_<label>_fixed.csv` is written for that target.
