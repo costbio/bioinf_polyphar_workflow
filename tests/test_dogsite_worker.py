@@ -92,15 +92,15 @@ def test_worker_runs_queue_with_stub(tmp_path):
         assert (done["tool"], done["tool_version"]) == ("dogsite2", "unknown")
         assert done["exit"] == 0 and done["seconds"] >= 0
         assert done["dogsite_sha256"] == sha256_file(FAKE)
-        out = layout.pockets / "P25815" / f"P25815_{name}.pdb"
+        out = layout.pockets / "P25815" / name      # base name: no accession prefix
         assert Path(f"{out}_desc.txt").is_file()
         assert Path(f"{out}_res_P_1.pdb").read_text().startswith("HEADER")
         assert (layout.pdbfixer / "P25815" / f"{name}.pdb").read_text() == f"ATOM {name}\n"
     df = pockets.parse_pockets(layout.pockets, layout.protein_info, "dogsite2")
-    assert list(df["Pocket Filename"]) == [f"P25815_{n}.pdb_res_P_1.pdb"
+    assert list(df["Pocket Filename"]) == [f"{n}_res_P_1.pdb"
                                            for n in ("2mjw_B", "2mjw_C", "1abc_A")]
     assert (df["drugScore"] >= 0.5).all()     # the fake pocket survives the 0.5 cutoff
-    res = lambda n: (layout.pockets / "P25815" / f"P25815_{n}.pdb_res_P_1.pdb").read_text()
+    res = lambda n: (layout.pockets / "P25815" / f"{n}_res_P_1.pdb").read_text()
     assert res("2mjw_B") != res("1abc_A")      # different models, different pockets
 
 
@@ -291,7 +291,7 @@ def test_worker_failure_recorded(tmp_path):
     assert failed["exit"] == 3
     assert "FAIL" in failed["stderr_tail"]
     assert src.read_bytes() == before
-    assert not Path(f"{layout.pockets}/P25815/P25815_FAIL_A.pdb_desc.txt").exists()
+    assert not Path(f"{layout.pockets}/P25815/FAIL_A_desc.txt").exists()
 
 
 def test_two_workers_never_double_claim(tmp_path):
@@ -337,7 +337,7 @@ def test_stale_running_reclaimed(tmp_path):
                        timeout=60)
     assert r.returncode == 0, r.stdout + r.stderr
     assert _queue(layout) == ["P25815_2mjw_B.done", "other.running.elsewhere.1"]
-    assert Path(f"{layout.pockets}/P25815/P25815_2mjw_B.pdb_desc.txt").is_file()
+    assert Path(f"{layout.pockets}/P25815/2mjw_B_desc.txt").is_file()
 
 
 def test_preflight_failure_claims_nothing(tmp_path):

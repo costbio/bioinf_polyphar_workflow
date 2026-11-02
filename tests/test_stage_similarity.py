@@ -71,7 +71,7 @@ def test_name_guard_rejects_long_and_colliding(tmp_path):
 
 
 def test_name_guard_fails_before_pocketmatch_runs(tmp_path):
-    src = FIX / "pockets_net2_P53350" / "P53350" / "P53350_4o56_A.pdb_res_P_1.pdb"
+    src = FIX / "pockets_net2_P53350" / "P53350" / "4o56_A_res_P_1.pdb"
     layout = _run_folder(tmp_path, {("P53350", "P53350_4o56_A.pdb_res_P_1.pdb"): src,
                                     ("Q99999", "Q99999_1abc_A.pdb_res_P_12_10_1.pdb"): src})
     (layout.pockets / "P53350" / "P53350_4o56_A.pdb_res_P_1.pdb").unlink()   # also missing
@@ -88,7 +88,7 @@ def test_name_guard_fails_before_pocketmatch_runs(tmp_path):
 
 
 def test_name_guard_in_units_and_dry_run(tmp_path):
-    src = FIX / "pockets_net2_P53350" / "P53350" / "P53350_4o56_A.pdb_res_P_1.pdb"
+    src = FIX / "pockets_net2_P53350" / "P53350" / "4o56_A_res_P_1.pdb"
     dup = "P53350_4o56_A.pdb_res_P_1.pdb"
     layout = _run_folder(tmp_path, {("P53350", dup): src, ("Q99999", dup): src})
     with pytest.raises(ValueError, match="collide in PocketMatch") as dry:
@@ -106,7 +106,7 @@ def test_name_guard_in_units_and_dry_run(tmp_path):
 # --- inputs --------------------------------------------------------------------------
 
 def test_select_pockets_cutoff_order_and_exact_names(tmp_path):
-    src = FIX / "pockets_net2_P53350" / "P53350" / "P53350_4o56_A.pdb_res_P_1.pdb"
+    src = FIX / "pockets_net2_P53350" / "P53350" / "4o56_A_res_P_1.pdb"
     layout = RunLayout(tmp_path)
     names = [("P53350", "P53350_4o56_A.pdb_res_P_2.pdb", 0.7),
              ("O14746", "AF-O14746-F1.pdb_res_P_1.pdb", 0.5),
@@ -137,7 +137,7 @@ def test_select_pockets_cutoff_order_and_exact_names(tmp_path):
 def test_select_pockets_uses_the_selected_column(tmp_path):
     """A DrugScore.csv written by the pockets stage carries `Selected` (dogsite3: volume
     >= --min-volume; no drugScore column at all): similarity takes exactly those rows."""
-    src = FIX / "pockets_net2_P53350" / "P53350" / "P53350_4o56_A.pdb_res_P_1.pdb"
+    src = FIX / "pockets_net2_P53350" / "P53350" / "4o56_A_res_P_1.pdb"
     layout = RunLayout(tmp_path)
     names = [("P53350", "4o56_A_P_2_res.pdb", 410.0, True),
              ("O14746", "AF-O14746-F1_P_1_1_res.pdb", 300.0, True),
@@ -168,7 +168,7 @@ def test_select_pockets_uses_the_selected_column(tmp_path):
 def test_selection_record_is_the_rule_actually_used(tmp_path):
     """Legacy table: the constant drugScore cutoff (fingerprint payload unchanged from
     before). `Selected` table: no drugscore_cutoff, the pockets manifest's rule instead."""
-    src = FIX / "pockets_net2_P53350" / "P53350" / "P53350_4o56_A.pdb_res_P_1.pdb"
+    src = FIX / "pockets_net2_P53350" / "P53350" / "4o56_A_res_P_1.pdb"
     layout = _run_folder(tmp_path, {("P53350", "4o56_A_P_1_res.pdb"): src})
     paths = sim.select_pockets(layout.pockets)
     assert sim.selection_record(layout) == {"drugscore_cutoff": 0.5}
@@ -186,7 +186,7 @@ def test_selection_record_is_the_rule_actually_used(tmp_path):
 
 
 def test_fingerprint_follows_the_selection(tmp_path):
-    src = FIX / "pockets_net2_P53350" / "P53350" / "P53350_4o56_A.pdb_res_P_1.pdb"
+    src = FIX / "pockets_net2_P53350" / "P53350" / "4o56_A_res_P_1.pdb"
     layout = _run_folder(tmp_path, {("P53350", "4o56_A_P_1_res.pdb"): src,
                                     ("P53350", "4o56_A_P_2_res.pdb"): src})
     paths = sim.select_pockets(layout.pockets)
@@ -300,7 +300,7 @@ def _fake_pm_bin(tmp_path):
 def test_dead_workers_are_not_retried_forever(tmp_path, monkeypatch):
     """Every worker dies: after the first solo probes all die (nothing ever finished), the
     remaining pockets are failed without running instead of one pool each."""
-    src = FIX / "pockets_net2_P53350" / "P53350" / "P53350_4o56_A.pdb_res_P_1.pdb"
+    src = FIX / "pockets_net2_P53350" / "P53350" / "4o56_A_res_P_1.pdb"
     layout = _run_folder(tmp_path, {("P53350", f"P53350_4o56_A.pdb_res_P_{i}.pdb"): src
                                     for i in range(1, 9)})
     monkeypatch.setenv(sim._CRASH_ENV, "*")
@@ -362,7 +362,7 @@ def test_failure_while_stopping_is_not_cached(tmp_path, monkeypatch):
 def test_killed_pocket_is_retried_next_run(tmp_path, monkeypatch):
     """A pocket whose cabbage-core is killed from outside is dropped for this run only:
     the stage does not count as finished and the pocket is counted again."""
-    src = FIX / "pockets_net2_P53350" / "P53350" / "P53350_4o56_A.pdb_res_P_1.pdb"
+    src = FIX / "pockets_net2_P53350" / "P53350" / "4o56_A_res_P_1.pdb"
     layout = _run_folder(tmp_path, {("P1", "a.pdb"): src, ("P2", "b.pdb"): src})
     flag = tmp_path / "oom"
     flag.touch()
@@ -628,7 +628,7 @@ def test_worker_crash_is_attributed(tmp_path, monkeypatch):
 
 
 def test_cli_dry_run(tmp_path, capsys):
-    src = FIX / "pockets_net2_P53350" / "P53350" / "P53350_4o56_A.pdb_res_P_1.pdb"
+    src = FIX / "pockets_net2_P53350" / "P53350" / "4o56_A_res_P_1.pdb"
     layout = _run_folder(tmp_path, {("P53350", f"P53350_4o56_A.pdb_res_P_{i}.pdb"): src
                                     for i in range(1, 6)})
     assert cli.main(["similarity", "--run-dir", str(tmp_path), "--dry-run", "--no-notify",

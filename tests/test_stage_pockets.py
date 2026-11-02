@@ -98,10 +98,10 @@ def test_pocket_filename_preserves_case(tmp_path):
     assert len(df) == 221
     on_disk = {p.name for p in layout.pockets.rglob("*_res_*.pdb")}
     names = set(df["Pocket Filename"])
-    assert "P53350_2ogq_A.pdb_res_P_1.pdb" in names
-    assert "P53350_4h5x_B.pdb_res_P_2_1.pdb" in names
+    assert "2ogq_A_res_P_1.pdb" in names
+    assert "4h5x_B_res_P_2_1.pdb" in names
     assert names == on_disk      # exact case, every file referenced and present
-    assert "P53350_2ogq_a.pdb_res_P_1.pdb" not in names   # the legacy lowercasing
+    assert "2ogq_a_res_P_1.pdb" not in names              # the legacy lowercasing
 
     # columns and values match the legacy DrugScore.csv (except the case-fixed filename)
     out = tmp_path / "DrugScore.csv"
@@ -115,14 +115,20 @@ def test_pocket_filename_preserves_case(tmp_path):
     assert (merged["Gene Name"] == merged["Gene Name_legacy"]).all()
     for col in ("volume", "simpleScore", "drugScore", "siteAtms"):
         assert (merged[col] - merged[f"{col}_legacy"]).abs().max() < 1e-9, col
-    assert (merged["Pocket Filename"].str.lower()
-            == merged["Pocket Filename_legacy"].str.lower()).all()
+    # the base name changed on 2026-11-02 (no accession prefix, no `.pdb` infix, see
+    # out_names); every legacy name still maps onto exactly one new name
+    def modernise(acc, name):
+        base = name[len(acc) + 1:] if name.lower().startswith(f"{acc.lower()}_") else name
+        return base.replace(".pdb_res_", "_res_").lower()
+
+    assert [n.lower() for n in merged["Pocket Filename"]] == [
+        modernise(a, n) for a, n in zip(merged["UniProt ID"], merged["Pocket Filename_legacy"])]
 
 
 def test_parse_pockets_missing_file_raises(tmp_path):
     layout = _net2_run(tmp_path)
-    (layout.pockets / "P53350" / "P53350_4o56_A.pdb_res_P_3.pdb").unlink()
-    with pytest.raises(FileNotFoundError, match="P53350_4o56_A.pdb_res_P_3.pdb"):
+    (layout.pockets / "P53350" / "4o56_A_res_P_3.pdb").unlink()
+    with pytest.raises(FileNotFoundError, match="4o56_A_res_P_3.pdb"):
         pockets.parse_pockets(layout.pockets, layout.protein_info, "dogsite2")
 
 
@@ -130,9 +136,9 @@ def test_parse_pockets_wrong_case_on_disk_raises(tmp_path):
     # Review Focus 2: a file that exists only under another case is not found,
     # even on a case-insensitive filesystem.
     layout = _net2_run(tmp_path)
-    p = layout.pockets / "P53350" / "P53350_2ogq_A.pdb_res_P_1.pdb"
-    p.rename(p.with_name("P53350_2ogq_a.pdb_res_P_1.pdb"))
-    with pytest.raises(FileNotFoundError, match="P53350_2ogq_A.pdb_res_P_1.pdb"):
+    p = layout.pockets / "P53350" / "2ogq_A_res_P_1.pdb"
+    p.rename(p.with_name("2ogq_a_res_P_1.pdb"))
+    with pytest.raises(FileNotFoundError, match="2ogq_A_res_P_1.pdb"):
         pockets.parse_pockets(layout.pockets, layout.protein_info, "dogsite2")
 
 
@@ -144,10 +150,10 @@ def test_af_rows_named_without_prefix(tmp_path):
     assert set(by_id) == {"P25815_2mjw_B", "AF-P25815-F1"}
     af = by_id["AF-P25815-F1"]
     assert af.model == "02_structures/P25815/AF-P25815-F1.pdb"
-    assert af.out == "04_pockets/P25815/AF-P25815-F1.pdb"     # no "P25815_" prefix
+    assert af.out == "04_pockets/P25815/AF-P25815-F1"         # no "P25815_" prefix
     pdb = by_id["P25815_2mjw_B"]
     assert pdb.model == "03_pdbfixer/P25815/2mjw_B.pdb"
-    assert pdb.out == "04_pockets/P25815/P25815_2mjw_B.pdb"
+    assert pdb.out == "04_pockets/P25815/2mjw_B"   # dogsite2 shares the dogsite3 base name
 
     # parsed: Protein is the AF model id, the filename the actual stem
     layout2 = _net2_run(tmp_path / "net2")
@@ -155,7 +161,7 @@ def test_af_rows_named_without_prefix(tmp_path):
     af_rows = df[df["UniProt ID"] == "O14746"]
     assert set(af_rows["Protein"]) == {"AF-O14746-F1"}
     assert set(af_rows["Gene Name"]) == {"TERT_HUMAN"}
-    assert "AF-O14746-F1.pdb_res_P_12_1.pdb" in set(af_rows["Pocket Filename"])
+    assert "AF-O14746-F1_res_P_12_1.pdb" in set(af_rows["Pocket Filename"])
     assert set(df.loc[df["UniProt ID"] == "P53350", "Protein"]) == {"2OGQ_A", "4O56_A", "4H5X_B"}
 
 
@@ -176,12 +182,12 @@ def test_enqueue_idempotent_and_relative_paths(tmp_path):
     assert sorted(snapshot) == ["AF-P25815-F1.job", "P25815_2mjw_B.job"]   # no temp files
     job = json.loads((q / "P25815_2mjw_B.job").read_text())
     assert job == {"model": "03_pdbfixer/P25815/2mjw_B.pdb",
-                   "out": "04_pockets/P25815/P25815_2mjw_B.pdb",
+                   "out": "04_pockets/P25815/2mjw_B",
                    "size": (layout.pdbfixer / "P25815" / "2mjw_B.pdb").stat().st_size,
                    "tool": "dogsite2"}
     af = json.loads((q / "AF-P25815-F1.job").read_text())
     assert af["model"] == "02_structures/P25815/AF-P25815-F1.pdb"
-    assert af["out"] == "04_pockets/P25815/AF-P25815-F1.pdb"
+    assert af["out"] == "04_pockets/P25815/AF-P25815-F1"
     for spec in (job, af):
         assert not os.path.isabs(spec["model"]) and not os.path.isabs(spec["out"])
 
@@ -217,7 +223,7 @@ def test_resume_counts_only_missing_models(tmp_path):
     af = (layout.structures / "P25815" / "AF-P25815-F1.pdb").stat().st_size
     assert wu.count == 2 and wu.cost_basis == "bytes" and sorted(wu.sizes) == sorted([fixed, af])
 
-    _finish(layout, "P25815_2mjw_B", "04_pockets/P25815/P25815_2mjw_B.pdb")
+    _finish(layout, "P25815_2mjw_B", "04_pockets/P25815/2mjw_B")
     wu = pockets.units(layout, SimpleNamespace(nprocs=2, pocket_tool="dogsite2"))
     assert (wu.count, wu.sizes) == (1, [af])
     assert pockets.enqueue(layout, "dogsite2") == ["AF-P25815-F1"]
@@ -323,7 +329,7 @@ def test_run_records_failures_sha_and_drugscore(tmp_path, monkeypatch):
     man = json.loads((layout.pockets / "manifest.json").read_text())
     assert man["versions"]["dogsite_sha256"] == "s1"
     df = pd.read_csv(layout.drugscore_csv, index_col=0)
-    assert list(df["Pocket Filename"]) == ["P25815_2mjw_B.pdb_res_P_1.pdb"]
+    assert list(df["Pocket Filename"]) == ["2mjw_B_res_P_1.pdb"]
     assert list(df["Protein"]) == ["2MJW_B"]
 
 
@@ -372,13 +378,13 @@ def _chimera_run(tmp_path, segments="1:5", others="P22222", icodes=None):
     pockets_res = {"P_1": range(1, 5), "P_2": range(6, 10), "P_3": range(4, 8),
                    "P_4": range(5, 11)}
     desc = "name\tvolume\tdrugScore\n" + "".join(f"{p}\t100\t0.8\n" for p in pockets_res)
-    _put(d / "P11111_9xyz_A.pdb_desc.txt", desc)
+    _put(d / "9xyz_A_desc.txt", desc)
     for p, res in pockets_res.items():
         text = "HEADER File contains complete residues of binding site atoms\n" + "".join(
             _atom(k, 100 + i, 3.0 * i + 0.0004) + _atom(500 + k, 100 + i, 50.0 + i, name="H",
                                                        elem="H")
             for k, i in enumerate(res, 1))
-        _put(d / f"P11111_9xyz_A.pdb_res_{p}.pdb", text)
+        _put(d / f"9xyz_A_res_{p}.pdb", text)
     return layout
 
 
@@ -391,9 +397,9 @@ def test_pockets_outside_the_target_segment_are_dropped(tmp_path):
     assert counts["pockets"] == 2 and counts["segment_unverified"] == 0
     failed = sorted((layout.pockets / "failed.tsv").read_text().splitlines()[1:])
     assert failed == [
-        "P11111/P11111_9xyz_A.pdb_res_P_2.pdb\tpockets\tpocket outside target segment: "
+        "P11111/9xyz_A_res_P_2.pdb\tpockets\tpocket outside target segment: "
         "100% outside; partner(s) P22222",
-        "P11111/P11111_9xyz_A.pdb_res_P_4.pdb\tpockets\tpocket outside target segment: "
+        "P11111/9xyz_A_res_P_4.pdb\tpockets\tpocket outside target segment: "
         "83% outside; partner(s) P22222"]
 
 
@@ -420,7 +426,7 @@ def test_insertion_code_bounds_are_parsed_and_lenient(tmp_path):
 
 def test_pocket_without_any_matching_atom_is_unverified_and_kept(tmp_path):
     layout = _chimera_run(tmp_path)
-    p = layout.pockets / "P11111" / "P11111_9xyz_A.pdb_res_P_2.pdb"
+    p = layout.pockets / "P11111" / "9xyz_A_res_P_2.pdb"
     p.write_text("".join(_atom(k, 7, 900.0 + k) for k in range(3)))
     counts = pockets.run(layout, SimpleNamespace(nprocs=1, worker_timeout=600, pocket_tool="dogsite2"), Prog())
     assert counts["outside_segment"] == 1 and counts["segment_unverified"] == 1
@@ -601,8 +607,7 @@ def test_dogsite3_names_and_job_files(tmp_path):
                    "size": (layout.pdbfixer / "P25815" / "2mjw_B.pdb").stat().st_size,
                    "tool": "dogsite3"}
     assert pockets.pocket_filename("dogsite3", "2mjw_B", "P_1_2") == "2mjw_B_P_1_2_res.pdb"
-    assert pockets.pocket_filename("dogsite2", "P25815_2mjw_B.pdb", "P_1_2") == \
-        "P25815_2mjw_B.pdb_res_P_1_2.pdb"
+    assert pockets.pocket_filename("dogsite2", "2mjw_B", "P_1_2") == "2mjw_B_res_P_1_2.pdb"
 
 
 def test_dogsite3_chain_shared_by_accessions_keeps_the_accession(tmp_path):
@@ -629,6 +634,22 @@ def test_dogsite3_longest_realistic_names_fit_pocketmatch():
     # the long form is only used for chains shared by accessions (rare); it is 33 here and
     # the similarity name guard would report it
     assert len(pockets.pocket_filename("dogsite3", "A0A0B4J2F0_7a8b_AB", "P_12_1")) == 33
+
+
+def test_both_tools_share_the_base_name_and_fit_a_long_chain_id(tmp_path):
+    """Decided 2026-11-02: one base name for both tools, `<pdb>_<chain>`. 2023's dogsite2
+    name `<UniProt>_<pdb>_<chain>.pdb_res_<pocket>.pdb` is 33 characters for PLK1's 9r1w
+    chain AAA (a current PDB entry's multi-character author chain ID), which PocketMatch
+    would truncate and merge with another pocket."""
+    from polyphar.stages.similarity import PM_NAME_LIMIT
+    layout = RunLayout(tmp_path)
+    _write_info(layout, [_row("P53350", "PLK1_HUMAN", "9r1w", "AAA", False)])
+    for tool in ("dogsite2", "dogsite3"):
+        assert pockets.out_names(pd.read_csv(layout.protein_info), tool) == ["9r1w_AAA"]
+        name = pockets.pocket_filename(tool, "9r1w_AAA", "P_1_1")
+        assert len(name) <= PM_NAME_LIMIT, (tool, name)
+        assert pockets._model_of(tool, name) == "9r1w_AAA"     # round-trips
+    assert len("P53350_9r1w_AAA.pdb_res_P_1_1.pdb") == 33      # what 2023 would have written
 
 
 def test_dogsite3_run_writes_tool_selected_and_rule(tmp_path, monkeypatch):

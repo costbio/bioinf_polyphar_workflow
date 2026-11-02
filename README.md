@@ -101,6 +101,9 @@ system `python3` ≥ 3.8 on the host.
 Then follow the quick start: create a run folder, check `run --dry-run`, and start the run
 in `tmux`.
 
+To run the seven v2 subtypes on POSEIDON one stage at a time, with the exact commands, the
+expected ID counts and what to check after each stage, see **[docs/RUNBOOK.md](docs/RUNBOOK.md)**.
+
 ## Quick start
 
 Build the image once from the repo root. The git commit is recorded in every stage manifest.
@@ -419,11 +422,30 @@ here.
   pocket outputs fails before anything is queued (`was made with --pocket-tool X, this run
   asks for Y`); queue records and manifests without a tool are DoGSiteScorer 2 outputs of
   earlier polyphar versions. Use a new run folder to switch tools.
+- **Names (both tools).** `<out>` = `04_pockets/<UniProt>/<pdb>_<chain>` for a PDB chain and
+  `04_pockets/<UniProt>/AF-<acc>-F1` for an AlphaFold model, so pocket files are e.g.
+  `2mjw_B_P_1_res.pdb` (DoGSite3) or `2mjw_B_res_P_1.pdb` (DoGSiteScorer 2), and
+  `AF-P25815-F1_P_1_2_res.pdb`. The UniProt folder already names the accession; only a chain
+  extracted for several accessions (a chimeric chain) keeps the `<UniProt>_` prefix, because
+  PocketMatch keeps base names only and they must stay unique. The longest realistic names
+  (`AF-A0A0B4J2F0-F1_P_12_1_res.pdb`, 31 characters) fit PocketMatch's 32-character limit.
+  The exception is a chimeric chain of a 10-character accession, which keeps the long
+  prefix: `A0A0B4J2F0_7a8b_AB_P_12_1_res.pdb` has 33. `pockets` runs `similarity`'s name
+  guard (≤ 32 characters, no collisions) on the selected pockets at its end and fails with
+  the names listed in `failed.tsv` (no manifest), before `similarity` would.
 - **DoGSiteScorer 2** (BioSolveIT; tested with 2.0.0), the **primary tool**: flags
-  `-s -i -y -d -w 4`, outputs `<UniProt>_<pdb>_<chain>.pdb_desc.txt` / `..._res_P_<n>.pdb`
-  as in 2023, selection `drugScore >= 0.5` (`--drugscore-cutoff`), which is the 2023 rule.
-  Version 2.0.0 reproduces the 2023 drugScore values exactly on the net2 regression chains
-  (setup step 5), so a rerun is comparable with 2023.
+  `-s -i -y -d -w 4`, outputs `<out>_desc.txt` / `<out>_res_P_<n>[_<m>].pdb`, selection
+  `drugScore >= 0.5` (`--drugscore-cutoff`), which is the 2023 rule. Version 2.0.0
+  reproduces the 2023 drugScore values exactly on the net2 regression chains (setup step 5),
+  so a rerun is comparable with 2023.
+  - **The base name is not 2023's.** 2023 wrote `<UniProt>_<pdb>_<chain>.pdb_res_P_<n>.pdb`.
+    A current PDB entry with a multi-character author chain ID breaks PocketMatch's
+    32-character limit that way (`P53350_9r1w_AAA.pdb_res_P_1_1.pdb` is 33), and PocketMatch
+    keeps only base names, so truncation would merge distinct pockets. Decided 2026-11-02:
+    both tools use the same base name, `<pdb>_<chain>` (see **Names** below), so the
+    DoGSiteScorer 2 pocket file of that chain is `9r1w_AAA_res_P_1_1.pdb` (22). The
+    accession is in the enclosing folder and in `DrugScore.csv`'s `UniProt ID` column, so
+    nothing is lost; only file names differ from 2023.
 - **DoGSite3** (ZBH, Universität Hamburg; tested with 1.3.0), the **sensitivity analysis**
   and not the primary tool: install with the ZBH installer (`/opt/ZBH/dogsite3/dogsite3`)
   and activate the license once with `dogsite3 --license <key>`. The worker runs
@@ -434,17 +456,6 @@ here.
   - **Selection: `volume >= 120 Å³`** (`--min-volume`), the cutoff calibrated against the
     2023 drugScore selection (see below). DoGSite3 has no drugScore. Pockets and subpockets
     are judged alike, as drugScore was in 2023.
-  - **Names.** `<out>` = `04_pockets/<UniProt>/<pdb>_<chain>` for a PDB chain and
-    `04_pockets/<UniProt>/AF-<acc>-F1` for an AlphaFold model, so pocket files are e.g.
-    `2mjw_B_P_1_res.pdb` and `AF-P25815-F1_P_1_2_res.pdb`. The UniProt folder already names
-    the accession; only a chain extracted for several accessions (a chimeric chain) keeps
-    the `<UniProt>_` prefix, because PocketMatch keeps base names only and they must stay
-    unique. The longest realistic names (`AF-A0A0B4J2F0-F1_P_12_1_res.pdb`, 31 characters)
-    fit PocketMatch's 32-character limit. The exception is a chimeric chain of a
-    10-character accession, which keeps the long prefix: `A0A0B4J2F0_7a8b_AB_P_12_1_res.pdb`
-    has 33. `pockets` runs `similarity`'s name guard (≤ 32 characters, no collisions) on the
-    selected pockets at its end and fails with the names listed in `failed.tsv` (no manifest),
-    before `similarity` would.
   - **Volumes are much smaller than DoGSiteScorer 2's.** On the same 20 pdbfixer chains of
     the 2023 net2 run, the largest DoGSite3 pocket had a median 0.24× the volume of the
     largest DoGSiteScorer 2 pocket (2OGQ_A, PLK1 kinase domain: 211 vs 546 Å³). Of 523

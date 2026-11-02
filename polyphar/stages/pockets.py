@@ -17,14 +17,17 @@ Inputs (from 02_structures/Protein_info.csv, never globbed):
   AlphaFold == False  model = 03_pdbfixer/<UniProt>/<file name of File>
                       (a missing fixed file is a failure `no pdbfixer output`, not queued)
   AlphaFold == True   model = File itself (02_structures/<UniProt>/AF-<acc>-F1.pdb)
-Outputs, `-o <out>`:
-  dogsite3  <out> = 04_pockets/<UniProt>/<pdb>_<chain>   (PDB chain; <UniProt>_<pdb>_<chain>
-                    when the same <pdb>_<chain> is a model of several accessions, a chimeric
-                    chain: PocketMatch keeps only base names, so they must stay unique)
-                    04_pockets/<UniProt>/AF-<acc>-F1      (AlphaFold model)
-            -> <out>_desc.txt, <out>_P_<n>[_<m>]_res.pdb
-  dogsite2  <out> = 04_pockets/<UniProt>/<UniProt>_<pdb>_<chain>.pdb, or .../AF-<acc>-F1.pdb
-            -> <out>_desc.txt, <out>_res_P_<n>[_<m>].pdb
+Outputs, `-o <out>` (the same base name for both tools):
+  <out> = 04_pockets/<UniProt>/<pdb>_<chain>   (PDB chain; <UniProt>_<pdb>_<chain> when the
+          same <pdb>_<chain> is a model of several accessions, a chimeric chain: PocketMatch
+          keeps only base names, so they must stay unique)
+          04_pockets/<UniProt>/AF-<acc>-F1     (AlphaFold model)
+  dogsite3  -> <out>_desc.txt, <out>_P_<n>[_<m>]_res.pdb
+  dogsite2  -> <out>_desc.txt, <out>_res_P_<n>[_<m>].pdb
+  2023 wrote the dogsite2 base name as <UniProt>_<pdb>_<chain>.pdb, which with a current
+  PDB entry's multi-character chain ID (e.g. P53350 9r1w chain AAA) exceeds PocketMatch's
+  32-character limit; the prefix and the .pdb infix were dropped for that reason (decided
+  2026-11-02), so dogsite2 pocket file names differ from 2023.
   04_pockets/DrugScore.csv   UniProt ID, Gene Name, Protein, Pocket, the tool's descriptor
                              columns, Pocket Filename (the file on disk), Tool, Selected;
                              minus pockets outside the target's SIFTS segment on a fusion
@@ -149,24 +152,22 @@ def _is_af(row) -> bool:
 
 
 def out_names(info, tool: str) -> list[str]:
-    """The `-o` base name of every Protein_info row, in order (see the module docstring)."""
+    """The `-o` base name of every Protein_info row, in order (see the module docstring).
+
+    The same for both tools: `<pdb>_<chain>`, or `<UniProt>_<pdb>_<chain>` when that chain
+    is a model of several accessions (a chimeric chain), because PocketMatch keeps only base
+    names and they must stay unique. `tool` is kept in the signature because the pocket file
+    names built from this base differ (see pocket_filename).
+    """
     rows = info.to_dict("records")
     stems = [Path(str(r["File"])).stem for r in rows]
-    shared = set()
-    if tool == "dogsite3":
-        owners: dict[str, set] = {}
-        for r, stem in zip(rows, stems):
-            if not _is_af(r):
-                owners.setdefault(stem, set()).add(str(r["UniProt ID"]))
-        shared = {stem for stem, accs in owners.items() if len(accs) > 1}
-    out = []
+    owners: dict[str, set] = {}
     for r, stem in zip(rows, stems):
-        acc = str(r["UniProt ID"])
-        if tool == "dogsite2":
-            out.append(f"{stem}.pdb" if _is_af(r) else f"{acc}_{stem}.pdb")
-        else:
-            out.append(f"{acc}_{stem}" if not _is_af(r) and stem in shared else stem)
-    return out
+        if not _is_af(r):
+            owners.setdefault(stem, set()).add(str(r["UniProt ID"]))
+    shared = {stem for stem, accs in owners.items() if len(accs) > 1}
+    return [f"{r['UniProt ID']}_{stem}" if not _is_af(r) and stem in shared else stem
+            for r, stem in zip(rows, stems)]
 
 
 def pocket_filename(tool: str, out_name: str, pocket: str) -> str:
