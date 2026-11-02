@@ -27,9 +27,10 @@ import requests
 from polyphar.common import WorkUnits, http_session, sha256_file, write_manifest
 
 STAGE_DIR = "01_uniprot"
-URL = "https://rest.uniprot.org/uniprotkb/stream"
+URL = "https://rest.uniprot.org/uniprotkb/search"
 FIELDS = "accession,id,gene_primary,reviewed,organism_id,xref_pdb"
 BATCH = 100
+PAGE_SIZE = 500       # rows per page; one BATCH is one page, so pagination rarely kicks in
 TIMEOUT = 60          # seconds per request (http_session has no default timeout)
 HUMAN_TAXID = 9606
 COLUMNS = ["Entry", "Entry Name", "Gene Names (primary)", "Reviewed", "Organism (ID)", "PDB"]
@@ -54,17 +55,47 @@ def parse_uniprot_tsv(text):
 # --- fetching ---------------------------------------------------------------
 
 def _get(session, query, fields, what):
-    """One GET; any failure becomes a RuntimeError naming `what`. Returns (text, release)."""
-    try:
-        resp = session.get(URL, params={"query": query, "fields": fields, "format": "tsv"},
-                           timeout=TIMEOUT)
-        resp.raise_for_status()
-    except requests.exceptions.HTTPError as exc:
-        body = (getattr(exc.response, "text", "") or "").strip().replace("\n", " ")[:300]
-        raise RuntimeError(f"UniProt request failed for {what}: {exc}. {body}") from exc
-    except requests.exceptions.RequestException as exc:
-        raise RuntimeError(f"UniProt request failed for {what}: {exc!r}") from exc
-    return resp.text, resp.headers.get("x-uniprot-release", "")
+    """GET `query`, following UniProt's `next` page links; any failure becomes a
+    RuntimeError naming `what`. Returns (concatenated TSV, release).
+
+    The paginated `search` endpoint is used rather than `stream`: on 2026-11-02 `stream`
+    answered these multi-accession OR-queries with intermittent HTTP 500s (a 100-accession
+    batch failed from two different networks, while `search` returned all rows), and a 500
+    is retried by http_session until the retries run out.
+    """
+    texts, release, seen = [], None, set()
+    url, params = URL, {"query": query, "fields": fields, "format": "tsv", "size": PAGE_SIZE}
+    while url and url not in seen:
+        seen.add(url)
+        try:
+            resp = session.get(url, params=params, timeout=TIMEOUT)
+            resp.raise_for_status()
+        except requests.exceptions.HTTPError as exc:
+            body = (getattr(exc.response, "text", "") or "").strip().replace("\n", " ")[:300]
+            raise RuntimeError(f"UniProt request failed for {what}: {exc}. {body}") from exc
+        except requests.exceptions.RequestException as exc:
+            raise RuntimeError(f"UniProt request failed for {what}: {exc!r}") from exc
+        texts.append(resp.text)
+        if release is None:
+            release = resp.headers.get("x-uniprot-release", "")
+        url = (resp.links.get("next") or {}).get("url")
+        params = None      # a next-link already carries query, fields, format and cursor
+    return _join_tsv(texts), release or ""
+
+
+def _join_tsv(texts):
+    """One TSV from consecutive pages: the first page whole, later pages without
+    their repeated header line (the header is whatever the first page's first line is,
+    so this holds for any `fields`)."""
+    if not texts:
+        return ""
+    header = texts[0].split("\n", 1)[0]
+    out = []
+    for i, text in enumerate(texts):
+        if i and text.split("\n", 1)[0] == header:
+            _, _, text = text.partition("\n")
+        out.append(text if text.endswith("\n") or not text else text + "\n")
+    return "".join(out)
 
 
 def _query(accessions):

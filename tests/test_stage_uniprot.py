@@ -21,10 +21,11 @@ def _sample():
 
 
 class FakeResponse:
-    def __init__(self, text="", status=200, release="2026_03"):
+    def __init__(self, text="", status=200, release="2026_03", next_url=None):
         self.text = text
         self.status_code = status
         self.headers = {"x-uniprot-release": release} if release else {}
+        self.links = {"next": {"url": next_url}} if next_url else {}
 
     def raise_for_status(self):
         if self.status_code >= 400:
@@ -125,6 +126,43 @@ def test_fetch_batches_dedupes_and_returns_release():
     assert release == "2026_03"
     assert df["Entry"].tolist() == ["P25815", "Q9NPD8", "UNREV1", "ECOLI1"]  # OLD1 dup dropped
     assert df.set_index("Entry")["PDB"]["P25815"] == "1J55;1OZO;2MJW;7NMI"
+
+
+def test_fetch_uses_the_search_endpoint_and_follows_next_pages():
+    """One batch spread over pages: the `next` link is followed with no params of ours
+    (it carries its own cursor), repeated headers are dropped, and every row is kept."""
+    pages = [
+        (FakeSession.HEADER + "\n" + ROWS["P25815"] + "\n", "https://rest.uniprot.org/next1"),
+        (FakeSession.HEADER + "\n" + ROWS["Q9NPD8"] + "\n", None),
+    ]
+
+    class Paged(FakeSession):
+        def get(self, url, params=None, timeout=None):
+            assert timeout, "every request must carry a timeout"
+            self.calls.append((url, params))
+            text, nxt = pages[len(self.calls) - 1]
+            return FakeResponse(text, release=self.release, next_url=nxt)
+
+    s = Paged(ROWS)
+    df, release = fetch_uniprot(["P25815", "Q9NPD8"], s, batch=100)
+    assert [c[0] for c in s.calls] == [uniprot.URL, "https://rest.uniprot.org/next1"]
+    assert uniprot.URL.endswith("/uniprotkb/search")     # not /stream: it 500s on OR-queries
+    assert s.calls[0][1]["size"] == uniprot.PAGE_SIZE
+    assert s.calls[1][1] is None
+    assert df["Entry"].tolist() == ["P25815", "Q9NPD8"] and release == "2026_03"
+
+
+def test_fetch_stops_if_a_next_link_repeats():
+    """A server that keeps pointing at the same page must not loop forever."""
+    class Looping(FakeSession):
+        def get(self, url, params=None, timeout=None):
+            self.calls.append(url)
+            return FakeResponse(self.HEADER + "\n" + ROWS["P25815"] + "\n",
+                                release=self.release, next_url=uniprot.URL)
+
+    s = Looping(ROWS)
+    df, _ = fetch_uniprot(["P25815"], s, batch=100)
+    assert s.calls == [uniprot.URL] and df["Entry"].tolist() == ["P25815"]
 
 
 def test_fetch_batch_failure_is_loud_and_names_the_batch():
