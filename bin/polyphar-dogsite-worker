@@ -264,7 +264,8 @@ def _help_text(dogsite):
 def binary_tool(dogsite):
     """Which tool the binary is, from what it says about itself only: the `Tool:` line of
     VERSION_INFO next to it, else its --help text (DoGSite3 names itself or lists its
-    --writeSiteResiduesPDB option; DoGSiteScorer names itself). None when it says neither."""
+    --writeSiteResiduesPDB option; DoGSiteScorer 2.0.0 lists `-i [ --druggability ]`, which
+    DoGSite3 does not have, or names itself). None when it says neither."""
     named = _version_info(dogsite).get("tool", "").lower()
     if named in TOOLS:
         return named
@@ -272,7 +273,7 @@ def binary_tool(dogsite):
     low = text.lower()
     if "dogsite3" in low or "--writesiteresiduespdb" in low:
         return "dogsite3"
-    if "dogsitescorer" in low:
+    if "dogsitescorer" in low or "--druggability" in low:
         return "dogsite2"
     return None
 

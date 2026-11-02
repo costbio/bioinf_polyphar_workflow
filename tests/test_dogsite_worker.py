@@ -23,7 +23,7 @@ REPO = Path(__file__).resolve().parent.parent
 WORKER = REPO / "bin" / "polyphar-dogsite-worker"
 WRAPPER = REPO / "bin" / "polyphar-docker"
 FAKE = REPO / "tests" / "fixtures" / "fake_dogsite"
-# the same fake under a DoGSiteScorer 2 identity (its --help names DoGSiteScorer, not DoGSite3)
+# the same fake under a DoGSiteScorer 2 identity (its --help lists --druggability, as DS2 2.0.0)
 FAKE2 = REPO / "tests" / "fixtures" / "fake_dogsite2"
 BENCH = REPO / "polyphar" / "data" / "bench" / "2mjw_B.pdb"
 HINT = "license/installation problem — see README §Pocket detection (DoGSite3 / DoGSiteScorer)"
@@ -148,7 +148,7 @@ def test_binary_identity_must_match_the_tool(tmp_path):
     """DOGSITE_BIN is checked against --tool before any job (VERSION_INFO / --help only)."""
     mod = _load_worker_module()
     assert mod.binary_tool(str(FAKE)) == "dogsite3"          # help lists --writeSiteResiduesPDB
-    assert mod.binary_tool(str(FAKE2)) == "dogsite2"         # help names DoGSiteScorer
+    assert mod.binary_tool(str(FAKE2)) == "dogsite2"         # help lists --druggability
     d = tmp_path / "zbh"
     d.mkdir()
     shutil.copy(FAKE2, d / "dogsite")                       # DS2-looking help, but ...

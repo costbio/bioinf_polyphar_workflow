@@ -403,7 +403,8 @@ copied or mounted into the image and never committed here.
   job of the other tool (`failed`: `job is for X, this worker runs Y`).
 - **The binary must be the chosen tool.** Before any job, the worker checks `DOGSITE_BIN`
   against `--tool` from what the binary says about itself: the `Tool:` line of `VERSION_INFO`
-  next to it, else its `--help` text (DoGSite3 lists `--writeSiteResiduesPDB`). DoGSite3 must
+  next to it, else its `--help` text (DoGSite3 lists `--writeSiteResiduesPDB`, DoGSiteScorer
+  2.0.0 `--druggability`). DoGSite3 must
   be confirmed; DoGSiteScorer 2 is refused only when the binary is DoGSite3. The preflight
   then also requires residue files named as the tool's are (`<out>_P_*_res.pdb` or
   `<out>_res_P_*.pdb`), not just exit 0 and `<out>_desc.txt`. Either failure exits 3 before
@@ -441,6 +442,11 @@ copied or mounted into the image and never committed here.
     models) have volume >= 300 Å³; DoGSiteScorer 2 kept 40 pockets by drugScore >= 0.5 on
     the 20 chains above. Check the selected-pocket counts (`counts.selected`) before
     similarity.
+  - **Calibration on DoGSite3's own scale:** `scripts/calibrate_dogsite3_volume.py` runs a
+    tool on the 2023 net2 inputs and finds the DoGSite3 volume cutoff that keeps the same
+    fraction of pockets as drugScore >= 0.5 did in 2023 (pockets and subpockets on both
+    sides), and compares the two selections by residue overlap. On 488 net2 models it
+    proposes 120 Å³ (pending a decision; the default is still 300).
 - **DoGSiteScorer 2**: flags `-s -i -y -d -w 4`, outputs
   `<UniProt>_<pdb>_<chain>.pdb_desc.txt` / `..._res_P_<n>.pdb` as in 2023, selection
   `drugScore >= 0.5` (`--drugscore-cutoff`).
