@@ -28,6 +28,7 @@ Queue protocol (paths in job files are relative to the run folder):
 
 import argparse
 import concurrent.futures
+import glob
 import hashlib
 import json
 import os
@@ -79,9 +80,14 @@ modes:
                $POLYPHAR_HOME/calibration.json (default ~/.polyphar; an entry of the other
                tool is replaced); without --run-dir nothing else is done
 
-Before claiming any job the worker runs the binary once on polyphar/data/bench/2mjw_B.pdb
-(preflight, with --tool's command line). If that fails, or takes longer than
---preflight-timeout, it exits with status 3 and the binary's stderr, leaving every job queued.
+First the binary must agree with --tool (from what it says about itself only: the Tool: line of
+VERSION_INFO next to it, else its --help text); DoGSite3 must be confirmed, DoGSiteScorer 2
+is refused only when the binary is DoGSite3. Then, before claiming any job, the worker runs
+the binary once on polyphar/data/bench/2mjw_B.pdb (preflight, with --tool's command line),
+which must exit 0 and write <out>_desc.txt and residue files named as --tool's are
+(dogsite3 <out>_P_*_res.pdb, dogsite2 <out>_res_P_*.pdb). If any of this fails, or takes
+longer than --preflight-timeout, it exits with status 3 and the reason, leaving every job
+queued.
 
 At start, claims of this host are put back in the queue when they are stale: their
 process is gone, or their WORKER.<host>.<pid> heartbeat is missing or older than 120 s
@@ -226,28 +232,72 @@ def out_for(path_without_ext, tool):
     return path_without_ext + ".pdb" if tool == "dogsite2" else path_without_ext
 
 
-def tool_version(dogsite):
-    """The binary's version: `Version:` of VERSION_INFO next to it (DoGSite3 installs one),
-    else the first x.y[.z] in its `--help` output, else "unknown"."""
+RES_PATTERNS = {"dogsite3": "%s_P_*_res.pdb", "dogsite2": "%s_res_P_*.pdb"}
+TOOL_NAMES = {"dogsite3": "DoGSite3", "dogsite2": "DoGSiteScorer 2"}
+
+
+def _version_info(dogsite):
+    """{key: value} of VERSION_INFO next to the binary (DoGSite3 installs one), or {}."""
     info = os.path.join(os.path.dirname(os.path.realpath(dogsite)), "VERSION_INFO")
+    out = {}
     try:
         with open(info, encoding="utf-8", errors="replace") as fh:
             for line in fh:
                 key, sep, value = line.partition(":")
-                if sep and key.strip().lower() == "version" and value.strip():
-                    return value.strip()
+                if sep and value.strip():
+                    out.setdefault(key.strip().lower(), value.strip())
     except OSError:
         pass
+    return out
+
+
+def _help_text(dogsite):
     try:
         r = subprocess.run([dogsite, "--help"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                            stderr=subprocess.STDOUT, universal_newlines=True,
                            errors="replace", timeout=60)
-        m = re.search(r"\b[Vv]ersion\s*:?\s*(\d+(?:\.\d+)+)", r.stdout or "")
-        if m:
-            return m.group(1)
+        return r.stdout or ""
     except (OSError, subprocess.SubprocessError):
-        pass
-    return "unknown"
+        return ""
+
+
+def binary_tool(dogsite):
+    """Which tool the binary is, from what it says about itself only: the `Tool:` line of
+    VERSION_INFO next to it, else its --help text (DoGSite3 names itself or lists its
+    --writeSiteResiduesPDB option; DoGSiteScorer names itself). None when it says neither."""
+    named = _version_info(dogsite).get("tool", "").lower()
+    if named in TOOLS:
+        return named
+    text = _help_text(dogsite)
+    low = text.lower()
+    if "dogsite3" in low or "--writesiteresiduespdb" in low:
+        return "dogsite3"
+    if "dogsitescorer" in low:
+        return "dogsite2"
+    return None
+
+
+def identity_problem(dogsite, tool):
+    """Why `dogsite` must not run as `tool`, or None. dogsite3 must be confirmed; dogsite2 is
+    refused only when the binary identifies itself as DoGSite3."""
+    found = binary_tool(dogsite)
+    if found is not None and found != tool:
+        return "%s is %s: conflicts with --tool %s" % (dogsite, TOOL_NAMES[found], tool)
+    if found is None and tool == "dogsite3":
+        return ("cannot confirm that %s is DoGSite3 (no VERSION_INFO next to it naming dogsite3 "
+                "and its --help does not look like DoGSite3): conflicts with --tool "
+                "dogsite3" % dogsite)
+    return None
+
+
+def tool_version(dogsite):
+    """The binary's version: `Version:` of VERSION_INFO next to it (DoGSite3 installs one),
+    else the first x.y[.z] in its `--help` output, else "unknown"."""
+    version = _version_info(dogsite).get("version")
+    if version:
+        return version
+    m = re.search(r"\b[Vv]ersion\s*:?\s*(\d+(?:\.\d+)+)", _help_text(dogsite))
+    return m.group(1) if m else "unknown"
 
 
 def tail(text):
@@ -291,6 +341,12 @@ def run_once(dogsite, model, timeout, tool=DEFAULT_TOOL):
         ok = proc.returncode == 0 and os.path.isfile(out + "_desc.txt")
         if not ok and proc.returncode == 0:
             err += "\n(exit 0 but no _desc.txt written)"
+        pattern = RES_PATTERNS[tool] % os.path.basename(out)
+        if ok and not glob.glob(os.path.join(tmpdir, glob.escape(os.path.basename(out)))
+                                + RES_PATTERNS[tool][2:]):
+            ok = False   # e.g. the other tool's binary: its residue files are named otherwise
+            err += "\n(exit 0 but no residue file %s written: is this %s?)" % (
+                pattern, TOOL_NAMES[tool])
         return ok, seconds, "exit %d: %s" % (proc.returncode, tail(err).strip())
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
@@ -729,6 +785,12 @@ def main(argv=None):
     args = parse_args(argv)
     install_signal_handlers()
     try:
+        problem = identity_problem(args.dogsite, args.tool)
+        if problem:
+            sys.stderr.write("dogsite-worker: %s; set DOGSITE_BIN / --dogsite to the %s binary "
+                             "or choose the matching --tool / --pocket-tool\n"
+                             % (problem, TOOL_NAMES[args.tool]))
+            return 3
         if args.benchmark:
             status = benchmark(args.dogsite, args.preflight_timeout, args.tool)
         else:

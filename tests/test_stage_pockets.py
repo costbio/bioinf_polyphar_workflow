@@ -734,3 +734,28 @@ def test_fusion_filter_works_on_real_dogsite3_residue_files(tmp_path):
         _finish3(layout, m.job_id, m.out, "O60218_4gqg_A")
         counts = pockets.run(layout, DS3, Prog())
         assert counts["outside_segment"] == n_out and counts["segment_unverified"] == 0
+
+
+def test_stage_fails_on_selected_names_pocketmatch_cannot_keep(tmp_path, monkeypatch):
+    """The similarity name guard also runs at the end of pockets, on the selected pockets:
+    a chimeric chain of a 10-character accession can give a 33-character name."""
+    monkeypatch.setattr(pockets, "POLL_S", 0.05)
+    layout = RunLayout(tmp_path)
+    rows = [_row("A0A0B4J2F0", "X_HUMAN", "7a8b", "AB", False, "1:999", "P22222"),
+            _row("P22222", "Y_HUMAN", "7a8b", "AB", False, "1:999", "A0A0B4J2F0")]
+    for acc in ("A0A0B4J2F0", "P22222"):
+        _put(layout.pdbfixer / acc / "7a8b_AB.pdb")
+        _put(layout.structures / acc / "7a8b_AB.pdb")
+    _write_info(layout, rows)
+    for m in pockets.select_models(layout, "dogsite3")[0]:
+        _put(layout.run_dir / f"{m.out}_desc.txt", "name\tvolume\nP_12_1\t400\nP_13_1\t100\n")
+        for p in ("P_12_1", "P_13_1"):
+            _put(layout.run_dir / f"{m.out}_{p}_res.pdb", "HEADER pocket\n")
+        _put(layout.pockets / "queue" / f"{m.job_id}.done",
+             json.dumps({"exit": 0, "tool": "dogsite3", "dogsite_sha256": "x"}))
+    with pytest.raises(ValueError, match=r"longer than 32.*A0A0B4J2F0_7a8b_AB_P_12_1_res\.pdb"):
+        pockets.run(layout, DS3, Prog())
+    failed = (layout.pockets / "failed.tsv").read_text()
+    assert "A0A0B4J2F0/A0A0B4J2F0_7a8b_AB_P_12_1_res.pdb\tpockets\tpocket name longer" in failed
+    assert "P_13_1" not in failed                    # not selected: never reaches PocketMatch
+    assert not (layout.pockets / "manifest.json").exists()

@@ -23,6 +23,8 @@ REPO = Path(__file__).resolve().parent.parent
 WORKER = REPO / "bin" / "polyphar-dogsite-worker"
 WRAPPER = REPO / "bin" / "polyphar-docker"
 FAKE = REPO / "tests" / "fixtures" / "fake_dogsite"
+# the same fake under a DoGSiteScorer 2 identity (its --help names DoGSiteScorer, not DoGSite3)
+FAKE2 = REPO / "tests" / "fixtures" / "fake_dogsite2"
 BENCH = REPO / "polyphar" / "data" / "bench" / "2mjw_B.pdb"
 HINT = "license/installation problem — see README §Pocket detection (DoGSite3 / DoGSiteScorer)"
 INFO_COLUMNS = ["UniProt ID", "Gene Name", "PDB", "Chain ID", "AlphaFold", "Resolution",
@@ -50,7 +52,10 @@ def _make_run(root, names, acc="P25815", tool="dogsite2"):
 
 
 def _worker_cmd(run_dir, dogsite=FAKE, *extra, tool="dogsite2"):
-    """The worker command line; tool=None leaves --tool out (the default, dogsite3)."""
+    """The worker command line; tool=None leaves --tool out (the default, dogsite3). With
+    tool dogsite2 the fake runs under its DoGSiteScorer 2 identity (FAKE2)."""
+    if tool == "dogsite2" and Path(dogsite) == FAKE:
+        dogsite = FAKE2
     return [sys.executable, str(WORKER), "--run-dir", str(run_dir),
             "--dogsite", str(dogsite), *(["--tool", tool] if tool else []), *extra]
 
@@ -139,6 +144,59 @@ def test_worker_refuses_a_job_of_the_other_tool(tmp_path):
     assert "job is for dogsite2" in pockets._failure_reason(failed)
 
 
+def test_binary_identity_must_match_the_tool(tmp_path):
+    """DOGSITE_BIN is checked against --tool before any job (VERSION_INFO / --help only)."""
+    mod = _load_worker_module()
+    assert mod.binary_tool(str(FAKE)) == "dogsite3"          # help lists --writeSiteResiduesPDB
+    assert mod.binary_tool(str(FAKE2)) == "dogsite2"         # help names DoGSiteScorer
+    d = tmp_path / "zbh"
+    d.mkdir()
+    shutil.copy(FAKE2, d / "dogsite")                       # DS2-looking help, but ...
+    (d / "VERSION_INFO").write_text("Tool:           dogsite3\nVersion:        1.3.0\n")
+    assert mod.binary_tool(str(d / "dogsite")) == "dogsite3"  # ... VERSION_INFO wins
+    unknown = tmp_path / "unknown"
+    unknown.write_text("#!/bin/sh\necho usage: x\n")
+    unknown.chmod(0o755)
+    assert mod.binary_tool(str(unknown)) is None
+    assert mod.identity_problem(str(FAKE), "dogsite3") is None
+    assert "is DoGSite3" in mod.identity_problem(str(FAKE), "dogsite2")
+    assert "is DoGSiteScorer 2" in mod.identity_problem(str(FAKE2), "dogsite3")
+    assert "cannot confirm" in mod.identity_problem(str(unknown), "dogsite3")
+    assert mod.identity_problem(str(unknown), "dogsite2") is None   # cannot tell: allowed
+
+    layout = _make_run(tmp_path / "run", ["2mjw_B"])
+    for dogsite, tool in ((FAKE, "dogsite2"), (FAKE2, "dogsite3")):
+        r = subprocess.run([sys.executable, str(WORKER), "--run-dir", str(tmp_path / "run"),
+                            "--dogsite", str(dogsite), "--tool", tool], env=_env(),
+                           capture_output=True, text=True, timeout=60)
+        assert r.returncode == 3, r.stderr
+        assert "conflicts with --tool" in r.stderr
+        assert _queue(layout) == ["P25815_2mjw_B.job"]       # nothing claimed
+        r = subprocess.run([sys.executable, str(WORKER), "--benchmark", "--dogsite",
+                            str(dogsite), "--tool", tool],
+                           env=_env(POLYPHAR_HOME=tmp_path / "home"), capture_output=True,
+                           text=True, timeout=60)
+        assert r.returncode == 3 and "conflicts with --tool" in r.stderr
+    assert not (tmp_path / "home" / "calibration.json").exists()
+
+
+def test_preflight_requires_the_tools_residue_files(tmp_path):
+    """exit 0 + _desc.txt is not enough: the residue files must have the tool's names."""
+    mod = _load_worker_module()
+    wrong = tmp_path / "dogsite3"
+    wrong.write_text("#!/bin/sh\n"
+                     "case \"$1\" in --help) echo '  --writeSiteResiduesPDB'; exit 0;; esac\n"
+                     "out=$4\necho name > \"${out}_desc.txt\"\n"
+                     "echo ATOM > \"${out}_res_P_1.pdb\"\n")       # DoGSiteScorer 2 names
+    wrong.chmod(0o755)
+    ok, _, msg = mod.run_once(str(wrong), str(BENCH), 60, "dogsite3")
+    assert not ok and "no residue file" in msg and "_P_*_res.pdb" in msg
+    ok, _, msg = mod.run_once(str(FAKE), str(BENCH), 60, "dogsite3")
+    assert ok, msg
+    ok, _, msg = mod.run_once(str(FAKE2), str(BENCH), 60, "dogsite2")
+    assert ok, msg
+
+
 def test_tool_version_from_version_info_or_help(tmp_path):
     mod = _load_worker_module()
     assert mod.tool_version(str(FAKE)) == "unknown"     # fake --help has no version
@@ -172,7 +230,8 @@ def test_benchmark_calibration_is_per_tool(tmp_path):
         {"pockets": {"seconds_per_unit": 1.0, "n_observations": 5, "nproc": 8,
                      "cpu_model": "x", "updated": "2026-01-01T00:00:00+00:00"}}))  # no tool
     for tool, n in (("dogsite3", 1), ("dogsite3", 2), ("dogsite2", 1)):
-        r = subprocess.run([sys.executable, str(WORKER), "--benchmark", "--dogsite", str(FAKE),
+        fake = FAKE if tool == "dogsite3" else FAKE2
+        r = subprocess.run([sys.executable, str(WORKER), "--benchmark", "--dogsite", str(fake),
                             "--tool", tool], env=_env(POLYPHAR_HOME=home),
                            capture_output=True, text=True, timeout=60)
         assert r.returncode == 0, r.stdout + r.stderr
@@ -598,6 +657,7 @@ def test_wrapper_passes_nprocs_to_worker(tmp_path, argv, env, expected):
 ])
 def test_wrapper_passes_the_pocket_tool_to_worker_and_container(tmp_path, argv, env, expected):
     run_dir, env = _fake_docker_env(tmp_path, **env)
+    env["DOGSITE_BIN"] = str(FAKE if expected == "dogsite3" else FAKE2)
     home = Path(env["POLYPHAR_HOME"])
     (home / "calibration.json").write_text(json.dumps(
         {"pockets": {"seconds_per_unit": 1e-6, "n_observations": 1, "tool": expected}}))

@@ -165,6 +165,26 @@ def test_select_pockets_uses_the_selected_column(tmp_path):
         "AF-O14746-F1_P_1_1_res.pdb", "2ogq_A_P_1_res.pdb"]
 
 
+def test_selection_record_is_the_rule_actually_used(tmp_path):
+    """Legacy table: the constant drugScore cutoff (fingerprint payload unchanged from
+    before). `Selected` table: no drugscore_cutoff, the pockets manifest's rule instead."""
+    src = FIX / "pockets_net2_P53350" / "P53350" / "P53350_4o56_A.pdb_res_P_1.pdb"
+    layout = _run_folder(tmp_path, {("P53350", "4o56_A_P_1_res.pdb"): src})
+    paths = sim.select_pockets(layout.pockets)
+    assert sim.selection_record(layout) == {"drugscore_cutoff": 0.5}
+    assert sim._fingerprint_payload(layout, paths, ["d"], {"x": "y"})["drugscore_cutoff"] == 0.5
+    df = pd.read_csv(layout.drugscore_csv, index_col=0)
+    df["Selected"] = True
+    df.to_csv(layout.drugscore_csv)
+    rule = {"tool": "dogsite3", "column": "volume", "min": 300.0, "text": "volume >= 300 A^3"}
+    (layout.pockets / "manifest.json").write_text(json.dumps({"selection_rule": rule}))
+    assert sim.selection_record(layout) == {"selection": "Selected", "selection_rule": rule}
+    payload = sim._fingerprint_payload(layout, paths, ["d"], {"x": "y"})
+    assert "drugscore_cutoff" not in payload and payload["selection_rule"] == rule
+    (layout.pockets / "manifest.json").unlink()      # no pockets manifest: rule unknown
+    assert sim.selection_record(layout) == {"selection": "Selected", "selection_rule": None}
+
+
 def test_fingerprint_follows_the_selection(tmp_path):
     src = FIX / "pockets_net2_P53350" / "P53350" / "P53350_4o56_A.pdb_res_P_1.pdb"
     layout = _run_folder(tmp_path, {("P53350", "4o56_A_P_1_res.pdb"): src,

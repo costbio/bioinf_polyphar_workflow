@@ -15,7 +15,8 @@ The mode follows the flags, as polyphar-dogsite-worker passes them:
 The label is chosen deterministically from the sha256 of the model's file name, so
 different models get different pockets.
 
-  * --help prints a usage text (no version, like DoGSite3 1.3.0) and exits 0
+  * --help prints a DoGSite3-like usage text (no version, lists --writeSiteResiduesPDB), or,
+    when invoked as fake_dogsite2 (symlink), a DoGSiteScorer 2-like one; exits 0
   * exits 3 when the model's file name contains FAIL
   * sleeps $FAKE_DOGSITE_SLEEP seconds (after the first partial output), when set
   * appends the model path to $FAKE_DOGSITE_LOG, when set (one line per call)
@@ -86,8 +87,12 @@ def dogsite2(model, out):
 
 def main():
     if "--help" in sys.argv[1:] or "-h" in sys.argv[1:]:
-        print(" License:\n  --license LicenseKey   Activate a new license\n\n"
-              " Input options:\n  -p [ --proteinFile ] arg   Protein input file (fake)")
+        if "dogsite2" in os.path.basename(sys.argv[0]):   # tests/fixtures/fake_dogsite2
+            print("DoGSiteScorer (fake): -p <protein> -o <out> -s -i -y -d -w <n>")
+        else:                                              # like DoGSite3 1.3.0: no version
+            print(" License:\n  --license LicenseKey   Activate a new license\n\n"
+                  " Input options:\n  -p [ --proteinFile ] arg   Protein input file (fake)\n"
+                  " Output options:\n  --writeSiteResiduesPDB   Write pocket site residues")
         return 0
     if os.environ.get("FAKE_DOGSITE_ARGS_LOG"):
         _append(os.environ["FAKE_DOGSITE_ARGS_LOG"], " ".join(sys.argv[1:]) + "\n")

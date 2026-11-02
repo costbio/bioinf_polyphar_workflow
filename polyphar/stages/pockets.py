@@ -722,6 +722,8 @@ def run(layout, args, progress) -> dict:
         Path(tmp).unlink(missing_ok=True)
         raise
 
+    _guard_names(d, df)
+
     counts = {"models": len(models) + len(missing), "queued": len(jobs),
               "done": res["done"], "skipped_existing": len(models) - len(jobs),
               "pockets": len(df), "selected": int(df["Selected"].sum()),
@@ -739,6 +741,23 @@ def run(layout, args, progress) -> dict:
                              "dogsite_version": version},
                    counts=counts, timing={}, extra={"selection_rule": rule})
     return counts
+
+
+def _guard_names(d: Path, df) -> None:
+    """similarity's PocketMatch name guard on the selected pockets (<= 32 characters, no
+    collisions, no whitespace / trailing '_'), so a bad name fails here, before similarity:
+    each finding goes to failed.tsv, then ValueError (no manifest; DrugScore.csv stays for
+    inspection). Only a chimeric chain of a 10-character accession can realistically exceed
+    32 characters with DoGSite3 names."""
+    from polyphar.stages.similarity import _name_problems
+
+    sel = df[df["Selected"].astype(bool)] if len(df) else df
+    paths = [d / a / f for a, f in zip(sel.get("UniProt ID", []), sel.get("Pocket Filename", []))]
+    rows, summary = _name_problems(paths)
+    if summary:
+        for item, reason in rows:
+            append_failure(d, item, STAGE, reason)
+        raise ValueError(f"selected pocket names PocketMatch cannot keep apart: {summary}")
 
 
 def pd_numeric(series):

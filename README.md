@@ -401,6 +401,13 @@ copied or mounted into the image and never committed here.
   binary. The wrapper reads the same option / variable and starts the host worker with
   `--tool <tool>`; the stage also writes the tool into every job file, and a worker refuses a
   job of the other tool (`failed`: `job is for X, this worker runs Y`).
+- **The binary must be the chosen tool.** Before any job, the worker checks `DOGSITE_BIN`
+  against `--tool` from what the binary says about itself: the `Tool:` line of `VERSION_INFO`
+  next to it, else its `--help` text (DoGSite3 lists `--writeSiteResiduesPDB`). DoGSite3 must
+  be confirmed; DoGSiteScorer 2 is refused only when the binary is DoGSite3. The preflight
+  then also requires residue files named as the tool's are (`<out>_P_*_res.pdb` or
+  `<out>_res_P_*.pdb`), not just exit 0 and `<out>_desc.txt`. Either failure exits 3 before
+  a job is claimed.
 - **One tool per run folder.** The tool is recorded in `04_pockets/TOOL` when the stage
   starts, in each `.done` and in the manifest (`versions.pocket_tool`,
   `versions.dogsite_version`). A run asking for the other tool than the folder's existing
@@ -422,7 +429,11 @@ copied or mounted into the image and never committed here.
     the accession; only a chain extracted for several accessions (a chimeric chain) keeps
     the `<UniProt>_` prefix, because PocketMatch keeps base names only and they must stay
     unique. The longest realistic names (`AF-A0A0B4J2F0-F1_P_12_1_res.pdb`, 31 characters)
-    fit PocketMatch's 32-character limit, which `similarity` still checks.
+    fit PocketMatch's 32-character limit. The exception is a chimeric chain of a
+    10-character accession, which keeps the long prefix: `A0A0B4J2F0_7a8b_AB_P_12_1_res.pdb`
+    has 33. `pockets` runs `similarity`'s name guard (≤ 32 characters, no collisions) on the
+    selected pockets at its end and fails with the names listed in `failed.tsv` (no manifest),
+    before `similarity` would.
   - **Volumes are much smaller than DoGSiteScorer 2's.** On the same 20 pdbfixer chains of
     the 2023 net2 run, the largest DoGSite3 pocket had a median 0.24× the volume of the
     largest DoGSiteScorer 2 pocket (2OGQ_A, PLK1 kinase domain: 211 vs 546 Å³). Of 523
@@ -436,7 +447,9 @@ copied or mounted into the image and never committed here.
 - **`DrugScore.csv`** (name kept from 2023) has `UniProt ID, Gene Name, Protein, Pocket`, the
   tool's descriptor columns, `Pocket Filename` (the residue file on disk), `Tool` and
   `Selected` (the tool's rule). The manifest records `selection_rule`. `similarity` uses the
-  rows with `Selected` true (a legacy `DrugScore.csv` without the column: `drugScore >= 0.5`).
+  rows with `Selected` true and records that rule (`selection_rule` from the pockets
+  manifest) in its manifest and fingerprint; a legacy `DrugScore.csv` without the column
+  uses `drugScore >= 0.5` (recorded as `drugscore_cutoff`).
   Changing `--min-volume` / `--drugscore-cutoff` reruns `pockets` (selection only) on the
   next `run`.
 - **Calibration** is per tool: `calibration.json`'s `pockets` entry records its `tool`; an

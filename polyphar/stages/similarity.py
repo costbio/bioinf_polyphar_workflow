@@ -772,15 +772,34 @@ def _pm_or_none(args) -> Path | None:
 OUTPUTS = (SCORE_FILE, "Pocketsim.csv")
 
 
-def _stage_fingerprint(layout, survivors, digests, bins) -> str:
+def selection_record(layout) -> dict:
+    """The pocket selection this stage used, for its manifest and fingerprint: a legacy
+    DrugScore.csv -> {"drugscore_cutoff": 0.5}; one with `Selected` -> {"selection":
+    "Selected", "selection_rule": the pockets manifest's selection_rule (None when
+    unreadable)}."""
+    if selection_used(layout.pockets) != "Selected":
+        return {"drugscore_cutoff": DRUGSCORE_CUTOFF}
+    rule = None
+    try:
+        rule = json.loads((layout.pockets / "manifest.json").read_text()).get("selection_rule")
+    except (OSError, ValueError, AttributeError):
+        pass
+    return {"selection": "Selected", "selection_rule": rule}
+
+
+def _fingerprint_payload(layout, survivors, digests, bins) -> dict:
     """What the finished outputs depend on, independent of nprocs: the ordered surviving
-    pockets (item, sha256), the PocketMatch binaries, the drugScore cutoff, DrugScore.csv
-    (whose sha256 covers its `Selected` column, i.e. the pockets stage's selection) and
+    pockets (item, sha256), the PocketMatch binaries, the pocket selection (selection_record;
+    for a legacy table exactly the payload of earlier versions), DrugScore.csv and
     Protein_info.csv."""
-    payload = {"pockets": [[_item(p), dg] for p, dg in zip(survivors, digests)],
-               "pocketmatch_sha256": bins, "drugscore_cutoff": DRUGSCORE_CUTOFF,
-               "drugscore_sha256": sha256_file(layout.drugscore_csv),
-               "protein_info_sha256": sha256_file(layout.protein_info)}
+    return {"pockets": [[_item(p), dg] for p, dg in zip(survivors, digests)],
+            "pocketmatch_sha256": bins, **selection_record(layout),
+            "drugscore_sha256": sha256_file(layout.drugscore_csv),
+            "protein_info_sha256": sha256_file(layout.protein_info)}
+
+
+def _stage_fingerprint(layout, survivors, digests, bins) -> str:
+    payload = _fingerprint_payload(layout, survivors, digests, bins)
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
 
@@ -884,8 +903,7 @@ def run(layout, args, progress) -> dict:
     versions = _versions(pm)
     fingerprint = _stage_fingerprint(layout, res.plan.paths, res.digests,
                                      versions["pocketmatch_sha256"])
-    write_manifest(d, STAGE, args={"nprocs": args.nprocs, "drugscore_cutoff": DRUGSCORE_CUTOFF,
-                                   "selection": selection_used(layout.pockets)},
+    write_manifest(d, STAGE, args={"nprocs": args.nprocs, **selection_record(layout)},
                    inputs=[layout.drugscore_csv, layout.protein_info], versions=versions,
                    counts=counts, timing={},
                    extra={"fingerprint": fingerprint,
