@@ -23,17 +23,16 @@ def _uniprot(layout, rows):
 
 
 def _outputs(layout, acc, name):
-    """A fixed chain and DoGSiteScorer outputs for it (one pocket)."""
+    """A fixed chain and DoGSite3 outputs for it (two pockets, 400 and 250 A^3)."""
     fixed = layout.pdbfixer / acc / f"{name}.pdb"
     fixed.parent.mkdir(parents=True, exist_ok=True)
     fixed.write_text("ATOM fixed\n")
     d = layout.pockets / acc
     d.mkdir(parents=True, exist_ok=True)
-    (d / f"{acc}_{name}.pdb_desc.txt").write_text("name\tdrugScore\nP_1\t0.9\n")
-    (d / f"{acc}_{name}.pdb_res_P_1.pdb").write_text("ATOM\n")
-    af = d / f"AF-{acc}-F1.pdb_desc.txt"
-    af.write_text("name\tdrugScore\nP_1\t0.9\n")
-    (d / f"AF-{acc}-F1.pdb_res_P_1.pdb").write_text("ATOM\n")
+    for out in (name, f"AF-{acc}-F1"):
+        (d / f"{out}_desc.txt").write_text("name\tvolume\nP_1\t400\nP_2\t250\n")
+        (d / f"{out}_P_1_res.pdb").write_text("ATOM\n")
+        (d / f"{out}_P_2_res.pdb").write_text("ATOM\n")
 
 
 def test_shrunken_input_reaches_protein_info_and_drugscore(tmp_path, monkeypatch):
@@ -66,3 +65,10 @@ def test_shrunken_input_reaches_protein_info_and_drugscore(tmp_path, monkeypatch
     assert set(info["UniProt ID"]) == {"P25815"}
     assert set(pd.read_csv(layout.drugscore_csv, index_col=0)["UniProt ID"]) == {"P25815"}
     assert "Q15109" not in (layout.structures / "alphafold.tsv").read_text()
+
+    # a changed pocket selection reruns pockets although no model is left to run
+    selected = pd.read_csv(layout.drugscore_csv, index_col=0)["Selected"]
+    assert list(selected) == [True, False, True, False]
+    assert cli.main([*argv, "--from", "pockets", "--min-volume", "200"]) == 0
+    assert pd.read_csv(layout.drugscore_csv, index_col=0)["Selected"].all()
+

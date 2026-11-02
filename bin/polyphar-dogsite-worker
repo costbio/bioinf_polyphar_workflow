@@ -1,15 +1,25 @@
 #!/usr/bin/env python3
-"""Host-side DoGSiteScorer worker for polyphar.
+"""Host-side pocket-detection worker for polyphar: DoGSite3 (default) or DoGSiteScorer 2.
 
-DoGSiteScorer is licensed for the host, so it never runs inside the polyphar container.
+Both tools are licensed for the host, so they never run inside the polyphar container.
 `polyphar pockets` (in the container) writes job files into <run>/04_pockets/queue/;
 this script, run on the host, claims and runs them. It needs only Python >= 3.8 and its
 standard library (it does not import polyphar).
 
+Tool (--tool, default $POLYPHAR_POCKET_TOOL or dogsite3) and command line:
+  dogsite3   <bin> -p <model> -o <out> -s -d --writeSiteResiduesPDB -v 1
+             (<out>_desc.txt, <out>_P_<n>[_<m>]_res.pdb)
+  dogsite2   <bin> -p <model> -s -i -y -d -w 4 -o <out>
+             (<out>_desc.txt, <out>_res_P_<n>[_<m>].pdb)
+Every job file names its tool (a job without one is from a DoGSiteScorer 2 era stage); a
+job for another tool than this worker's is recorded as failed, never run with the wrong
+binary.
+
 Queue protocol (paths in job files are relative to the run folder):
-  <id>.job                    {"model": ..., "out": ..., "size": <bytes>}
+  <id>.job                    {"model": ..., "out": ..., "size": <bytes>, "tool": ...}
   <id>.running.<host>.<pid>   claimed by os.rename (atomic): no job is run twice
-  <id>.done                   {"exit": 0, "seconds": s, "dogsite_sha256": ...}
+  <id>.done                   {"exit": 0, "seconds": s, "dogsite_sha256": ..., "tool": ...,
+                               "tool_version": ...}
   <id>.failed                 {"exit": n, "stderr_tail": ...} (+ "reason" for a timeout)
   WORKER.<host>.<pid>         heartbeat, touched every 30 s while the worker lives (mtime set
                               explicitly to this host's time.time(), also on NFS)
@@ -22,6 +32,7 @@ import hashlib
 import json
 import os
 import platform
+import re
 import shutil
 import signal
 import socket
@@ -39,9 +50,17 @@ STALE_HEARTBEAT_S = 120.0     # a claim whose worker heartbeat is older than thi
 DEFAULT_PREFLIGHT_TIMEOUT = 600.0
 DEFAULT_JOB_TIMEOUT = 6 * 3600.0
 LOG_REL = os.path.join("logs", "dogsite-worker.log")
-DOGSITE_FLAGS = ["-s", "-i", "-y", "-d", "-w", "4"]
+TOOLS = ("dogsite3", "dogsite2")
+DEFAULT_TOOL = "dogsite3"
+LEGACY_TOOL = "dogsite2"      # a job file without a "tool" field
+TOOL_ENV = "POLYPHAR_POCKET_TOOL"
+DOGSITE2_FLAGS = ["-s", "-i", "-y", "-d", "-w", "4"]
+# -s: subpockets, as with DoGSiteScorer 2 (P_<n>_<m> rows and files); -d: write _desc.txt;
+# --writeSiteResiduesPDB: <out>_P_<n>_res.pdb (complete residues, the PocketMatch input);
+# -v 1: errors only.
+DOGSITE3_FLAGS = ["-s", "-d", "--writeSiteResiduesPDB", "-v", "1"]
 STDERR_TAIL = 2000
-HINT = "license/installation problem — see README §DoGSiteScorer"
+HINT = "license/installation problem — see README §Pocket detection (DoGSite3 / DoGSiteScorer)"
 REPO = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 BENCH_DIR = os.path.join(REPO, "polyphar", "data", "bench")
 # The bench CHAINS (protein models) in BENCH_DIR, timed by --benchmark; the first one is
@@ -51,18 +70,18 @@ PREFLIGHT_MODEL = os.path.join(BENCH_DIR, BENCH_CHAINS[0])
 
 EPILOG = """\
 modes:
-  default      run the jobs queued now, then exit
+  default      run the jobs queued now (all with the same --tool), then exit
   --watch      keep polling every 5 s for new jobs until queue/CLOSED exists
                (bin/polyphar-docker starts the worker like this for `pockets` / `run`)
-  --benchmark  time DoGSiteScorer on the bench chains (BENCH_CHAINS in this script, files
+  --benchmark  time the tool on the bench chains (BENCH_CHAINS in this script, files
                in polyphar/data/bench/) and store
-               pockets.seconds_per_unit (per byte, one process) in
-               $POLYPHAR_HOME/calibration.json (default ~/.polyphar); without
-               --run-dir nothing else is done
+               pockets.seconds_per_unit (per byte, one process) with its "tool" in
+               $POLYPHAR_HOME/calibration.json (default ~/.polyphar; an entry of the other
+               tool is replaced); without --run-dir nothing else is done
 
 Before claiming any job the worker runs the binary once on polyphar/data/bench/2mjw_B.pdb
-(preflight). If that fails, or takes longer than --preflight-timeout, it exits with
-status 3 and the binary's stderr, leaving every job queued.
+(preflight, with --tool's command line). If that fails, or takes longer than
+--preflight-timeout, it exits with status 3 and the binary's stderr, leaving every job queued.
 
 At start, claims of this host are put back in the queue when they are stale: their
 process is gone, or their WORKER.<host>.<pid> heartbeat is missing or older than 120 s
@@ -172,7 +191,7 @@ def unlink(path):
 
 
 def remove_outputs(out):
-    """Delete every DoGSiteScorer output of `-o out` (<out>_desc.txt, <out>_res_*.pdb,
+    """Delete every output of `-o out` (<out>_desc.txt, <out>_res_*.pdb, <out>_P_*_res.pdb,
     <out>.pml, ...): files in out's directory named <out name>_* or <out name>.*."""
     d, base = os.path.split(out)
     try:
@@ -196,8 +215,39 @@ def pid_alive(pid):
     return True
 
 
-def dogsite_cmd(dogsite, model, out):
-    return [dogsite, "-p", model] + DOGSITE_FLAGS + ["-o", out]
+def dogsite_cmd(dogsite, model, out, tool=DEFAULT_TOOL):
+    if tool == "dogsite3":
+        return [dogsite, "-p", model, "-o", out] + DOGSITE3_FLAGS
+    return [dogsite, "-p", model] + DOGSITE2_FLAGS + ["-o", out]
+
+
+def out_for(path_without_ext, tool):
+    """`-o` value for a model: dogsite2 kept the model's .pdb in its output names."""
+    return path_without_ext + ".pdb" if tool == "dogsite2" else path_without_ext
+
+
+def tool_version(dogsite):
+    """The binary's version: `Version:` of VERSION_INFO next to it (DoGSite3 installs one),
+    else the first x.y[.z] in its `--help` output, else "unknown"."""
+    info = os.path.join(os.path.dirname(os.path.realpath(dogsite)), "VERSION_INFO")
+    try:
+        with open(info, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                key, sep, value = line.partition(":")
+                if sep and key.strip().lower() == "version" and value.strip():
+                    return value.strip()
+    except OSError:
+        pass
+    try:
+        r = subprocess.run([dogsite, "--help"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                           stderr=subprocess.STDOUT, universal_newlines=True,
+                           errors="replace", timeout=60)
+        m = re.search(r"\b[Vv]ersion\s*:?\s*(\d+(?:\.\d+)+)", r.stdout or "")
+        if m:
+            return m.group(1)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return "unknown"
 
 
 def tail(text):
@@ -213,14 +263,16 @@ def killpg(proc, sig):
         pass
 
 
-def run_once(dogsite, model, timeout):
-    """Run DoGSiteScorer on `model` in a temp dir, for at most `timeout` seconds.
+def run_once(dogsite, model, timeout, tool=DEFAULT_TOOL):
+    """Run the tool on `model` in a temp dir, for at most `timeout` seconds.
     Returns (ok, seconds, message)."""
     tmpdir = tempfile.mkdtemp(prefix="polyphar-dogsite-")
     try:
-        out = os.path.join(tmpdir, os.path.basename(model))
+        stem = os.path.splitext(os.path.basename(model))[0]
+        out = out_for(os.path.join(tmpdir, stem), tool)
         t0 = time.monotonic()
-        proc = subprocess.Popen(dogsite_cmd(dogsite, os.path.abspath(model), out), cwd=tmpdir,
+        proc = subprocess.Popen(dogsite_cmd(dogsite, os.path.abspath(model), out, tool),
+                                cwd=tmpdir,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 universal_newlines=True, errors="replace",
                                 start_new_session=True)
@@ -249,11 +301,11 @@ def preflight_failed(model, err):
     return 3
 
 
-def preflight(dogsite, timeout=DEFAULT_PREFLIGHT_TIMEOUT):
-    ok, seconds, err = run_once(dogsite, PREFLIGHT_MODEL, timeout)
+def preflight(dogsite, timeout=DEFAULT_PREFLIGHT_TIMEOUT, tool=DEFAULT_TOOL):
+    ok, seconds, err = run_once(dogsite, PREFLIGHT_MODEL, timeout, tool)
     if not ok:
         return preflight_failed(PREFLIGHT_MODEL, err)
-    log("preflight ok (%.1f s on %s)" % (seconds, os.path.basename(PREFLIGHT_MODEL)))
+    log("preflight ok (%s, %.1f s on %s)" % (tool, seconds, os.path.basename(PREFLIGHT_MODEL)))
     return 0
 
 
@@ -273,9 +325,10 @@ def cpu_model():
     return platform.processor() or platform.machine() or "unknown"
 
 
-def save_calibration(seconds_per_unit):
+def save_calibration(seconds_per_unit, tool=DEFAULT_TOOL):
     """Fold one measurement into calibration.json's `pockets` entry, in the schema of
-    polyphar.eta.Calibration (running mean); other entries are kept."""
+    polyphar.eta.Calibration (running mean, "tool" recorded); an entry of another tool
+    (no "tool" field = dogsite2) is replaced, other stages' entries are kept."""
     home = polyphar_home()
     os.makedirs(home, exist_ok=True)
     path = os.path.join(home, "calibration.json")
@@ -287,6 +340,8 @@ def save_calibration(seconds_per_unit):
     except (OSError, ValueError):
         data = {}
     old = data.get("pockets")
+    if isinstance(old, dict) and (old.get("tool") or LEGACY_TOOL) != tool:
+        old = None   # never average two tools
     n, mean = 0, float(seconds_per_unit)
     if isinstance(old, dict):
         try:
@@ -305,6 +360,7 @@ def save_calibration(seconds_per_unit):
         "nproc": os.cpu_count(),
         "cpu_model": cpu_model(),
         "updated": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "tool": tool,
     }
     fd, tmp = tempfile.mkstemp(dir=home, prefix=".calibration.json.", suffix=".tmp")
     try:
@@ -317,8 +373,8 @@ def save_calibration(seconds_per_unit):
     return path, data["pockets"]
 
 
-def benchmark(dogsite, timeout=DEFAULT_PREFLIGHT_TIMEOUT):
-    """Time DoGSiteScorer (one process) on the bench chains; store seconds per byte."""
+def benchmark(dogsite, timeout=DEFAULT_PREFLIGHT_TIMEOUT, tool=DEFAULT_TOOL):
+    """Time the tool (one process) on the bench chains; store seconds per byte."""
     models = [os.path.join(BENCH_DIR, name) for name in BENCH_CHAINS]
     missing = [m for m in models if not os.path.isfile(m)]
     if missing:
@@ -330,26 +386,30 @@ def benchmark(dogsite, timeout=DEFAULT_PREFLIGHT_TIMEOUT):
         return 3
     total_s = total_b = 0.0
     for model in models:
-        ok, seconds, err = run_once(dogsite, model, timeout)
+        ok, seconds, err = run_once(dogsite, model, timeout, tool)
         if not ok:
             return preflight_failed(model, err)
         size = os.path.getsize(model)
         log("benchmark %s: %.2f s for %d bytes" % (os.path.basename(model), seconds, size))
         total_s += seconds
         total_b += size
-    path, entry = save_calibration(total_s / total_b)
-    log("pockets calibrated: %.3g s per byte -> %s" % (entry["seconds_per_unit"], path))
+    path, entry = save_calibration(total_s / total_b, tool)
+    log("pockets calibrated (%s): %.3g s per byte -> %s" % (tool, entry["seconds_per_unit"],
+                                                            path))
     return 0
 
 
 # --- the queue --------------------------------------------------------------------------
 
 class Worker:
-    def __init__(self, run_dir, dogsite, nprocs, watch, job_timeout=DEFAULT_JOB_TIMEOUT):
+    def __init__(self, run_dir, dogsite, nprocs, watch, job_timeout=DEFAULT_JOB_TIMEOUT,
+                 tool=DEFAULT_TOOL):
         self.run_dir = os.path.realpath(run_dir)
         self.job_timeout = job_timeout
         self.qdir = os.path.join(self.run_dir, QUEUE_REL)
         self.dogsite = dogsite
+        self.tool = tool
+        self.version = tool_version(dogsite)
         self.sha = sha256_file(dogsite)
         self.nprocs = nprocs
         self.watch = watch
@@ -465,8 +525,16 @@ class Worker:
                 spec = json.load(fh)
             model = self.resolve(spec["model"])
             out = self.resolve(spec["out"])
-        except (OSError, ValueError, KeyError, TypeError) as exc:
+            job_tool = spec.get("tool") or LEGACY_TOOL
+        except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
             self.finish(jid, running, ".failed", {"exit": -1, "stderr_tail": "bad job: %s" % exc})
+            return
+        if job_tool != self.tool:
+            reason = ("job is for %s, this worker runs %s (--tool); one pocket tool per run "
+                      "folder" % (job_tool, self.tool))
+            self.finish(jid, running, ".failed", {"exit": -1, "reason": reason,
+                                                  "stderr_tail": ""})
+            log("FAILED %s (%s)" % (jid, reason))
             return
         outdir = os.path.dirname(out)
         desc = out + "_desc.txt"
@@ -477,7 +545,8 @@ class Worker:
             if self.stopping:
                 return
             try:
-                proc = subprocess.Popen(dogsite_cmd(self.dogsite, model, out), cwd=outdir,
+                proc = subprocess.Popen(dogsite_cmd(self.dogsite, model, out, self.tool),
+                                        cwd=outdir,
                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                         universal_newlines=True, errors="replace",
                                         start_new_session=True)
@@ -507,7 +576,8 @@ class Worker:
             return
         if proc.returncode == 0 and os.path.isfile(desc):
             self.finish(jid, running, ".done",
-                        {"exit": 0, "seconds": round(seconds, 3), "dogsite_sha256": self.sha})
+                        {"exit": 0, "seconds": round(seconds, 3), "dogsite_sha256": self.sha,
+                         "tool": self.tool, "tool_version": self.version})
             log("done %s (%.1f s)" % (jid, seconds))
             return
         if self.stopping:
@@ -609,13 +679,18 @@ def find_binary(value):
 def parse_args(argv):
     p = argparse.ArgumentParser(
         prog="polyphar-dogsite-worker",
-        description="Run the DoGSiteScorer jobs that `polyphar pockets` queues in "
-                    "<run>/04_pockets/queue/ (host side; Python >= 3.8, stdlib only).",
+        description="Run the pocket-detection jobs (DoGSite3 or DoGSiteScorer 2) that "
+                    "`polyphar pockets` queues in <run>/04_pockets/queue/ (host side; "
+                    "Python >= 3.8, stdlib only).",
         epilog=EPILOG, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--run-dir", help="the run folder on this host (required unless "
                                      "only --benchmark)")
     p.add_argument("--dogsite", default=os.environ.get("DOGSITE_BIN"),
-                   help="DoGSiteScorer binary (default: $DOGSITE_BIN)")
+                   help="the tool's binary, e.g. /opt/ZBH/dogsite3/dogsite3 (default: "
+                        "$DOGSITE_BIN)")
+    p.add_argument("--tool", default=os.environ.get(TOOL_ENV) or DEFAULT_TOOL,
+                   help="dogsite3 or dogsite2: the tool --dogsite is (default: $%s or %s); "
+                        "must be the run's --pocket-tool" % (TOOL_ENV, DEFAULT_TOOL))
     p.add_argument("--nprocs", type=int, default=4,
                    help="DoGSiteScorer processes at a time (default: 4)")
     p.add_argument("--watch", action="store_true",
@@ -635,6 +710,9 @@ def parse_args(argv):
         p.error("--nprocs must be >= 1")
     if not args.preflight_timeout > 0:
         p.error("--preflight-timeout must be > 0")
+    if args.tool not in TOOLS:
+        p.error("--tool / $%s must be one of %s (got %r)" % (TOOL_ENV, ", ".join(TOOLS),
+                                                           args.tool))
     if not args.run_dir and not args.benchmark:
         p.error("--run-dir is required (unless --benchmark)")
     if args.run_dir and not os.path.isdir(args.run_dir):
@@ -652,13 +730,13 @@ def main(argv=None):
     install_signal_handlers()
     try:
         if args.benchmark:
-            status = benchmark(args.dogsite, args.preflight_timeout)
+            status = benchmark(args.dogsite, args.preflight_timeout, args.tool)
         else:
-            status = preflight(args.dogsite, args.preflight_timeout)
+            status = preflight(args.dogsite, args.preflight_timeout, args.tool)
         if status != 0 or not args.run_dir:
             return status
         return Worker(args.run_dir, args.dogsite, args.nprocs, args.watch,
-                      args.job_timeout).serve()
+                      args.job_timeout, args.tool).serve()
     except Stop as stop:
         log("stopped by signal %d" % stop.signum)
         return 128 + stop.signum

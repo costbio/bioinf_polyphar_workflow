@@ -134,6 +134,50 @@ def test_select_pockets_cutoff_order_and_exact_names(tmp_path):
     assert len(sim.select_pockets(layout.pockets)) == 2
 
 
+def test_select_pockets_uses_the_selected_column(tmp_path):
+    """A DrugScore.csv written by the pockets stage carries `Selected` (dogsite3: volume
+    >= --min-volume; no drugScore column at all): similarity takes exactly those rows."""
+    src = FIX / "pockets_net2_P53350" / "P53350" / "P53350_4o56_A.pdb_res_P_1.pdb"
+    layout = RunLayout(tmp_path)
+    names = [("P53350", "4o56_A_P_2_res.pdb", 410.0, True),
+             ("O14746", "AF-O14746-F1_P_1_1_res.pdb", 300.0, True),
+             ("P53350", "2ogq_A_P_1_res.pdb", 299.9, False)]
+    for acc, name, *_ in names:
+        (layout.pockets / acc).mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(src, layout.pockets / acc / name)
+    pd.DataFrame([[a, "G", "X", "P_1", v, n, "dogsite3", sel] for a, n, v, sel in names],
+                 columns=["UniProt ID", "Gene Name", "Protein", "Pocket", "volume",
+                          "Pocket Filename", "Tool", "Selected"]).to_csv(layout.drugscore_csv)
+    got = sim.select_pockets(layout.pockets)
+    assert [p.relative_to(layout.pockets).as_posix() for p in got] == [
+        "O14746/AF-O14746-F1_P_1_1_res.pdb", "P53350/4o56_A_P_2_res.pdb"]
+    assert sim.selection_used(layout.pockets) == "Selected"
+    # Selected wins over drugScore when both exist (a dogsite2 table from the new stage)
+    df = pd.read_csv(layout.drugscore_csv, index_col=0)
+    df["drugScore"] = [0.1, 0.9, 0.9]
+    df.to_csv(layout.drugscore_csv)
+    assert [p.name for p in sim.select_pockets(layout.pockets)] == [
+        "AF-O14746-F1_P_1_1_res.pdb", "4o56_A_P_2_res.pdb"]
+    # legacy DrugScore.csv (no Selected): drugScore >= 0.5
+    df.drop(columns=["Selected"]).to_csv(layout.drugscore_csv)
+    assert sim.selection_used(layout.pockets) == "drugScore >= 0.5"
+    assert [p.name for p in sim.select_pockets(layout.pockets)] == [
+        "AF-O14746-F1_P_1_1_res.pdb", "2ogq_A_P_1_res.pdb"]
+
+
+def test_fingerprint_follows_the_selection(tmp_path):
+    src = FIX / "pockets_net2_P53350" / "P53350" / "P53350_4o56_A.pdb_res_P_1.pdb"
+    layout = _run_folder(tmp_path, {("P53350", "4o56_A_P_1_res.pdb"): src,
+                                    ("P53350", "4o56_A_P_2_res.pdb"): src})
+    paths = sim.select_pockets(layout.pockets)
+    legacy = sim._stage_fingerprint(layout, paths, ["d"] * len(paths), {"x": "y"})
+    df = pd.read_csv(layout.drugscore_csv, index_col=0)
+    df["Selected"] = True
+    df.to_csv(layout.drugscore_csv)
+    selected = sim._stage_fingerprint(layout, paths, ["d"] * len(paths), {"x": "y"})
+    assert selected != legacy
+
+
 def test_missing_drugscore_is_clear(tmp_path):
     with pytest.raises(FileNotFoundError, match="polyphar pockets"):
         sim.units(RunLayout(tmp_path), _args())

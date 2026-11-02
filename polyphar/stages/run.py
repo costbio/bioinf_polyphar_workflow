@@ -21,8 +21,11 @@ the first unit, milestone progress, done / FAILED.
   about once at the start (Methods need it).
 * Options of stages outside --from..--to are warned about (stderr) and ignored.
 * A stage with remaining units and no calibration on this machine is benchmarked first (`benchmark --stages
-  <stage>`), except pockets: DoGSiteScorer is host-only (bin/polyphar-docker calibrates it
-  before `run`); uncalibrated, its ETA comes with the 5 % milestone.
+  <stage>`), except pockets: DoGSite3 / DoGSiteScorer is host-only (bin/polyphar-docker
+  calibrates it, per pocket tool, before `run`); uncalibrated, its ETA comes with the 5 %
+  milestone.
+* A finished pockets stage with nothing left to run is rerun when its pocket selection
+  (--min-volume / --drugscore-cutoff) changed (pockets.needs_rerun).
 * The first failed stage stops the run (priority-1 notification). So does structures, fix
   or pockets when failed / work items exceeds --max-failed-fraction (default 0.2): exit 1,
   "run STOPPED"; --keep-going overrides. Expected exclusions (structures unmapped pairs,
@@ -431,9 +434,13 @@ def _run_stages(cli, layout, args, stages, ids_given, notifier) -> int:
             stage = cli._load_stage(name)
             units = stage.units(layout, args)
             manifest = _manifest(layout, name) if units.count == 0 else None
+            stale = (stage.needs_rerun(layout, args)
+                     if manifest is not None and hasattr(stage, "needs_rerun") else None)
             if manifest is not None:
                 changed = changed_inputs(layout, manifest)
-                if changed:
+                if stale:
+                    print(f"{name}: 0 units left but {stale}: running it", flush=True)
+                elif changed:
                     print(f"{name}: 0 units left but inputs changed since its manifest "
                           f"({'; '.join(changed[:5])}): running it", flush=True)
                 else:

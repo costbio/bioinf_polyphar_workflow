@@ -1,8 +1,10 @@
 """Stage 05: pocket similarity with upstream PocketMatch v2.0, serial or block-pair parallel.
 
-Inputs: 04_pockets/DrugScore.csv, rows with drugScore >= 0.5; each pocket file is
-04_pockets/<UniProt ID>/<Pocket Filename>, found by its exact on-disk name. The pocket
-list is ordered by (UniProt ID, Pocket Filename) so every run sees the same order. A
+Inputs: 04_pockets/DrugScore.csv, rows with Selected == True (the pockets stage's rule for its
+tool: dogsite3 volume >= --min-volume, dogsite2 drugScore >= 0.5), or, for a legacy table
+without that column, drugScore >= 0.5 (so the 2023 net2 regression still applies); each
+pocket file is 04_pockets/<UniProt ID>/<Pocket Filename>, found by its exact on-disk name.
+The pocket list is ordered by (UniProt ID, Pocket Filename) so every run sees the same order. A
 listed file that is missing is recorded in failed.tsv (`pocket file missing`) and dropped.
 PocketMatch records a file's base name truncated to 32 characters, so names longer than
 32 or colliding fail the stage before PocketMatch runs (also in --dry-run), listed in
@@ -112,21 +114,50 @@ class JobsFailed(RuntimeError):
 
 # --- inputs --------------------------------------------------------------------------
 
-def pocket_table(pockets_dir, cutoff: float = DRUGSCORE_CUTOFF):
-    """(table, missing): the DrugScore.csv rows with drugScore >= cutoff whose pocket file
-    exists, one per file, sorted by (UniProt ID, Pocket Filename); and the listed files that
-    do not exist, as `<UniProt ID>/<Pocket Filename>` (compared by exact name, so a case
-    mismatch counts as missing on any filesystem)."""
+def _truthy(series):
+    """A `Selected` column as read back from CSV (bool, or the strings True/False)."""
+    if series.dtype == bool:
+        return series
+    return series.astype(str).str.strip().str.lower().isin(("true", "1", "yes"))
+
+
+def _drugscore_table(pockets_dir):
     import pandas as pd
 
-    pockets_dir = Path(pockets_dir)
-    path = pockets_dir / "DrugScore.csv"
+    path = Path(pockets_dir) / "DrugScore.csv"
     if not path.is_file():
         raise FileNotFoundError(f"{path} not found; run `polyphar pockets` first")
     text_cols = ["UniProt ID", "Gene Name", "Protein", "Pocket", "Pocket Filename"]
     df = pd.read_csv(path, index_col=0, dtype={c: str for c in text_cols})
     df[text_cols] = df[text_cols].fillna("")
-    df = df[pd.to_numeric(df["drugScore"]) >= cutoff]
+    return df
+
+
+def _selection(df, cutoff: float) -> str:
+    return "Selected" if "Selected" in df.columns else f"drugScore >= {cutoff:g}"
+
+
+def selection_used(pockets_dir, cutoff: float = DRUGSCORE_CUTOFF) -> str:
+    """How pockets are chosen from this DrugScore.csv: "Selected" (the column the pockets
+    stage writes by its tool's rule) or, for a legacy table, "drugScore >= <cutoff>"."""
+    return _selection(_drugscore_table(pockets_dir), cutoff)
+
+
+def pocket_table(pockets_dir, cutoff: float = DRUGSCORE_CUTOFF):
+    """(table, missing): the selected DrugScore.csv rows whose pocket file exists, one per
+    file, sorted by (UniProt ID, Pocket Filename); and the listed files that do not exist,
+    as `<UniProt ID>/<Pocket Filename>` (compared by exact name, so a case mismatch counts
+    as missing on any filesystem). Selected = the `Selected` column when present (written
+    by the pockets stage per tool: dogsite3 volume, dogsite2 drugScore), else the legacy
+    drugScore >= cutoff (DrugScore.csv of 2023 and of earlier polyphar versions)."""
+    import pandas as pd
+
+    pockets_dir = Path(pockets_dir)
+    df = _drugscore_table(pockets_dir)
+    if "Selected" in df.columns:
+        df = df[_truthy(df["Selected"])]
+    else:
+        df = df[pd.to_numeric(df["drugScore"]) >= cutoff]
     df = df.drop_duplicates(["UniProt ID", "Pocket Filename"])
     df = df.sort_values(["UniProt ID", "Pocket Filename"], kind="mergesort")
     df = df.reset_index(drop=True)
@@ -147,7 +178,7 @@ def _paths(pockets_dir, table) -> list[Path]:
 
 
 def select_pockets(pockets_dir, cutoff: float = DRUGSCORE_CUTOFF) -> list[Path]:
-    """Existing pocket files with drugScore >= cutoff, in the stage's deterministic order."""
+    """Existing selected pocket files (pocket_table), in the stage's deterministic order."""
     return _paths(pockets_dir, pocket_table(pockets_dir, cutoff)[0])
 
 
@@ -744,7 +775,8 @@ OUTPUTS = (SCORE_FILE, "Pocketsim.csv")
 def _stage_fingerprint(layout, survivors, digests, bins) -> str:
     """What the finished outputs depend on, independent of nprocs: the ordered surviving
     pockets (item, sha256), the PocketMatch binaries, the drugScore cutoff, DrugScore.csv
-    and Protein_info.csv."""
+    (whose sha256 covers its `Selected` column, i.e. the pockets stage's selection) and
+    Protein_info.csv."""
     payload = {"pockets": [[_item(p), dg] for p, dg in zip(survivors, digests)],
                "pocketmatch_sha256": bins, "drugscore_cutoff": DRUGSCORE_CUTOFF,
                "drugscore_sha256": sha256_file(layout.drugscore_csv),
@@ -852,7 +884,8 @@ def run(layout, args, progress) -> dict:
     versions = _versions(pm)
     fingerprint = _stage_fingerprint(layout, res.plan.paths, res.digests,
                                      versions["pocketmatch_sha256"])
-    write_manifest(d, STAGE, args={"nprocs": args.nprocs, "drugscore_cutoff": DRUGSCORE_CUTOFF},
+    write_manifest(d, STAGE, args={"nprocs": args.nprocs, "drugscore_cutoff": DRUGSCORE_CUTOFF,
+                                   "selection": selection_used(layout.pockets)},
                    inputs=[layout.drugscore_csv, layout.protein_info], versions=versions,
                    counts=counts, timing={},
                    extra={"fingerprint": fingerprint,

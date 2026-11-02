@@ -24,15 +24,15 @@ WORKER = REPO / "bin" / "polyphar-dogsite-worker"
 WRAPPER = REPO / "bin" / "polyphar-docker"
 FAKE = REPO / "tests" / "fixtures" / "fake_dogsite"
 BENCH = REPO / "polyphar" / "data" / "bench" / "2mjw_B.pdb"
-HINT = "license/installation problem — see README §DoGSiteScorer"
+HINT = "license/installation problem — see README §Pocket detection (DoGSite3 / DoGSiteScorer)"
 INFO_COLUMNS = ["UniProt ID", "Gene Name", "PDB", "Chain ID", "AlphaFold", "Resolution",
                 "Structure method", "SIFTS coverage", "File", "SIFTS segments",
                 "SIFTS other accessions"]
 
 
-def _make_run(root, names, acc="P25815"):
+def _make_run(root, names, acc="P25815", tool="dogsite2"):
     """Run folder with fixed PDB chains `names` (e.g. "2mjw_B") listed in
-    Protein_info.csv, and their jobs enqueued. Returns the layout."""
+    Protein_info.csv, and their jobs enqueued for `tool`. Returns the layout."""
     layout = RunLayout(root)
     rows = []
     for name in names:
@@ -45,19 +45,21 @@ def _make_run(root, names, acc="P25815"):
                      f"02_structures/{acc}/{name}.pdb", "1:999", ""])
     layout.structures.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(rows, columns=INFO_COLUMNS).to_csv(layout.protein_info, index=False)
-    pockets.enqueue(layout)
+    pockets.enqueue(layout, tool)
     return layout
 
 
-def _worker_cmd(run_dir, dogsite=FAKE, *extra):
+def _worker_cmd(run_dir, dogsite=FAKE, *extra, tool="dogsite2"):
+    """The worker command line; tool=None leaves --tool out (the default, dogsite3)."""
     return [sys.executable, str(WORKER), "--run-dir", str(run_dir),
-            "--dogsite", str(dogsite), *extra]
+            "--dogsite", str(dogsite), *(["--tool", tool] if tool else []), *extra]
 
 
 def _env(**kw):
     env = {k: v for k, v in os.environ.items()
            if k not in ("FAKE_DOGSITE_SLEEP", "FAKE_DOGSITE_LOG", "DOGSITE_BIN", "NPROCS",
-                        "POLYPHAR_PREFLIGHT_TIMEOUT")}
+                        "POLYPHAR_PREFLIGHT_TIMEOUT", "POLYPHAR_POCKET_TOOL",
+                                 "FAKE_DOGSITE_ARGS_LOG")}
     env.update({k: str(v) for k, v in kw.items()})
     return env
 
@@ -81,19 +83,102 @@ def test_worker_runs_queue_with_stub(tmp_path):
                               "P25815_2mjw_C.done"]   # no heartbeat
     for name in ("2mjw_B", "2mjw_C", "1abc_A"):
         done = json.loads((layout.pockets / "queue" / f"P25815_{name}.done").read_text())
-        assert set(done) == {"exit", "seconds", "dogsite_sha256"}
+        assert set(done) == {"exit", "seconds", "dogsite_sha256", "tool", "tool_version"}
+        assert (done["tool"], done["tool_version"]) == ("dogsite2", "unknown")
         assert done["exit"] == 0 and done["seconds"] >= 0
         assert done["dogsite_sha256"] == sha256_file(FAKE)
         out = layout.pockets / "P25815" / f"P25815_{name}.pdb"
         assert Path(f"{out}_desc.txt").is_file()
         assert Path(f"{out}_res_P_1.pdb").read_text().startswith("HEADER")
         assert (layout.pdbfixer / "P25815" / f"{name}.pdb").read_text() == f"ATOM {name}\n"
-    df = pockets.parse_pockets(layout.pockets, layout.protein_info)
+    df = pockets.parse_pockets(layout.pockets, layout.protein_info, "dogsite2")
     assert list(df["Pocket Filename"]) == [f"P25815_{n}.pdb_res_P_1.pdb"
                                            for n in ("2mjw_B", "2mjw_C", "1abc_A")]
     assert (df["drugScore"] >= 0.5).all()     # the fake pocket survives the 0.5 cutoff
     res = lambda n: (layout.pockets / "P25815" / f"P25815_{n}.pdb_res_P_1.pdb").read_text()
     assert res("2mjw_B") != res("1abc_A")      # different models, different pockets
+
+
+def test_worker_runs_dogsite3_jobs_by_default(tmp_path):
+    """No --tool: DoGSite3, with its command line, output names and version in .done."""
+    layout = _make_run(tmp_path, ["2mjw_B", "1abc_A"], tool="dogsite3")
+    args_log = tmp_path / "args.log"
+    r = subprocess.run(_worker_cmd(tmp_path, FAKE, tool=None),
+                       env=_env(FAKE_DOGSITE_ARGS_LOG=args_log), capture_output=True, text=True,
+                       timeout=60)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert _queue(layout) == ["P25815_1abc_A.done", "P25815_2mjw_B.done"]
+    lines = args_log.read_text().splitlines()
+    out = layout.pockets / "P25815" / "2mjw_B"
+    model = layout.pdbfixer / "P25815" / "2mjw_B.pdb"
+    assert f"-p {model} -o {out} -s -d --writeSiteResiduesPDB -v 1" in lines
+    assert lines[0].endswith(" -s -d --writeSiteResiduesPDB -v 1")      # the preflight too
+    done = json.loads((layout.pockets / "queue" / "P25815_2mjw_B.done").read_text())
+    assert done["tool"] == "dogsite3" and done["tool_version"] == "unknown"   # no VERSION_INFO
+    assert Path(f"{out}_desc.txt").is_file() and Path(f"{out}_P_1_res.pdb").is_file()
+    assert not list(layout.pockets.glob("P25815/*_res_P_*"))
+    df = pockets.parse_pockets(layout.pockets, layout.protein_info, "dogsite3")
+    assert all((layout.pockets / "P25815" / f).is_file() for f in df["Pocket Filename"])
+    assert (df["volume"] >= 300).any() and (df["volume"] < 300).any()
+
+
+def test_worker_refuses_a_job_of_the_other_tool(tmp_path):
+    layout = _make_run(tmp_path, ["2mjw_B"], tool="dogsite3")
+    q = layout.pockets / "queue"
+    legacy = {"model": "03_pdbfixer/P25815/2mjw_B.pdb", "out": "04_pockets/P25815/x.pdb",
+              "size": 1}                       # no "tool": a DoGSiteScorer 2 era job
+    (q / "P25815_x.job").write_text(json.dumps(legacy))
+    r = subprocess.run(_worker_cmd(tmp_path, FAKE, tool="dogsite3"), env=_env(),
+                       capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stderr
+    assert _queue(layout) == ["P25815_2mjw_B.done", "P25815_x.failed"]
+    failed = json.loads((q / "P25815_x.failed").read_text())
+    assert "job is for dogsite2, this worker runs dogsite3" in failed["reason"]
+    assert not (layout.pockets / "P25815" / "x.pdb_desc.txt").exists()
+    # the stage reports it with the reason
+    assert "job is for dogsite2" in pockets._failure_reason(failed)
+
+
+def test_tool_version_from_version_info_or_help(tmp_path):
+    mod = _load_worker_module()
+    assert mod.tool_version(str(FAKE)) == "unknown"     # fake --help has no version
+    d = tmp_path / "dogsite3"
+    d.mkdir()
+    shutil.copy(FAKE, d / "dogsite3")
+    (d / "VERSION_INFO").write_text("Tool:           dogsite3\nVersion:        1.3.0\n"
+                                    "Build Platform: ubuntu-20.04-64bit\n")
+    assert mod.tool_version(str(d / "dogsite3")) == "1.3.0"
+    (d / "VERSION_INFO").unlink()
+    (d / "dogsite3").write_text("#!/bin/sh\necho 'DoGSiteScorer version 2.0.1'\n")
+    (d / "dogsite3").chmod(0o755)
+    assert mod.tool_version(str(d / "dogsite3")) == "2.0.1"
+
+
+def test_worker_rejects_unknown_tool(tmp_path):
+    _make_run(tmp_path, ["2mjw_B"])
+    r = subprocess.run(_worker_cmd(tmp_path, FAKE, tool="fpocket"), env=_env(),
+                       capture_output=True, text=True, timeout=60)
+    assert r.returncode == 2 and "--tool" in r.stderr
+    r = subprocess.run(_worker_cmd(tmp_path, FAKE, tool=None),
+                       env=_env(POLYPHAR_POCKET_TOOL="dogsite4"), capture_output=True, text=True,
+                       timeout=60)
+    assert r.returncode == 2 and "dogsite4" in r.stderr
+
+
+def test_benchmark_calibration_is_per_tool(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "calibration.json").write_text(json.dumps(
+        {"pockets": {"seconds_per_unit": 1.0, "n_observations": 5, "nproc": 8,
+                     "cpu_model": "x", "updated": "2026-01-01T00:00:00+00:00"}}))  # no tool
+    for tool, n in (("dogsite3", 1), ("dogsite3", 2), ("dogsite2", 1)):
+        r = subprocess.run([sys.executable, str(WORKER), "--benchmark", "--dogsite", str(FAKE),
+                            "--tool", tool], env=_env(POLYPHAR_HOME=home),
+                           capture_output=True, text=True, timeout=60)
+        assert r.returncode == 0, r.stdout + r.stderr
+        entry = json.loads((home / "calibration.json").read_text())["pockets"]
+        assert (entry["tool"], entry["n_observations"]) == (tool, n)
+        assert entry["seconds_per_unit"] < 1.0   # the legacy 1.0 was never averaged in
 
 
 def test_fake_dogsite_varies_pocket_by_model(tmp_path):
@@ -409,7 +494,9 @@ def test_benchmark_writes_pockets_calibration(tmp_path):
     cal = json.loads((home / "calibration.json").read_text())
     assert cal["fix"]["n_observations"] == 3            # other entries kept
     entry = cal["pockets"]
-    assert set(entry) == {"seconds_per_unit", "n_observations", "nproc", "cpu_model", "updated"}
+    assert set(entry) == {"seconds_per_unit", "n_observations", "nproc", "cpu_model", "updated",
+                          "tool"}
+    assert entry["tool"] == "dogsite3"            # the default tool
     assert entry["n_observations"] == 1
     # per byte, single process: >= the fake's 0.2 s sleep over the bench bytes
     bench_bytes = sum(p.stat().st_size for p in BENCH.parent.glob("*.pdb"))
@@ -417,7 +504,8 @@ def test_benchmark_writes_pockets_calibration(tmp_path):
     assert [p.name for p in home.iterdir()] == ["calibration.json"]   # no temp left
     # the polyphar ETA engine reads it
     from polyphar.eta import Calibration
-    assert Calibration.load(home).cost("pockets") == entry["seconds_per_unit"]
+    assert Calibration.load(home).cost("pockets", "dogsite3") == entry["seconds_per_unit"]
+    assert Calibration.load(home).cost("pockets", "dogsite2") is None
 
 
 def test_worker_is_stdlib_python38_and_standalone():
@@ -443,6 +531,7 @@ def test_worker_is_stdlib_python38_and_standalone():
 
 FAKE_DOCKER = """#!/bin/sh
 # records whether a DoGSiteScorer worker heartbeat exists while "the container" runs
+echo "$@" > "$RUN/docker_args"
 q="$RUN/04_pockets/queue"
 n=$(ls "$q" 2>/dev/null | grep -c '^WORKER\\.' || true)
 echo "$n" > "$RUN/docker_saw_workers"
@@ -498,6 +587,49 @@ def test_wrapper_passes_nprocs_to_worker(tmp_path, argv, env, expected):
     cmd = (run_dir / "docker_saw_cmd").read_text().split()
     assert cmd[cmd.index("--nprocs") + 1] == expected
     assert _no_worker_left(run_dir)
+
+
+@pytest.mark.parametrize("argv, env, expected", [
+    (["pockets"], {}, "dogsite3"),
+    (["pockets"], {"POLYPHAR_POCKET_TOOL": "dogsite2"}, "dogsite2"),
+    (["pockets", "--pocket-tool", "dogsite2"], {"POLYPHAR_POCKET_TOOL": "dogsite3"}, "dogsite2"),
+    (["run", "--from", "fix", "--pocket-tool=dogsite3"], {"POLYPHAR_POCKET_TOOL": "dogsite2"},
+     "dogsite3"),
+])
+def test_wrapper_passes_the_pocket_tool_to_worker_and_container(tmp_path, argv, env, expected):
+    run_dir, env = _fake_docker_env(tmp_path, **env)
+    home = Path(env["POLYPHAR_HOME"])
+    (home / "calibration.json").write_text(json.dumps(
+        {"pockets": {"seconds_per_unit": 1e-6, "n_observations": 1, "tool": expected}}))
+    r = subprocess.run([str(WRAPPER), *argv], env=env, capture_output=True, text=True,
+                       timeout=60)
+    assert r.returncode == 0, r.stdout + r.stderr
+    cmd = (run_dir / "docker_saw_cmd").read_text().split()
+    assert cmd[cmd.index("--tool") + 1] == expected
+    assert f"POLYPHAR_POCKET_TOOL={expected}" in (run_dir / "docker_args").read_text().split()
+    assert _no_worker_left(run_dir)
+
+
+def test_wrapper_rejects_an_unknown_pocket_tool(tmp_path):
+    run_dir, env = _fake_docker_env(tmp_path)
+    r = subprocess.run([str(WRAPPER), "pockets", "--pocket-tool", "fpocket"], env=env,
+                       capture_output=True, text=True, timeout=60)
+    assert r.returncode == 2 and "fpocket" in r.stderr
+    assert not (run_dir / "docker_args").exists()
+
+
+def test_wrapper_benchmarks_when_the_calibration_is_of_the_other_tool(tmp_path):
+    run_dir, env = _fake_docker_env(tmp_path)    # calibrated, but without a tool: dogsite2
+    home = Path(env["POLYPHAR_HOME"])
+    r = subprocess.run([str(WRAPPER), "run"], env=env, capture_output=True, text=True,
+                       timeout=60)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert json.loads((home / "calibration.json").read_text())["pockets"]["tool"] == "dogsite3"
+    stamp = (home / "calibration.json").stat().st_mtime_ns
+    r = subprocess.run([str(WRAPPER), "run"], env=env, capture_output=True, text=True,
+                       timeout=60)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert (home / "calibration.json").stat().st_mtime_ns == stamp   # calibrated: no rerun
 
 
 def test_wrapper_sighup_stops_container_and_worker(tmp_path):
@@ -622,9 +754,12 @@ def test_wrapper_starts_and_stops_worker(tmp_path):
                        capture_output=True, text=True, timeout=300)
     assert r.returncode == 0, r.stdout + r.stderr
     df = pd.read_csv(layout.drugscore_csv, index_col=0)
-    assert sorted(df["Pocket Filename"]) == sorted(f"P25815_{n}.pdb_res_P_1.pdb" for n in names)
+    assert {f.split("_P_")[0] for f in df["Pocket Filename"]} == set(names)   # dogsite3 names
+    assert all((layout.pockets / "P25815" / f).is_file() for f in df["Pocket Filename"])
+    assert set(df["Tool"]) == {"dogsite3"} and df["Selected"].any()
     man = json.loads((layout.pockets / "manifest.json").read_text())
     assert man["versions"]["dogsite_sha256"] == sha256_file(FAKE)
+    assert man["versions"]["pocket_tool"] == "dogsite3"
     left = subprocess.run(["pgrep", "-f", f"polyphar-dogsite-worker --run-dir {run_dir}"],
                           capture_output=True, text=True)
     assert left.stdout.strip() == "", "worker still running after the wrapper exited"
@@ -675,7 +810,7 @@ def test_closed_stdout_does_not_kill_the_worker(tmp_path):
 def test_finish_never_writes_failed_after_done(tmp_path, monkeypatch):
     w = _load_worker_module()
     layout = _make_run(tmp_path, ["2mjw_B"])
-    worker = w.Worker(str(tmp_path), str(FAKE), 1, False)
+    worker = w.Worker(str(tmp_path), str(FAKE), 1, False, tool="dogsite2")
     jid, running = worker.claim_next()
 
     def boom(*a, **kw):

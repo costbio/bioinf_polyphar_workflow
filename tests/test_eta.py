@@ -283,3 +283,30 @@ def test_progress_size_mode_advance_without_size_uses_mean_unit_size(tmp_path):
     p.advance(2)
     p.done({})
     assert calib.cost("fix") == 40.0 / 400.0   # calibration no longer skipped
+
+
+def test_pockets_calibration_is_per_tool(tmp_path):
+    from polyphar.eta import Calibration, estimate_stage
+    from polyphar.common import WorkUnits
+
+    cal = Calibration(tmp_path / "calibration.json",
+                      {"pockets": {"seconds_per_unit": 2e-6, "n_observations": 3}})
+    # an entry without a tool predates DoGSite3: DoGSiteScorer 2
+    assert cal.tool_of("pockets") == "dogsite2"
+    assert cal.cost("pockets") == 2e-6 and cal.cost("pockets", "dogsite2") == 2e-6
+    assert cal.cost("pockets", "dogsite3") is None
+    units = WorkUnits(2, "bytes", [1e6, 1e6])
+    est = estimate_stage("pockets", units, 4, cal, tool="dogsite3")
+    assert est.seconds is None
+    assert "uncalibrated for dogsite3 (calibration.json has dogsite2)" in est.basis
+    assert estimate_stage("pockets", units, 4, cal, tool="dogsite2").seconds > 0
+    # a measurement of the other tool replaces the entry instead of averaging into it
+    cal.update("pockets", 1e-5, "dogsite3")
+    assert cal.data["pockets"]["tool"] == "dogsite3"
+    assert cal.data["pockets"]["n_observations"] == 1
+    assert cal.cost("pockets", "dogsite3") == 1e-5 and cal.cost("pockets", "dogsite2") is None
+    cal.update("pockets", 3e-5, "dogsite3")
+    assert cal.data["pockets"]["n_observations"] == 2
+    assert abs(cal.cost("pockets", "dogsite3") - 2e-5) < 1e-12
+    cal.save()
+    assert Calibration.load(tmp_path).tool_of("pockets") == "dogsite3"

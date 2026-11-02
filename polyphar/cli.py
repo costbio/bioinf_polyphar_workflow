@@ -31,7 +31,8 @@ STAGES = {
     "uniprot": ("polyphar.stages.uniprot", "fetch UniProt records"),
     "structures": ("polyphar.stages.structures", "download PDB/AlphaFold structures"),
     "fix": ("polyphar.stages.fix", "repair structures with pdbfixer"),
-    "pockets": ("polyphar.stages.pockets", "detect pockets (DoGSiteScorer, host only)"),
+    "pockets": ("polyphar.stages.pockets",
+                "detect pockets (DoGSite3 or DoGSiteScorer 2, host only)"),
     "similarity": ("polyphar.stages.similarity", "PocketMatch pocket similarity"),
     "select": ("polyphar.stages.select", "select polypharmacology targets"),
     "dock": ("polyphar.stages.dock", "dock the ligand library with smina"),
@@ -163,8 +164,9 @@ def gate(name, stage, layout, args, notifier, record=None, units=None) -> dict:
     if units is None:
         units = stage.units(layout, args)
     calib = Calibration.load(polyphar_home())
+    tool = stage.calibration_tool(args) if hasattr(stage, "calibration_tool") else None
     est = estimate_stage(name, units, args.nprocs, calib, PARALLEL_EFFICIENCY,
-                         threads_per_job=tpj)
+                         threads_per_job=tpj, tool=tool)
     record.update(units=f"{units.count} ({units.cost_basis})", estimate_s=est.seconds)
     eta = format_eta(est, datetime.now())
     line = f"{name}: {units.count} units ({units.cost_basis}) - ETA {eta}"
@@ -175,7 +177,7 @@ def gate(name, stage, layout, args, notifier, record=None, units=None) -> dict:
     total_size = float(sum(units.sizes)) if units.sizes else None
     progress = Progress(name, units.count, est, notifier, total_size=total_size,
                         calib=calib, slots=slots_for(name, args.nprocs, tpj) or 1.0,
-                        log_path=layout.logs / f"{name}.log")
+                        log_path=layout.logs / f"{name}.log", tool=tool)
     previous = _install_sigterm_handler()
     t0 = time.monotonic()
     try:

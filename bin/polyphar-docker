@@ -5,7 +5,11 @@
 #
 # Environment:
 #   POLYPHAR_RUN_DIR      run folder on the host (default: current directory)
-#   DOGSITE_BIN           host DoGSiteScorer binary (needed by pockets / run / benchmark)
+#   DOGSITE_BIN           host pocket-detection binary of the chosen tool (needed by
+#                         pockets / run / benchmark), e.g. /opt/ZBH/dogsite3/dogsite3
+#   POLYPHAR_POCKET_TOOL  dogsite3 (default) or dogsite2; a `--pocket-tool X` argument wins.
+#                         The same tool goes to the host worker (--tool) and the container
+#                         (env; the stage also writes it into every job file)
 #   POLYPHAR_HOME         calibration / pushover.env dir (default: ~/.polyphar)
 #   POLYPHAR_VERSION      image tag (default: latest)
 #   NPROCS                worker processes (passed through)
@@ -26,10 +30,30 @@ home_dir="${POLYPHAR_HOME:-$HOME/.polyphar}"
 mkdir -p "$home_dir"
 home_dir="$(realpath "$home_dir")"
 
+# --- pocket tool: --pocket-tool X / --pocket-tool=X, else $POLYPHAR_POCKET_TOOL, else dogsite3
+pocket_tool="${POLYPHAR_POCKET_TOOL:-dogsite3}"
+prev=""
+for a in "$@"; do
+    if [ "$prev" = "--pocket-tool" ]; then
+        pocket_tool="$a"
+    fi
+    case "$a" in
+        --pocket-tool=*) pocket_tool="${a#--pocket-tool=}" ;;
+    esac
+    prev="$a"
+done
+case "$pocket_tool" in
+    dogsite3|dogsite2) ;;
+    *)
+        echo "polyphar-docker: pocket tool must be dogsite3 or dogsite2 (got '$pocket_tool')" >&2
+        exit 2 ;;
+esac
+
 opts=(--rm --init --user "$(id -u):$(id -g)"
       -v "$run_dir":/work
       -v "$home_dir":/polyphar_home
       -e NPROCS
+      -e POLYPHAR_POCKET_TOOL="$pocket_tool"
       -e POLYPHAR_RUN_NAME="$(basename "$run_dir")")
 if [ -f "$home_dir/pushover.env" ]; then
     opts+=(--env-file "$home_dir/pushover.env")
@@ -56,7 +80,7 @@ image="polyphar:${POLYPHAR_VERSION:-latest}"
 # FAILED notification and summary) instead of letting pockets wait for a dead worker.
 # Host calibration of pockets (worker --benchmark) runs before the container for
 # `benchmark`, and for `run` (including pockets) when calibration.json has no pockets
-# entry yet.
+# entry for this pocket tool yet (an entry without a tool is dogsite2's).
 worker="$(dirname "$(realpath "$0")")/polyphar-dogsite-worker"
 stage_index() {
     case "$1" in
@@ -108,10 +132,11 @@ case "${1:-}" in
         done
         if [ "${from:-0}" -le 4 ] && [ "${to:-7}" -ge 4 ]; then
             want_worker=1
-            if ! python3 - "$home_dir/calibration.json" <<'PY' 2>/dev/null
+            if ! python3 - "$home_dir/calibration.json" "$pocket_tool" <<'PY' 2>/dev/null
 import json, sys
 entry = json.load(open(sys.argv[1])).get("pockets") or {}
-sys.exit(0 if float(entry.get("seconds_per_unit", 0)) > 0 else 1)
+same_tool = (entry.get("tool") or "dogsite2") == sys.argv[2]
+sys.exit(0 if same_tool and float(entry.get("seconds_per_unit", 0)) > 0 else 1)
 PY
             then
                 want_bench=1
@@ -132,8 +157,8 @@ fi
 
 if [ -z "${DOGSITE_BIN:-}" ]; then
     if [ "$want_worker" = 1 ]; then
-        echo "polyphar-docker: DOGSITE_BIN is not set; pockets needs the host DoGSiteScorer" \
-             "binary (export DOGSITE_BIN=/path/to/dogsite)" >&2
+        echo "polyphar-docker: DOGSITE_BIN is not set; pockets needs the host $pocket_tool" \
+             "binary (export DOGSITE_BIN=/opt/ZBH/dogsite3/dogsite3 for dogsite3)" >&2
         exit 2
     fi
     echo "polyphar-docker: DOGSITE_BIN is not set; pockets is not calibrated (host only)" >&2
@@ -143,7 +168,7 @@ fi
 if [ "$want_bench" = 1 ]; then
     bench_status=0
     POLYPHAR_HOME="$home_dir" "$worker" --benchmark --dogsite "$DOGSITE_BIN" \
-        --preflight-timeout "$preflight_timeout" || bench_status=$?
+        --tool "$pocket_tool" --preflight-timeout "$preflight_timeout" || bench_status=$?
     if [ "$bench_status" != 0 ]; then
         echo "polyphar-docker: DoGSiteScorer benchmark failed (exit $bench_status)" >&2
         if [ "$want_worker" = 1 ]; then
@@ -178,8 +203,9 @@ if [ "$want_worker" = 1 ]; then
     queue="$run_dir/04_pockets/queue"
     mkdir -p "$queue"
     rm -f "$queue/CLOSED"   # left by an earlier run; it would stop the new worker
-    "$worker" --run-dir "$run_dir" --dogsite "$DOGSITE_BIN" --nprocs "$worker_nprocs" \
-        --preflight-timeout "$preflight_timeout" --job-timeout "$job_timeout" --watch &
+    "$worker" --run-dir "$run_dir" --dogsite "$DOGSITE_BIN" --tool "$pocket_tool" \
+        --nprocs "$worker_nprocs" --preflight-timeout "$preflight_timeout" \
+        --job-timeout "$job_timeout" --watch &
     worker_pid=$!
     # The worker's heartbeat appears once its preflight passed.
     start_deadline=$((SECONDS + preflight_timeout + 60))

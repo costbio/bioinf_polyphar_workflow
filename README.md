@@ -7,13 +7,14 @@
 1. reviewed human UniProt records,
 2. PDB chains (SIFTS-mapped) and AlphaFold models,
 3. pdbfixer repair,
-4. DoGSiteScorer pockets,
+4. DoGSite3 pockets (DoGSiteScorer 2 as an alternative),
 5. [PocketMatch 2.0](https://github.com/1337deepesh/PocketMatch_v2.0) pocket-pair similarities,
 6. target selection on the similarity network (hub + neighbours),
 7. smina docking of a ligand library (e-Drug3D) into the selected targets.
 
-Everything runs through one CLI, `polyphar <stage>`, in a Docker image. DoGSiteScorer is the
-exception: it runs on the host (see [DoGSiteScorer](#dogsitescorer)). Each stage prints and
+Everything runs through one CLI, `polyphar <stage>`, in a Docker image. Pocket detection is the
+exception: DoGSite3 (or DoGSiteScorer 2) runs on the host (see
+[Pocket detection](#pocket-detection-dogsite3--dogsitescorer)). Each stage prints and
 notifies its exact work units and ETA before it starts, and every stage can be resumed.
 
 ## First-time server setup
@@ -22,20 +23,25 @@ Do these once per machine, in this order. Each step checks something the next on
 You need `git`, `docker` (your user in the `docker` group), `conda` or `mamba`, `tmux` and a
 system `python3` ≥ 3.8 on the host.
 
-1. **Clone the repo and create the host env.** The DoGSiteScorer tests and the regression
+1. **Clone the repo and create the host env.** The DoGSite3 tests and the regression
    checks run on the host.
 
        git clone https://github.com/costbio/bioinf_polyphar_workflow.git ~/repos/bioinf_polyphar_workflow
        REPO=~/repos/bioinf_polyphar_workflow && cd "$REPO"
        conda env create -f environment.yml && conda activate polyphar && pip install -e .
 
-2. **Install and license DoGSiteScorer on the host**, then check that it runs. `--benchmark`
-   first runs the worker's preflight, which is one DoGSiteScorer call on a bench chain. It
-   then stores the `pockets` calibration in `~/.polyphar/calibration.json`. Exit code 3 means
-   a license or installation problem, and the binary's error is printed.
+2. **Install and license DoGSite3 on the host**, then check that it runs. The ZBH installer
+   puts the binary at `/opt/ZBH/dogsite3/dogsite3` (with `VERSION_INFO` next to it). Activate
+   the license once, as the user who runs polyphar: `dogsite3 --license <key>`. `--benchmark`
+   first runs the worker's preflight, which is one DoGSite3 call on a bench chain. It then
+   stores the `pockets` calibration (for this tool) in `~/.polyphar/calibration.json`. Exit
+   code 3 means a license or installation problem, and the binary's error is printed.
 
-       export DOGSITE_BIN=/opt/dogsite/dogsite
-       python3 "$REPO"/bin/polyphar-dogsite-worker --benchmark
+       export DOGSITE_BIN=/opt/ZBH/dogsite3/dogsite3
+       python3 "$REPO"/bin/polyphar-dogsite-worker --benchmark     # --tool dogsite3 (default)
+
+   For DoGSiteScorer 2 instead, set `DOGSITE_BIN` to its binary and add `--tool dogsite2`
+   here and `POLYPHAR_POCKET_TOOL=dogsite2` (or `--pocket-tool dogsite2`) for the runs.
 
 3. **Build the image.** The tag you choose is what `POLYPHAR_VERSION` selects later. Also tag
    it `dev`: `tests/test_docker.py` looks for `polyphar:dev` and skips silently without it.
@@ -47,15 +53,17 @@ system `python3` ≥ 3.8 on the host.
 4. **Check the machine.**
    - The PocketMatch binaries run in the image. `Exec format error` means the kernel lacks
      IA32 emulation (see [Server checks](#server-checks)).
-   - The wrapper runs as your user, with the real DoGSiteScorer.
+   - The wrapper runs as your user, with the real DoGSite3.
    - RCSB and AlphaFold downloads work.
 
        pytest -W error tests/test_docker.py
        pytest -W error -m "dogsite and not regression" tests/test_stage_pockets.py
        pytest -W error tests/test_stage_structures.py -k end_to_end
 
-5. **Compare the new DoGSiteScorer with the 2023 pockets.** This tells you whether the newly
-   licensed binary behaves like the one used in 2023. It reruns three net2 PLK1 chains and
+5. **DoGSiteScorer 2 only: compare it with the 2023 pockets.** This tells you whether a newly
+   licensed DoGSiteScorer 2 binary behaves like the one used in 2023 (DoGSite3 is a different
+   method, so it skips; set `POLYPHAR_POCKET_TOOL=dogsite2` and `DOGSITE_BIN` to the
+   DoGSiteScorer 2 binary). It reruns three net2 PLK1 chains and
    requires the same pocket names, with drugScore within 1e-4. It needs only a small part of
    the 2023 data, so copy that from the workstation (adjust the host name):
 
@@ -64,7 +72,8 @@ system `python3` ≥ 3.8 on the host.
            ~/adep_csb/disease_subtypes/Liver_cancer/net2/pockets/
        rsync -av 'workstation:/mnt/c/experiments/adep_csb/disease_subtypes/Liver_cancer/net2/pdbfixer/P53350/{2ogq_A,4o56_A,4h5x_B}.pdb' \
            ~/adep_csb/disease_subtypes/Liver_cancer/net2/pdbfixer/P53350/
-       ADEP_DATA=~/adep_csb pytest -W error -m "dogsite and regression" tests/test_stage_pockets.py
+       POLYPHAR_POCKET_TOOL=dogsite2 ADEP_DATA=~/adep_csb \
+           pytest -W error -m "dogsite and regression" tests/test_stage_pockets.py
 
    If this fails, the DoGSiteScorer version differs from 2023. Don't start a rerun until
    that is understood: pockets, and everything after them, would not be comparable.
@@ -103,7 +112,7 @@ Make a run folder (one per subtype), put the inputs in `inputs/`, and run everyt
     mkdir -p ~/runs/net1/inputs
     cp clusters_features_ppi.xlsx e-Drug3D_2083.sdf ~/runs/net1/inputs/
     cd ~/runs/net1
-    export POLYPHAR_VERSION=dev DOGSITE_BIN=/opt/dogsite/dogsite NPROCS=32
+    export POLYPHAR_VERSION=dev DOGSITE_BIN=/opt/ZBH/dogsite3/dogsite3 NPROCS=32
     "$REPO"/bin/polyphar-docker run --dry-run        # ETA table, does nothing
     "$REPO"/bin/polyphar-docker run --xlsx inputs/clusters_features_ppi.xlsx --sheet net1 \
         --id-column "uniprot Entry" --reviewed-column "Reviewed/unreviewed"
@@ -129,7 +138,7 @@ your shell when the tmux server is already running, so pass them inside the comm
 (or with `tmux new -e VAR=value`):
 
     cd ~/runs/net1
-    tmux new -s net1 "POLYPHAR_VERSION=dev DOGSITE_BIN=/opt/dogsite/dogsite NPROCS=32 \"$REPO\"/bin/polyphar-docker run"
+    tmux new -s net1 "POLYPHAR_VERSION=dev DOGSITE_BIN=/opt/ZBH/dogsite3/dogsite3 NPROCS=32 \"$REPO\"/bin/polyphar-docker run"
     # or
     mkdir -p logs && nohup "$REPO"/bin/polyphar-docker run > logs/run.out 2>&1 &
 
@@ -142,7 +151,7 @@ summary and pool cleanup (exit 129).
 (Once `00_ids/ids.txt` exists, `run` needs no ids options: see below.)
 
 Do not use `docker run -d`. The wrapper must stay alive because it supervises the host
-DoGSiteScorer worker, and stops it when the container exits.
+pocket worker, and stops it when the container exits.
 
 ### `polyphar run`
 
@@ -237,8 +246,9 @@ All stages take `--run-dir` (default `/work` in the container, else the current 
     polyphar uniprot                                  # reviewed human entries only
     polyphar structures                               # SIFTS chains + AlphaFold F1 models
     polyphar fix [--ph 7.0]
-    polyphar pockets [--worker-timeout 600] [--worker-dead-after 21600]
-                                                      # host worker runs DoGSiteScorer
+    polyphar pockets [--pocket-tool dogsite3] [--min-volume 300] [--drugscore-cutoff 0.5] \
+                     [--worker-timeout 600] [--worker-dead-after 21600]
+                                                      # host worker runs DoGSite3 / DoGSiteScorer 2
     polyphar similarity [--pm-bin-dir /opt/pocketmatch]
     polyphar select [--pmax 0.7] [--exclude O15350] [--hub-tie-break union]
     polyphar dock --library inputs/e-Drug3D_2083.sdf [--seed 42] [--chunk-size 50] \
@@ -258,7 +268,8 @@ exits 3, like `run`, and sends its `done` notification at priority 1.
 - **`polyphar benchmark`** times a small fixture workload per stage on one process and
   stores seconds per unit in `~/.polyphar/calibration.json`. Every finished stage also
   updates its entry. `pockets` is calibrated on the host by
-  `bin/polyphar-dogsite-worker --benchmark`, which the wrapper runs when the entry is missing.
+  `bin/polyphar-dogsite-worker --benchmark --tool <tool>`, which the wrapper runs when there is
+  no entry for the run's pocket tool (a calibration of the other tool is never used).
 
 ## Old scripts -> subcommands (for Methods)
 
@@ -309,8 +320,19 @@ exits 3, like `run`, and sends its `done` notification at priority 1.
   manifest.
 - **Ligands**: smina `--addH 1` (its default, pinned explicitly), `--seed 42`. Kept from
   2023: exhaustiveness 12, num_modes 12, unpadded box over the pocket atoms.
+- **Pocket detection with DoGSite3** (default; see
+  [Pocket detection](#pocket-detection-dogsite3--dogsitescorer)). 2023 used DoGSiteScorer 2
+  (`-s -i -y -d -w 4`) and kept pockets with drugScore >= 0.5. polyphar now runs DoGSite3
+  (`dogsite3 -p <model> -o <out> -s -d --writeSiteResiduesPDB -v 1`, version recorded in the
+  manifest), which reports pocket descriptors (volume, enclosure, depth, ...) but no
+  drugScore. Pockets and subpockets with a volume of at least 300 Å³ are kept, a fixed
+  cutoff [citation]. Suggested Methods text: "Binding pockets and subpockets were detected
+  with DoGSite3 (version 1.3.0) [citation] on each pdbfixer-repaired PDB chain and each
+  AlphaFold model, with subpocket detection enabled. Pockets (and subpockets) with a volume
+  of at least 300 Å³ were retained for pocket similarity [citation]." DoGSiteScorer 2 with
+  the 2023 rule stays available (`--pocket-tool dogsite2`).
 - **Fusion / chimeric chains.** A chain SIFTS maps to several accessions (a fusion construct,
-  e.g. a target fused to MBP or T4 lysozyme) is kept whole for pdbfixer and DoGSiteScorer.
+  e.g. a target fused to MBP or T4 lysozyme) is kept whole for pdbfixer and pocket detection.
   `Protein_info.csv` records the accession's SIFTS segments on that chain (`SIFTS segments`,
   `PDB_BEG:PDB_END` in author numbering) and the partners (`SIFTS other accessions`). A
   pocket with more than 50 % of its residues outside the segment(s) is dropped before
@@ -334,8 +356,8 @@ smina runs with exhaustiveness 12. With `--threads-per-job 1` (the default), `NP
 processes run at once and each does its 12 searches serially. That is the same total work as
 `--cpu 12`, and the results are byte-identical (`test_cpu_and_chunk_invariance`). For a tail
 of peptide-sized ligands that dominate the run time, use `--threads-per-job 12` so the last
-chunks use all cores. `NPROCS` also sets how many DoGSiteScorer jobs the host worker runs at
-once. Results do not depend on `--chunk-size`, but changing it re-docks everything (the chunk
+chunks use all cores. `NPROCS` also sets how many DoGSite3 / DoGSiteScorer jobs the host worker
+runs at once. Results do not depend on `--chunk-size`, but changing it re-docks everything (the chunk
 is part of the job key).
 
 ## Pushover notifications
@@ -369,28 +391,73 @@ These are sent:
 Every notification, sent or not (for example without credentials), is also recorded in
 `logs/notifications.log`.
 
-## DoGSiteScorer
+## Pocket detection (DoGSite3 / DoGSiteScorer)
 
-DoGSiteScorer's license is bound to the host. The binary is never copied or mounted into the
-image and never committed here.
+DoGSite3 (default) and DoGSiteScorer 2 are both licensed for the host. A binary is never
+copied or mounted into the image and never committed here.
 
-- **Install** it on the host and set `DOGSITE_BIN=/path/to/dogsite`. Flags are the legacy
-  `-s -i -y -d -w 4`, and pockets with `drugScore >= 0.5` are kept.
+- **Tool choice.** `--pocket-tool dogsite3|dogsite2` on `pockets` / `run` (default
+  `$POLYPHAR_POCKET_TOOL`, else `dogsite3`), with `DOGSITE_BIN` pointing to that tool's
+  binary. The wrapper reads the same option / variable and starts the host worker with
+  `--tool <tool>`; the stage also writes the tool into every job file, and a worker refuses a
+  job of the other tool (`failed`: `job is for X, this worker runs Y`).
+- **One tool per run folder.** The tool is recorded in `04_pockets/TOOL` when the stage
+  starts, in each `.done` and in the manifest (`versions.pocket_tool`,
+  `versions.dogsite_version`). A run asking for the other tool than the folder's existing
+  pocket outputs fails before anything is queued (`was made with --pocket-tool X, this run
+  asks for Y`); queue records and manifests without a tool are DoGSiteScorer 2 outputs of
+  earlier polyphar versions. Use a new run folder to switch tools.
+- **DoGSite3** (ZBH, Universität Hamburg; tested with 1.3.0): install with the ZBH
+  installer (`/opt/ZBH/dogsite3/dogsite3`) and activate the license once with
+  `dogsite3 --license <key>`. The worker runs
+  `dogsite3 -p <model> -o <out> -s -d --writeSiteResiduesPDB -v 1`: subpockets on (`-s`, as
+  with DoGSiteScorer 2), descriptors to `<out>_desc.txt` (`-d`), each (sub)pocket's complete
+  residues to `<out>_P_<n>[_<m>]_res.pdb` (the PocketMatch input). The version is read from
+  `VERSION_INFO` next to the binary (else `unknown`).
+  - **Selection: `volume >= 300 Å³`** (`--min-volume`), a fixed cutoff [citation]. DoGSite3
+    has no drugScore. Pockets and subpockets are judged alike, as drugScore was in 2023.
+  - **Names.** `<out>` = `04_pockets/<UniProt>/<pdb>_<chain>` for a PDB chain and
+    `04_pockets/<UniProt>/AF-<acc>-F1` for an AlphaFold model, so pocket files are e.g.
+    `2mjw_B_P_1_res.pdb` and `AF-P25815-F1_P_1_2_res.pdb`. The UniProt folder already names
+    the accession; only a chain extracted for several accessions (a chimeric chain) keeps
+    the `<UniProt>_` prefix, because PocketMatch keeps base names only and they must stay
+    unique. The longest realistic names (`AF-A0A0B4J2F0-F1_P_12_1_res.pdb`, 31 characters)
+    fit PocketMatch's 32-character limit, which `similarity` still checks.
+  - **Volumes are much smaller than DoGSiteScorer 2's.** On the same 20 pdbfixer chains of
+    the 2023 net2 run, the largest DoGSite3 pocket had a median 0.24× the volume of the
+    largest DoGSiteScorer 2 pocket (2OGQ_A, PLK1 kinase domain: 211 vs 546 Å³). Of 523
+    DoGSite3 pockets in 50 random net2 models (40 chains, 10 AlphaFold models), 11 (in 10
+    models) have volume >= 300 Å³; DoGSiteScorer 2 kept 40 pockets by drugScore >= 0.5 on
+    the 20 chains above. Check the selected-pocket counts (`counts.selected`) before
+    similarity.
+- **DoGSiteScorer 2**: flags `-s -i -y -d -w 4`, outputs
+  `<UniProt>_<pdb>_<chain>.pdb_desc.txt` / `..._res_P_<n>.pdb` as in 2023, selection
+  `drugScore >= 0.5` (`--drugscore-cutoff`).
+- **`DrugScore.csv`** (name kept from 2023) has `UniProt ID, Gene Name, Protein, Pocket`, the
+  tool's descriptor columns, `Pocket Filename` (the residue file on disk), `Tool` and
+  `Selected` (the tool's rule). The manifest records `selection_rule`. `similarity` uses the
+  rows with `Selected` true (a legacy `DrugScore.csv` without the column: `drugScore >= 0.5`).
+  Changing `--min-volume` / `--drugscore-cutoff` reruns `pockets` (selection only) on the
+  next `run`.
+- **Calibration** is per tool: `calibration.json`'s `pockets` entry records its `tool`; an
+  entry of the other tool (no `tool` = DoGSiteScorer 2) leaves the stage uncalibrated, and the
+  wrapper benchmarks the run's tool before `run`.
 - **Host worker.** `bin/polyphar-dogsite-worker` needs only Python ≥ 3.8 and its standard
   library. For `pockets` and `run`, the wrapper starts it with `--watch` and waits until its
-  preflight (one DoGSiteScorer call on a bench chain) passes. It allows
+  preflight (one call of the tool on a bench chain) passes. It allows
   `POLYPHAR_PREFLIGHT_TIMEOUT` seconds (default 600) plus 60 s, and stops the worker on exit.
   A failing preflight points to a license or installation problem.
-- **Timeouts and a dead worker.** A DoGSiteScorer job running longer than `--job-timeout`
+- **Timeouts and a dead worker.** A job running longer than `--job-timeout`
   (wrapper: `POLYPHAR_DOGSITE_JOB_TIMEOUT`, default 21600 s = 6 h) is killed with its process
   group and recorded as failed (`timeout after N s`). If the worker exits while the container
   runs and the queue is not `CLOSED`, the wrapper says so and stops the container, so the run
   ends with its FAILED notification instead of waiting for a dead worker. The worker logs to
   stdout and to `logs/dogsite-worker.log`; a broken stdout (closed terminal) never stops it.
 - **Queue protocol** in `04_pockets/queue/`, with paths relative to the run folder:
-  - The container writes `<id>.job`.
+  - The container writes `<id>.job` (`model`, `out`, `size`, `tool`).
   - A worker claims it by renaming it to `<id>.running.<host>.<pid>`.
-  - The result is `<id>.done` or `<id>.failed`.
+  - The result is `<id>.done` (with `tool`, `tool_version`, `dogsite_sha256`) or
+    `<id>.failed`.
   - The worker touches `WORKER.<host>.<pid>` as a heartbeat every 30 s (mtime set explicitly
     to the host's clock, so it also works on NFS).
   - The container writes `CLOSED` when every job has finished.
@@ -399,9 +466,12 @@ image and never committed here.
       bin/polyphar-dogsite-worker --run-dir ~/runs/net1 --dogsite "$DOGSITE_BIN" --nprocs 8 --watch
       bin/polyphar-dogsite-worker --benchmark --dogsite "$DOGSITE_BIN"   # calibrate pockets
 
-  Without `--watch` it runs the jobs queued now and exits.
-- For tests and local end-to-end runs, `tests/fixtures/fake_dogsite` stands in for the binary.
-  It copies real net2 pockets, so its pocket geometry is not a real prediction.
+  Add `--tool dogsite2` for DoGSiteScorer 2. Without `--watch` it runs the jobs queued now
+  and exits.
+- For tests and local end-to-end runs, `tests/fixtures/fake_dogsite` stands in for either
+  binary (dogsite3 mode when `--writeSiteResiduesPDB` is given). It copies real outputs
+  (three DoGSite3 1.3.0 output sets, or single net2 DoGSiteScorer 2 pockets), so its pocket
+  geometry is not a prediction for the model it is given.
 
 ## Outputs and failures
 
@@ -450,9 +520,10 @@ image and never committed here.
 The end-to-end test runs `polyphar run` on P25815 + P53350 with a 3-ligand library through
 `bin/polyphar-docker`. It needs docker, the `polyphar:dev` image (or `$POLYPHAR_VERSION`) and
 network access. With `fake_dogsite` the pockets are copies of a few real pockets, so the best
-pair reaches only Pmax 0.39: set `POLYPHAR_E2E_PMAX=0.3`, or `select` correctly stops the run
-with "no protein pair has Pmax >= 0.7". With the real binary
-(`DOGSITE_BIN=/path/to/dogsite`), run it without `POLYPHAR_E2E_PMAX`.
+pair can stay below Pmax 0.7 (0.39 with the DoGSiteScorer 2 copies): set
+`POLYPHAR_E2E_PMAX=0.3`, or `select` correctly stops the run with "no protein pair has
+Pmax >= 0.7". With the real binary
+(`DOGSITE_BIN=/opt/ZBH/dogsite3/dogsite3`), run it without `POLYPHAR_E2E_PMAX`.
 
 Markers `dogsite`, `pocketmatch`, `docking`, `docker`, `regression` (`ADEP_DATA`) and
 `pushover` skip unless their tool or environment is available.

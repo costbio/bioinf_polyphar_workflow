@@ -1,17 +1,25 @@
 #!/usr/bin/env python3
-"""Stand-in for the DoGSiteScorer binary (tests and local end-to-end runs only).
+"""Stand-in for the DoGSiteScorer 2 / DoGSite3 binaries (tests and local end-to-end runs only).
 
     fake_dogsite -p <model> [other flags...] -o <out>
 
-Writes <out>.pml first (a partial output, as the real binary writes several files),
-then <out>_res_P_1.pdb and finally <out>_desc.txt. The pocket is one of several REAL
-net2 pockets of different proteins in fake_dogsite_data/ (<label>.res_P_1.pdb with its
-real descriptor row <label>.desc.txt, all drugScore >= 0.5), chosen deterministically
-from the sha256 of the model's file name, so different models get different pockets.
+The mode follows the flags, as polyphar-dogsite-worker passes them:
+  dogsite3 (--writeSiteResiduesPDB given): copies one REAL DoGSite3 1.3.0 output set from
+      fake_dogsite3_data/<label>/ (<label>_desc.txt, <label>_P_<n>[_<m>]_res.pdb), renamed
+      to <out>_desc.txt and <out>_P_..._res.pdb; the residue files are written first and
+      <out>_desc.txt last. Every label has pockets on both sides of volume 300 A^3.
+  dogsite2 (otherwise): writes <out>.pml first (a partial output), then
+      <out>_res_P_1.pdb and finally <out>_desc.txt: one of several REAL net2 pockets of
+      different proteins in fake_dogsite_data/ (<label>.res_P_1.pdb with its real
+      descriptor row <label>.desc.txt, all drugScore >= 0.5).
+The label is chosen deterministically from the sha256 of the model's file name, so
+different models get different pockets.
 
+  * --help prints a usage text (no version, like DoGSite3 1.3.0) and exits 0
   * exits 3 when the model's file name contains FAIL
-  * sleeps $FAKE_DOGSITE_SLEEP seconds (after writing <out>.pml), when set
+  * sleeps $FAKE_DOGSITE_SLEEP seconds (after the first partial output), when set
   * appends the model path to $FAKE_DOGSITE_LOG, when set (one line per call)
+  * appends the full argument list to $FAKE_DOGSITE_ARGS_LOG, when set
 """
 import hashlib
 import os
@@ -19,7 +27,9 @@ import shutil
 import sys
 import time
 
-DATA = os.path.join(os.path.dirname(os.path.realpath(__file__)), "fake_dogsite_data")
+HERE = os.path.dirname(os.path.realpath(__file__))
+DATA = os.path.join(HERE, "fake_dogsite_data")
+DATA3 = os.path.join(HERE, "fake_dogsite3_data")
 
 
 def _value(flag):
@@ -29,35 +39,71 @@ def _value(flag):
     return args[args.index(flag) + 1]
 
 
-def pocket_label(model):
-    labels = sorted(f[:-len(".desc.txt")] for f in os.listdir(DATA) if f.endswith(".desc.txt"))
+def _pick(labels, model):
     digest = hashlib.sha256(os.path.basename(model).encode()).hexdigest()
-    return labels[int(digest, 16) % len(labels)]
+    return sorted(labels)[int(digest, 16) % len(labels)]
+
+
+def pocket_label(model):
+    return _pick([f[:-len(".desc.txt")] for f in os.listdir(DATA) if f.endswith(".desc.txt")],
+                 model)
+
+
+def _append(path, text):
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+    try:
+        os.write(fd, text.encode())
+    finally:
+        os.close(fd)
+
+
+def _sleep():
+    if os.environ.get("FAKE_DOGSITE_SLEEP"):
+        time.sleep(float(os.environ["FAKE_DOGSITE_SLEEP"]))
+
+
+def dogsite3(model, out):
+    label = _pick([d for d in os.listdir(DATA3) if os.path.isdir(os.path.join(DATA3, d))], model)
+    src = os.path.join(DATA3, label)
+    res = sorted(f for f in os.listdir(src) if f.endswith("_res.pdb"))
+    for i, name in enumerate(res):
+        shutil.copyfile(os.path.join(src, name), out + name[len(label):])
+        if i == 0:
+            _sleep()
+    shutil.copyfile(os.path.join(src, label + "_desc.txt"), out + "_desc.txt")
+    print(f"fake_dogsite: dogsite3 pockets of {label} for {model}")
+
+
+def dogsite2(model, out):
+    label = pocket_label(model)
+    with open(out + ".pml", "w") as fh:
+        fh.write(f"# fake_dogsite pocket {label}\n")
+    _sleep()
+    shutil.copyfile(os.path.join(DATA, label + ".res_P_1.pdb"), out + "_res_P_1.pdb")
+    shutil.copyfile(os.path.join(DATA, label + ".desc.txt"), out + "_desc.txt")
+    print(f"fake_dogsite: pocket {label} for {model}")
 
 
 def main():
+    if "--help" in sys.argv[1:] or "-h" in sys.argv[1:]:
+        print(" License:\n  --license LicenseKey   Activate a new license\n\n"
+              " Input options:\n  -p [ --proteinFile ] arg   Protein input file (fake)")
+        return 0
+    if os.environ.get("FAKE_DOGSITE_ARGS_LOG"):
+        _append(os.environ["FAKE_DOGSITE_ARGS_LOG"], " ".join(sys.argv[1:]) + "\n")
     model, out = _value("-p"), _value("-o")
-    log = os.environ.get("FAKE_DOGSITE_LOG")
-    if log:
-        fd = os.open(log, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
-        try:
-            os.write(fd, (model + "\n").encode())
-        finally:
-            os.close(fd)
+    if os.environ.get("FAKE_DOGSITE_LOG"):
+        _append(os.environ["FAKE_DOGSITE_LOG"], model + "\n")
     if "FAIL" in os.path.basename(model):
         print(f"fake_dogsite: FAIL requested by model name {model}", file=sys.stderr)
         return 3
     if not os.path.isfile(model):
         print(f"fake_dogsite: no such model {model}", file=sys.stderr)
-        return 2
-    label = pocket_label(model)
-    with open(out + ".pml", "w") as fh:
-        fh.write(f"# fake_dogsite pocket {label}\n")
-    if os.environ.get("FAKE_DOGSITE_SLEEP"):
-        time.sleep(float(os.environ["FAKE_DOGSITE_SLEEP"]))
-    shutil.copyfile(os.path.join(DATA, label + ".res_P_1.pdb"), out + "_res_P_1.pdb")
-    shutil.copyfile(os.path.join(DATA, label + ".desc.txt"), out + "_desc.txt")
-    print(f"fake_dogsite: pocket {label} for {model}")
+        return 66
+    if "--writeSiteResiduesPDB" in sys.argv[1:]:
+        dogsite3(model, out)
+    else:
+        dogsite2(model, out)
     return 0
 
 

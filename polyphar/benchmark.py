@@ -3,7 +3,7 @@
 benchmark times one small fixture workload per stage on ONE process and stores
 seconds-per-unit in <POLYPHAR_HOME>/calibration.json, in the same unit basis the stages'
 units() use (fix: input bytes; similarity: pairs; dock: ligands; uniprot / structures:
-requests). `pockets` is never run here: DoGSiteScorer is host-only, so
+requests). `pockets` is never run here: DoGSite3 / DoGSiteScorer is host-only, so
 bin/polyphar-dogsite-worker --benchmark calibrates it.
 
 estimate prints the stages after the last completed one: the next stage exactly (from its
@@ -73,10 +73,16 @@ PRIORS = {
     "ligands": 2083,   # e-Drug3D_2083
 }
 PRIORS_SOURCE = "2023 HCC net2 run"
+# kept (selected) pockets per submitted model, by pocket tool. dogsite2: the PRIORS value
+# (drugScore >= 0.5, 2023 net2). dogsite3: volume >= 300 A^3 on DoGSite3 1.3.0 output for 50
+# random 2023 net2 models (40 pdbfixer chains + 10 AlphaFold models), 2026-11-02: 11 of 523
+# pockets in 50 models.
+KEPT_POCKETS_PRIOR = {"dogsite2": PRIORS["kept_pockets_per_model"], "dogsite3": 11 / 50}
 
 BENCH_STAGES = ("uniprot", "structures", "fix", "pockets", "similarity", "dock")
-HOST_CALIBRATED = ("host-calibrated: DoGSiteScorer runs on the host only; calibrate with "
-                   "bin/polyphar-dogsite-worker --benchmark (bin/polyphar-docker does it)")
+HOST_CALIBRATED = ("host-calibrated: DoGSite3 / DoGSiteScorer runs on the host only; calibrate "
+                   "with bin/polyphar-dogsite-worker --benchmark --tool <tool> "
+                   "(bin/polyphar-docker does it)")
 
 
 class Skip(Exception):
@@ -315,10 +321,13 @@ def _count_records(path: Path) -> int | None:
         return None
 
 
-def run_state(layout, done: list[str]) -> tuple[dict, list[str]]:
-    """Projection inputs: PRIORS with every value the finished stages have observed
-    replacing its prior. Returns (state, names of the observed values)."""
+def run_state(layout, done: list[str], tool: str | None = None) -> tuple[dict, list[str]]:
+    """Projection inputs: PRIORS (kept pockets per model by pocket `tool`, when given) with
+    every value the finished stages have observed replacing its prior. Returns (state,
+    names of the observed values)."""
     s = dict(PRIORS)
+    if tool in KEPT_POCKETS_PRIOR:
+        s["kept_pockets_per_model"] = KEPT_POCKETS_PRIOR[tool]
     observed = []
 
     def put(key, value):
@@ -357,8 +366,11 @@ def run_state(layout, done: list[str]) -> tuple[dict, list[str]]:
         put("fixed_chain_bytes", _mean_size(layout.pdbfixer.glob("*/*.pdb")))
     if "pockets" in done:
         models = _manifest_counts(layout, "pockets").get("models")
-        kept = sum(1 for r in _csv_rows(layout.drugscore_csv)
-                   if _float(r.get("drugScore")) >= 0.5)
+        rows = _csv_rows(layout.drugscore_csv)
+        if rows and "Selected" in rows[0]:   # the pockets stage's per-tool selection
+            kept = sum(1 for r in rows if str(r.get("Selected")).strip().lower() == "true")
+        else:                                # legacy DrugScore.csv
+            kept = sum(1 for r in rows if _float(r.get("drugScore")) >= 0.5)
         if isinstance(models, int) and models > 0:
             put("kept_pockets_per_model", kept / models if kept else None)
     if "select" in done:
@@ -403,13 +415,24 @@ def projected_units(stage: str, s: dict) -> WorkUnits | None:
 
 # --- estimate ------------------------------------------------------------------------------
 
-def _stage_args(stage: str, layout, nprocs: int):
-    """Default arguments of `stage`. --dry-run is set so units() never records anything
-    (e.g. similarity's name guard would otherwise write failed.tsv): estimate is read-only."""
+def _stage_args(stage: str, layout, nprocs: int, extra: list[str] | None = None):
+    """Default arguments of `stage` (plus `extra`). --dry-run is set so units() never records
+    anything (e.g. similarity's name guard would otherwise write failed.tsv): estimate is
+    read-only."""
     from polyphar.cli import build_parser
 
     return build_parser().parse_args([stage, "--run-dir", str(layout.run_dir),
-                                      "--nprocs", str(nprocs), "--dry-run"])
+                                      "--nprocs", str(nprocs), "--dry-run", *(extra or [])])
+
+
+def _pocket_tool(layout) -> str:
+    """The run folder's recorded pocket tool, else the default ($POLYPHAR_POCKET_TOOL)."""
+    from polyphar.stages import pockets
+
+    try:
+        return pockets.recorded_tool(layout) or pockets.default_tool()
+    except (RuntimeError, SystemExit):
+        return pockets.DEFAULT_TOOL
 
 
 def estimate_rows(layout, nprocs: int, calib) -> tuple[list[dict], list[str]]:
@@ -423,7 +446,8 @@ def estimate_rows(layout, nprocs: int, calib) -> tuple[list[dict], list[str]]:
 
     done = completed(layout)
     last = max((ORDER.index(s) for s in done), default=-1)
-    state, observed = run_state(layout, done)
+    tool = _pocket_tool(layout)
+    state, observed = run_state(layout, done, tool)
     rows = []
     for i, stage in enumerate(ORDER[last + 1:], start=last + 1):
         units, kind, note = None, "projected", ""
@@ -433,7 +457,8 @@ def estimate_rows(layout, nprocs: int, calib) -> tuple[list[dict], list[str]]:
         elif i == last + 1:
             try:
                 module = importlib.import_module(STAGES[stage][0])
-                units = module.units(layout, _stage_args(stage, layout, nprocs))
+                extra = ["--pocket-tool", tool] if stage == "pockets" else None
+                units = module.units(layout, _stage_args(stage, layout, nprocs, extra))
                 kind = "exact"
             except Exception as exc:   # inputs not usable yet: fall back to the projection
                 note = f"exact units unavailable ({type(exc).__name__}: {exc})"
@@ -442,7 +467,8 @@ def estimate_rows(layout, nprocs: int, calib) -> tuple[list[dict], list[str]]:
         if trivial:
             rows.append({"stage": stage, "kind": kind, "units": "-", "seconds": 0.0, "note": ""})
             continue
-        est = estimate_stage(stage, units, nprocs, calib, PARALLEL_EFFICIENCY)
+        est = estimate_stage(stage, units, nprocs, calib, PARALLEL_EFFICIENCY,
+                             tool=tool if stage == "pockets" else None)
         rows.append({"stage": stage, "kind": kind, "units": f"{units.count} ({units.cost_basis})",
                      "seconds": est.seconds, "note": note or est.basis})
     return rows, observed

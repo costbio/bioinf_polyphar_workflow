@@ -1,0 +1,7 @@
+Real DoGSite3 1.3.0 output (ZBH, Universitaet Hamburg; Build ID
+I2fc2182615fa94ac7697cb65b66fd040f58941fd), run 2026-11-02 on the polyphar host with
+    dogsite3 -p <chain>.pdb -o <label> -s -d --writeSiteResiduesPDB -v 1
+on three 2023 HCC net2 pdbfixer chains (O60218 4ga8_A, O60218 4gqg_A, P20248 4bcn_A).
+Output data only (descriptor tables and pocket residue PDBs), used by
+tests/fixtures/fake_dogsite in dogsite3 mode. The DoGSite3 program is not included.
+Each label has at least one pocket with volume >= 300 A^3 and several below it.

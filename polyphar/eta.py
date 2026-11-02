@@ -61,6 +61,11 @@ def _cpu_model() -> str:
     return platform.processor() or platform.machine() or "unknown"
 
 
+# Stages whose calibration depends on an external tool, and the tool an entry without a
+# `tool` field was measured with (pockets: DoGSiteScorer 2, the only tool before DoGSite3).
+LEGACY_TOOLS = {"pockets": "dogsite2"}
+
+
 class Calibration:
     """Seconds per unit-basis on ONE process, per stage, in
     <home>/calibration.json. A missing or unreadable file is an empty
@@ -87,16 +92,31 @@ class Calibration:
             pass
         return cls(path, data)
 
-    def cost(self, stage: str) -> float | None:
+    def tool_of(self, stage: str) -> str | None:
+        """The tool an entry was measured with (pockets: an entry written before tools were
+        recorded is DoGSiteScorer 2, the only tool then), or None without an entry."""
         entry = self.data.get(stage)
-        return float(entry["seconds_per_unit"]) if entry else None
+        if not entry:
+            return None
+        return entry.get("tool") or LEGACY_TOOLS.get(stage)
 
-    def update(self, stage: str, seconds_per_unit: float) -> None:
+    def cost(self, stage: str, tool: str | None = None) -> float | None:
+        """Seconds per unit; with `tool`, only an entry measured with that tool counts
+        (another tool's calibration is never used silently)."""
+        entry = self.data.get(stage)
+        if not entry or (tool is not None and self.tool_of(stage) != tool):
+            return None
+        return float(entry["seconds_per_unit"])
+
+    def update(self, stage: str, seconds_per_unit: float, tool: str | None = None) -> None:
         """Fold one measurement into the running mean. Non-positive or
-        non-finite measurements are ignored."""
+        non-finite measurements are ignored. With `tool`, an entry of another tool is
+        replaced (not averaged) and the entry records the tool."""
         if not (isinstance(seconds_per_unit, (int, float))
                 and math.isfinite(seconds_per_unit) and seconds_per_unit > 0):
             return
+        if tool is not None and self.tool_of(stage) not in (None, tool):
+            self.data.pop(stage, None)
         old = self.data.get(stage)
         try:
             n = max(1, int(old["n_observations"])) if old else 0
@@ -111,6 +131,8 @@ class Calibration:
             "cpu_model": _cpu_model(),
             "updated": datetime.now().astimezone().isoformat(timespec="seconds"),
         }
+        if tool is not None:
+            self.data[stage]["tool"] = tool
 
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -133,15 +155,20 @@ class Estimate:
 
 def estimate_stage(stage: str, units: WorkUnits, nprocs: int, calib: Calibration,
                    parallel_efficiency: dict | None = None, *,
-                   threads_per_job: int = 1) -> Estimate:
-    """Wall-clock estimate: max(total work / slots, longest single job)."""
+                   threads_per_job: int = 1, tool: str | None = None) -> Estimate:
+    """Wall-clock estimate: max(total work / slots, longest single job). With `tool`, only
+    a calibration measured with that tool is used."""
     slots = slots_for(stage, nprocs, threads_per_job, parallel_efficiency)
     if slots is None:
         return Estimate(0.0, "trivial")
     if units.count == 0:
         return Estimate(0.0, "no work")
-    c = calib.cost(stage)
+    c = calib.cost(stage, tool)
     if c is None:
+        other = calib.tool_of(stage) if tool is not None else None
+        if other is not None:
+            return Estimate(None, f"uncalibrated for {tool} (calibration.json has {other}) — "
+                                  f"run bin/polyphar-dogsite-worker --benchmark --tool {tool}")
         return Estimate(None, UNCALIBRATED)
     basis = f"calibrated ({units.cost_basis}, {slots:g} slots)"
     if units.sizes:
@@ -179,8 +206,9 @@ class Progress:
     def __init__(self, stage: str, total: int, est: Estimate, notifier,
                  milestones=MILESTONES, *, total_size: float | None = None,
                  calib: Calibration | None = None, slots: float = 1.0,
-                 log_path=None, clock=time.monotonic):
+                 log_path=None, clock=time.monotonic, tool: str | None = None):
         self.stage = stage
+        self.tool = tool
         self.total = total
         self.total_size = total_size
         self.est = est
@@ -278,7 +306,7 @@ class Progress:
         self._notify(f"{self.stage} done", msg, priority=1 if flagged else 0)
         if self.calib is not None and self.work_done > 0 and elapsed > 0:
             # seconds per unit on ONE process: elapsed wall time * slots / work
-            self.calib.update(self.stage, elapsed * self.slots / self.work_done)
+            self.calib.update(self.stage, elapsed * self.slots / self.work_done, self.tool)
             try:
                 self.calib.save()
             except OSError as exc:

@@ -301,3 +301,18 @@ def test_uniprot_bench_records_retries_and_excludes_failed_attempts(tmp_path, mo
     spc, extra = benchmark._bench_uniprot(tmp_path)
     assert extra["retries"] == 1 and state["n"] == benchmark.UNIPROT_REQUESTS + 1
     assert spc < 0.1   # 0.4 s of the failed attempt is not in the cost
+
+
+def test_run_state_counts_selected_pockets_and_uses_the_tools_prior(tmp_path):
+    layout, _ = _run_with_uniprot_done(tmp_path)
+    state, _ = benchmark.run_state(layout, ["ids", "uniprot"], tool="dogsite3")
+    assert state["kept_pockets_per_model"] == benchmark.KEPT_POCKETS_PRIOR["dogsite3"]
+    state, _ = benchmark.run_state(layout, ["ids", "uniprot"], tool="dogsite2")
+    assert state["kept_pockets_per_model"] == benchmark.PRIORS["kept_pockets_per_model"]
+    write_manifest(layout.pockets, "pockets", {}, [], {}, {"models": 4}, {})
+    (layout.pockets / "DrugScore.csv").write_text(
+        "idx,volume,Tool,Selected\n0,400,dogsite3,True\n1,350,dogsite3,True\n"
+        "2,100,dogsite3,False\n")
+    state, observed = benchmark.run_state(layout, ["ids", "uniprot", "pockets"],
+                                          tool="dogsite3")
+    assert state["kept_pockets_per_model"] == 2 / 4 and "kept_pockets_per_model" in observed
