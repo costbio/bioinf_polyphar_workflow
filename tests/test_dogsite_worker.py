@@ -52,7 +52,7 @@ def _make_run(root, names, acc="P25815", tool="dogsite2"):
 
 
 def _worker_cmd(run_dir, dogsite=FAKE, *extra, tool="dogsite2"):
-    """The worker command line; tool=None leaves --tool out (the default, dogsite3). With
+    """The worker command line; tool=None leaves --tool out (the default, dogsite2). With
     tool dogsite2 the fake runs under its DoGSiteScorer 2 identity (FAKE2)."""
     if tool == "dogsite2" and Path(dogsite) == FAKE:
         dogsite = FAKE2
@@ -104,11 +104,29 @@ def test_worker_runs_queue_with_stub(tmp_path):
     assert res("2mjw_B") != res("1abc_A")      # different models, different pockets
 
 
-def test_worker_runs_dogsite3_jobs_by_default(tmp_path):
-    """No --tool: DoGSite3, with its command line, output names and version in .done."""
+def test_worker_default_tool_is_dogsite2(tmp_path):
+    """No --tool and no $POLYPHAR_POCKET_TOOL: DoGSiteScorer 2 (the primary tool), so a
+    DoGSite3 binary is refused and a DoGSiteScorer 2 one runs the legacy command line."""
+    layout = _make_run(tmp_path, ["2mjw_B"], tool="dogsite2")
+    r = subprocess.run(_worker_cmd(tmp_path, FAKE, tool=None), env=_env(),
+                       capture_output=True, text=True, timeout=60)
+    assert r.returncode == 3 and "conflicts with --tool dogsite2" in r.stderr
+    args_log = tmp_path / "args.log"
+    r = subprocess.run(_worker_cmd(tmp_path, FAKE2, tool=None),
+                       env=_env(FAKE_DOGSITE_ARGS_LOG=args_log), capture_output=True, text=True,
+                       timeout=60)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert _queue(layout) == ["P25815_2mjw_B.done"]
+    assert all(" -s -i -y -d -w 4 -o " in l for l in args_log.read_text().splitlines())
+    done = json.loads((layout.pockets / "queue" / "P25815_2mjw_B.done").read_text())
+    assert done["tool"] == "dogsite2"
+
+
+def test_worker_runs_dogsite3_jobs(tmp_path):
+    """--tool dogsite3: its command line, output names and version in .done."""
     layout = _make_run(tmp_path, ["2mjw_B", "1abc_A"], tool="dogsite3")
     args_log = tmp_path / "args.log"
-    r = subprocess.run(_worker_cmd(tmp_path, FAKE, tool=None),
+    r = subprocess.run(_worker_cmd(tmp_path, FAKE, tool="dogsite3"),
                        env=_env(FAKE_DOGSITE_ARGS_LOG=args_log), capture_output=True, text=True,
                        timeout=60)
     assert r.returncode == 0, r.stdout + r.stderr
@@ -546,7 +564,7 @@ def test_benchmark_writes_pockets_calibration(tmp_path):
     (home / "calibration.json").write_text(json.dumps(
         {"fix": {"seconds_per_unit": 1e-5, "n_observations": 3, "nproc": 8,
                  "cpu_model": "x", "updated": "2026-01-01T00:00:00+00:00"}}))
-    r = subprocess.run([sys.executable, str(WORKER), "--benchmark", "--dogsite", str(FAKE)],
+    r = subprocess.run([sys.executable, str(WORKER), "--benchmark", "--dogsite", str(FAKE2)],
                        env=_env(POLYPHAR_HOME=home, FAKE_DOGSITE_SLEEP="0.2"),
                        capture_output=True, text=True, timeout=60)
     assert r.returncode == 0, r.stdout + r.stderr
@@ -555,7 +573,7 @@ def test_benchmark_writes_pockets_calibration(tmp_path):
     entry = cal["pockets"]
     assert set(entry) == {"seconds_per_unit", "n_observations", "nproc", "cpu_model", "updated",
                           "tool"}
-    assert entry["tool"] == "dogsite3"            # the default tool
+    assert entry["tool"] == "dogsite2"            # the default tool
     assert entry["n_observations"] == 1
     # per byte, single process: >= the fake's 0.2 s sleep over the bench bytes
     bench_bytes = sum(p.stat().st_size for p in BENCH.parent.glob("*.pdb"))
@@ -563,8 +581,8 @@ def test_benchmark_writes_pockets_calibration(tmp_path):
     assert [p.name for p in home.iterdir()] == ["calibration.json"]   # no temp left
     # the polyphar ETA engine reads it
     from polyphar.eta import Calibration
-    assert Calibration.load(home).cost("pockets", "dogsite3") == entry["seconds_per_unit"]
-    assert Calibration.load(home).cost("pockets", "dogsite2") is None
+    assert Calibration.load(home).cost("pockets", "dogsite2") == entry["seconds_per_unit"]
+    assert Calibration.load(home).cost("pockets", "dogsite3") is None
 
 
 def test_worker_is_stdlib_python38_and_standalone():
@@ -620,7 +638,7 @@ def _fake_docker_env(tmp_path, calibrated=True, **kw):
             {"pockets": {"seconds_per_unit": 1e-6, "n_observations": 1, "nproc": 1,
                          "cpu_model": "x", "updated": "x"}}))
     env = _env(PATH=f"{bindir}:{os.environ['PATH']}", RUN=run_dir, POLYPHAR_RUN_DIR=run_dir,
-               POLYPHAR_HOME=home, DOGSITE_BIN=FAKE, **kw)
+               POLYPHAR_HOME=home, DOGSITE_BIN=FAKE2, **kw)   # the default tool: dogsite2
     return run_dir, env
 
 
@@ -649,7 +667,7 @@ def test_wrapper_passes_nprocs_to_worker(tmp_path, argv, env, expected):
 
 
 @pytest.mark.parametrize("argv, env, expected", [
-    (["pockets"], {}, "dogsite3"),
+    (["pockets"], {}, "dogsite2"),                       # the default
     (["pockets"], {"POLYPHAR_POCKET_TOOL": "dogsite2"}, "dogsite2"),
     (["pockets", "--pocket-tool", "dogsite2"], {"POLYPHAR_POCKET_TOOL": "dogsite3"}, "dogsite2"),
     (["run", "--from", "fix", "--pocket-tool=dogsite3"], {"POLYPHAR_POCKET_TOOL": "dogsite2"},
@@ -679,7 +697,8 @@ def test_wrapper_rejects_an_unknown_pocket_tool(tmp_path):
 
 
 def test_wrapper_benchmarks_when_the_calibration_is_of_the_other_tool(tmp_path):
-    run_dir, env = _fake_docker_env(tmp_path)    # calibrated, but without a tool: dogsite2
+    run_dir, env = _fake_docker_env(tmp_path)    # calibrated, without a tool: dogsite2
+    env.update(POLYPHAR_POCKET_TOOL="dogsite3", DOGSITE_BIN=str(FAKE))
     home = Path(env["POLYPHAR_HOME"])
     r = subprocess.run([str(WRAPPER), "run"], env=env, capture_output=True, text=True,
                        timeout=60)
@@ -752,7 +771,7 @@ def test_wrapper_worker_only_when_pockets_in_range(tmp_path, argv, worker):
         {"pockets": {"seconds_per_unit": 1e-6, "n_observations": 1, "nproc": 1,
                      "cpu_model": "x", "updated": "x"}}))
     env = _env(PATH=f"{bindir}:{os.environ['PATH']}", RUN=run_dir, POLYPHAR_RUN_DIR=run_dir,
-               POLYPHAR_HOME=home, DOGSITE_BIN=FAKE, FAKE_DOCKER_EXIT=7)
+               POLYPHAR_HOME=home, DOGSITE_BIN=FAKE2, FAKE_DOCKER_EXIT=7)
     r = subprocess.run([str(WRAPPER), *argv], env=env, capture_output=True, text=True,
                        timeout=60)
     assert r.returncode == 7, r.stdout + r.stderr    # the container's exit status
@@ -783,7 +802,7 @@ def test_wrapper_benchmarks_pockets_before_run_when_uncalibrated(tmp_path):
     run_dir.mkdir()
     home = tmp_path / "home"
     env = _env(PATH=f"{bindir}:{os.environ['PATH']}", RUN=run_dir, POLYPHAR_RUN_DIR=run_dir,
-               POLYPHAR_HOME=home, DOGSITE_BIN=FAKE)
+               POLYPHAR_HOME=home, DOGSITE_BIN=FAKE2)
     r = subprocess.run([str(WRAPPER), "run"], env=env, capture_output=True, text=True,
                        timeout=60)
     assert r.returncode == 0, r.stdout + r.stderr
@@ -809,7 +828,8 @@ def test_wrapper_starts_and_stops_worker(tmp_path):
                      f"02_structures/P25815/{name}.pdb", "1:999", ""])
     pd.DataFrame(rows, columns=INFO_COLUMNS).to_csv(layout.protein_info, index=False)
     env = _env(POLYPHAR_RUN_DIR=run_dir, POLYPHAR_VERSION="dev",
-               POLYPHAR_HOME=tmp_path / "home", DOGSITE_BIN=FAKE)
+               POLYPHAR_HOME=tmp_path / "home", DOGSITE_BIN=FAKE,
+               POLYPHAR_POCKET_TOOL="dogsite3")
     r = subprocess.run([str(WRAPPER), "pockets", "--no-notify"], env=env,
                        capture_output=True, text=True, timeout=300)
     assert r.returncode == 0, r.stdout + r.stderr

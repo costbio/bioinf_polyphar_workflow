@@ -23,14 +23,14 @@ def _uniprot(layout, rows):
 
 
 def _outputs(layout, acc, name):
-    """A fixed chain and DoGSite3 outputs for it (two pockets, 400 and 250 A^3)."""
+    """A fixed chain and DoGSite3 outputs for it (two pockets, 400 and 100 A^3)."""
     fixed = layout.pdbfixer / acc / f"{name}.pdb"
     fixed.parent.mkdir(parents=True, exist_ok=True)
     fixed.write_text("ATOM fixed\n")
     d = layout.pockets / acc
     d.mkdir(parents=True, exist_ok=True)
     for out in (name, f"AF-{acc}-F1"):
-        (d / f"{out}_desc.txt").write_text("name\tvolume\nP_1\t400\nP_2\t250\n")
+        (d / f"{out}_desc.txt").write_text("name\tvolume\nP_1\t400\nP_2\t100\n")
         (d / f"{out}_P_1_res.pdb").write_text("ATOM\n")
         (d / f"{out}_P_2_res.pdb").write_text("ATOM\n")
 
@@ -50,7 +50,7 @@ def test_shrunken_input_reaches_protein_info_and_drugscore(tmp_path, monkeypatch
     _outputs(layout, "P25815", "2mjw_B")
     _outputs(layout, "Q15109", "2mjw_A")
     argv = ["run", "--run-dir", str(layout.run_dir), "--from", "structures", "--to", "pockets",
-            "--no-notify", "--nprocs", "1"]
+            "--no-notify", "--nprocs", "1", "--pocket-tool", "dogsite3"]
 
     assert cli.main(argv) == 0
     info = pd.read_csv(layout.protein_info, dtype=str, keep_default_na=False)
@@ -69,6 +69,6 @@ def test_shrunken_input_reaches_protein_info_and_drugscore(tmp_path, monkeypatch
     # a changed pocket selection reruns pockets although no model is left to run
     selected = pd.read_csv(layout.drugscore_csv, index_col=0)["Selected"]
     assert list(selected) == [True, False, True, False]
-    assert cli.main([*argv, "--from", "pockets", "--min-volume", "200"]) == 0
+    assert cli.main([*argv, "--from", "pockets", "--min-volume", "50"]) == 0
     assert pd.read_csv(layout.drugscore_csv, index_col=0)["Selected"].all()
 

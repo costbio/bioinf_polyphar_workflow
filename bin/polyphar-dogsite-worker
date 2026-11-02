@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Host-side pocket-detection worker for polyphar: DoGSite3 (default) or DoGSiteScorer 2.
+"""Host-side pocket-detection worker for polyphar: DoGSiteScorer 2 (default) or DoGSite3.
 
 Both tools are licensed for the host, so they never run inside the polyphar container.
 `polyphar pockets` (in the container) writes job files into <run>/04_pockets/queue/;
 this script, run on the host, claims and runs them. It needs only Python >= 3.8 and its
 standard library (it does not import polyphar).
 
-Tool (--tool, default $POLYPHAR_POCKET_TOOL or dogsite3) and command line:
+Tool (--tool, default $POLYPHAR_POCKET_TOOL or dogsite2) and command line:
   dogsite3   <bin> -p <model> -o <out> -s -d --writeSiteResiduesPDB -v 1
              (<out>_desc.txt, <out>_P_<n>[_<m>]_res.pdb)
   dogsite2   <bin> -p <model> -s -i -y -d -w 4 -o <out>
@@ -52,7 +52,7 @@ DEFAULT_PREFLIGHT_TIMEOUT = 600.0
 DEFAULT_JOB_TIMEOUT = 6 * 3600.0
 LOG_REL = os.path.join("logs", "dogsite-worker.log")
 TOOLS = ("dogsite3", "dogsite2")
-DEFAULT_TOOL = "dogsite3"
+DEFAULT_TOOL = "dogsite2"
 LEGACY_TOOL = "dogsite2"      # a job file without a "tool" field
 TOOL_ENV = "POLYPHAR_POCKET_TOOL"
 DOGSITE2_FLAGS = ["-s", "-i", "-y", "-d", "-w", "4"]

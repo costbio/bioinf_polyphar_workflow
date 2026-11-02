@@ -13,8 +13,8 @@
 7. smina docking of a ligand library (e-Drug3D) into the selected targets.
 
 Everything runs through one CLI, `polyphar <stage>`, in a Docker image. Pocket detection is the
-exception: DoGSite3 (or DoGSiteScorer 2) runs on the host (see
-[Pocket detection](#pocket-detection-dogsite3--dogsitescorer)). Each stage prints and
+exception: DoGSiteScorer 2 (or DoGSite3) runs on the host (see
+[Pocket detection](#pocket-detection-dogsitescorer--dogsite3)). Each stage prints and
 notifies its exact work units and ETA before it starts, and every stage can be resumed.
 
 ## First-time server setup
@@ -30,18 +30,20 @@ system `python3` ≥ 3.8 on the host.
        REPO=~/repos/bioinf_polyphar_workflow && cd "$REPO"
        conda env create -f environment.yml && conda activate polyphar && pip install -e .
 
-2. **Install and license DoGSite3 on the host**, then check that it runs. The ZBH installer
-   puts the binary at `/opt/ZBH/dogsite3/dogsite3` (with `VERSION_INFO` next to it). Activate
-   the license once, as the user who runs polyphar: `dogsite3 --license <key>`. `--benchmark`
-   first runs the worker's preflight, which is one DoGSite3 call on a bench chain. It then
-   stores the `pockets` calibration (for this tool) in `~/.polyphar/calibration.json`. Exit
-   code 3 means a license or installation problem, and the binary's error is printed.
+2. **Install and license DoGSiteScorer 2 on the host** (the primary tool), then check that
+   it runs. Install its license as BioSolveIT documents, as the user who runs polyphar.
+   `--benchmark` first runs the worker's preflight, which is one DoGSiteScorer 2 call on a
+   bench chain. It then stores the `pockets` calibration (for this tool) in
+   `~/.polyphar/calibration.json`. Exit code 3 means a license or installation problem, and
+   the binary's error is printed.
 
-       export DOGSITE_BIN=/opt/ZBH/dogsite3/dogsite3
-       python3 "$REPO"/bin/polyphar-dogsite-worker --benchmark     # --tool dogsite3 (default)
+       export DOGSITE_BIN=/path/to/dogsitescorer-2.0.0/dogsite
+       python3 "$REPO"/bin/polyphar-dogsite-worker --benchmark     # --tool dogsite2 (default)
 
-   For DoGSiteScorer 2 instead, set `DOGSITE_BIN` to its binary and add `--tool dogsite2`
-   here and `POLYPHAR_POCKET_TOOL=dogsite2` (or `--pocket-tool dogsite2`) for the runs.
+   For the DoGSite3 sensitivity analysis instead, install it with the ZBH installer
+   (`/opt/ZBH/dogsite3/dogsite3`, with `VERSION_INFO` next to it), activate its license once
+   (`dogsite3 --license <key>`), then set `DOGSITE_BIN` to it and add `--tool dogsite3` here
+   and `POLYPHAR_POCKET_TOOL=dogsite3` (or `--pocket-tool dogsite3`) for the runs.
 
 3. **Build the image.** The tag you choose is what `POLYPHAR_VERSION` selects later. Also tag
    it `dev`: `tests/test_docker.py` looks for `polyphar:dev` and skips silently without it.
@@ -53,7 +55,7 @@ system `python3` ≥ 3.8 on the host.
 4. **Check the machine.**
    - The PocketMatch binaries run in the image. `Exec format error` means the kernel lacks
      IA32 emulation (see [Server checks](#server-checks)).
-   - The wrapper runs as your user, with the real DoGSite3.
+   - The wrapper runs as your user, with the real pocket-detection binary.
    - RCSB and AlphaFold downloads work.
 
        pytest -W error tests/test_docker.py
@@ -246,9 +248,9 @@ All stages take `--run-dir` (default `/work` in the container, else the current 
     polyphar uniprot                                  # reviewed human entries only
     polyphar structures                               # SIFTS chains + AlphaFold F1 models
     polyphar fix [--ph 7.0]
-    polyphar pockets [--pocket-tool dogsite3] [--min-volume 300] [--drugscore-cutoff 0.5] \
+    polyphar pockets [--pocket-tool dogsite2] [--drugscore-cutoff 0.5] [--min-volume 120] \
                      [--worker-timeout 600] [--worker-dead-after 21600]
-                                                      # host worker runs DoGSite3 / DoGSiteScorer 2
+                                                      # host worker runs DoGSiteScorer 2 / DoGSite3
     polyphar similarity [--pm-bin-dir /opt/pocketmatch]
     polyphar select [--pmax 0.7] [--exclude O15350] [--hub-tie-break union]
     polyphar dock --library inputs/e-Drug3D_2083.sdf [--seed 42] [--chunk-size 50] \
@@ -320,17 +322,18 @@ exits 3, like `run`, and sends its `done` notification at priority 1.
   manifest.
 - **Ligands**: smina `--addH 1` (its default, pinned explicitly), `--seed 42`. Kept from
   2023: exhaustiveness 12, num_modes 12, unpadded box over the pocket atoms.
-- **Pocket detection with DoGSite3** (default; see
-  [Pocket detection](#pocket-detection-dogsite3--dogsitescorer)). 2023 used DoGSiteScorer 2
-  (`-s -i -y -d -w 4`) and kept pockets with drugScore >= 0.5. polyphar now runs DoGSite3
-  (`dogsite3 -p <model> -o <out> -s -d --writeSiteResiduesPDB -v 1`, version recorded in the
-  manifest), which reports pocket descriptors (volume, enclosure, depth, ...) but no
-  drugScore. Pockets and subpockets with a volume of at least 300 Å³ are kept, a fixed
-  cutoff [citation]. Suggested Methods text: "Binding pockets and subpockets were detected
-  with DoGSite3 (version 1.3.0) [citation] on each pdbfixer-repaired PDB chain and each
-  AlphaFold model, with subpocket detection enabled. Pockets (and subpockets) with a volume
-  of at least 300 Å³ were retained for pocket similarity [citation]." DoGSiteScorer 2 with
-  the 2023 rule stays available (`--pocket-tool dogsite2`).
+- **Pocket detection with DoGSiteScorer 2** (default; see
+  [Pocket detection](#pocket-detection-dogsitescorer--dogsite3)). This is the 2023 method and
+  rule: `-s -i -y -d -w 4`, pockets and subpockets with drugScore >= 0.5. DoGSiteScorer
+  2.0.0 reproduces the 2023 drugScore values exactly on the net2 regression chains, so the
+  rerun's pockets are comparable with 2023's. What changes is **coverage**: the 2023 net2
+  pocket stage has output for only about 495 of its 1301 models (~38 %), and 2.0.0 finds
+  pockets for all sampled missing ones, so the 2023 similarity networks were built from a
+  minority of the structures. Suggested Methods text: "Binding pockets and subpockets were
+  detected with DoGSiteScorer (version 2.0.0) [citation] on each pdbfixer-repaired PDB chain
+  and each AlphaFold model, with subpocket detection enabled. Pockets (and subpockets) with
+  a drug score of at least 0.5 were retained for pocket similarity." DoGSite3 with a
+  calibrated volume cutoff is the sensitivity analysis (`--pocket-tool dogsite3`).
 - **Fusion / chimeric chains.** A chain SIFTS maps to several accessions (a fusion construct,
   e.g. a target fused to MBP or T4 lysozyme) is kept whole for pdbfixer and pocket detection.
   `Protein_info.csv` records the accession's SIFTS segments on that chain (`SIFTS segments`,
@@ -391,13 +394,14 @@ These are sent:
 Every notification, sent or not (for example without credentials), is also recorded in
 `logs/notifications.log`.
 
-## Pocket detection (DoGSite3 / DoGSiteScorer)
+## Pocket detection (DoGSiteScorer / DoGSite3)
 
-DoGSite3 (default) and DoGSiteScorer 2 are both licensed for the host. A binary is never
-copied or mounted into the image and never committed here.
+DoGSiteScorer 2 (default, the primary tool) and DoGSite3 (the sensitivity analysis) are both
+licensed for the host. A binary is never copied or mounted into the image and never committed
+here.
 
-- **Tool choice.** `--pocket-tool dogsite3|dogsite2` on `pockets` / `run` (default
-  `$POLYPHAR_POCKET_TOOL`, else `dogsite3`), with `DOGSITE_BIN` pointing to that tool's
+- **Tool choice.** `--pocket-tool dogsite2|dogsite3` on `pockets` / `run` (default
+  `$POLYPHAR_POCKET_TOOL`, else `dogsite2`), with `DOGSITE_BIN` pointing to that tool's
   binary. The wrapper reads the same option / variable and starts the host worker with
   `--tool <tool>`; the stage also writes the tool into every job file, and a worker refuses a
   job of the other tool (`failed`: `job is for X, this worker runs Y`).
@@ -415,15 +419,21 @@ copied or mounted into the image and never committed here.
   pocket outputs fails before anything is queued (`was made with --pocket-tool X, this run
   asks for Y`); queue records and manifests without a tool are DoGSiteScorer 2 outputs of
   earlier polyphar versions. Use a new run folder to switch tools.
-- **DoGSite3** (ZBH, Universität Hamburg; tested with 1.3.0): install with the ZBH
-  installer (`/opt/ZBH/dogsite3/dogsite3`) and activate the license once with
-  `dogsite3 --license <key>`. The worker runs
+- **DoGSiteScorer 2** (BioSolveIT; tested with 2.0.0), the **primary tool**: flags
+  `-s -i -y -d -w 4`, outputs `<UniProt>_<pdb>_<chain>.pdb_desc.txt` / `..._res_P_<n>.pdb`
+  as in 2023, selection `drugScore >= 0.5` (`--drugscore-cutoff`), which is the 2023 rule.
+  Version 2.0.0 reproduces the 2023 drugScore values exactly on the net2 regression chains
+  (setup step 5), so a rerun is comparable with 2023.
+- **DoGSite3** (ZBH, Universität Hamburg; tested with 1.3.0), the **sensitivity analysis**
+  and not the primary tool: install with the ZBH installer (`/opt/ZBH/dogsite3/dogsite3`)
+  and activate the license once with `dogsite3 --license <key>`. The worker runs
   `dogsite3 -p <model> -o <out> -s -d --writeSiteResiduesPDB -v 1`: subpockets on (`-s`, as
   with DoGSiteScorer 2), descriptors to `<out>_desc.txt` (`-d`), each (sub)pocket's complete
   residues to `<out>_P_<n>[_<m>]_res.pdb` (the PocketMatch input). The version is read from
   `VERSION_INFO` next to the binary (else `unknown`).
-  - **Selection: `volume >= 300 Å³`** (`--min-volume`), a fixed cutoff [citation]. DoGSite3
-    has no drugScore. Pockets and subpockets are judged alike, as drugScore was in 2023.
+  - **Selection: `volume >= 120 Å³`** (`--min-volume`), the cutoff calibrated against the
+    2023 drugScore selection (see below). DoGSite3 has no drugScore. Pockets and subpockets
+    are judged alike, as drugScore was in 2023.
   - **Names.** `<out>` = `04_pockets/<UniProt>/<pdb>_<chain>` for a PDB chain and
     `04_pockets/<UniProt>/AF-<acc>-F1` for an AlphaFold model, so pocket files are e.g.
     `2mjw_B_P_1_res.pdb` and `AF-P25815-F1_P_1_2_res.pdb`. The UniProt folder already names
@@ -438,18 +448,18 @@ copied or mounted into the image and never committed here.
   - **Volumes are much smaller than DoGSiteScorer 2's.** On the same 20 pdbfixer chains of
     the 2023 net2 run, the largest DoGSite3 pocket had a median 0.24× the volume of the
     largest DoGSiteScorer 2 pocket (2OGQ_A, PLK1 kinase domain: 211 vs 546 Å³). Of 523
-    DoGSite3 pockets in 50 random net2 models (40 chains, 10 AlphaFold models), 11 (in 10
-    models) have volume >= 300 Å³; DoGSiteScorer 2 kept 40 pockets by drugScore >= 0.5 on
-    the 20 chains above. Check the selected-pocket counts (`counts.selected`) before
-    similarity.
+    DoGSite3 pockets in 50 random net2 models (40 chains, 10 AlphaFold models), only 11 (in
+    10 models) have volume >= 300 Å³; DoGSiteScorer 2 kept 40 pockets by drugScore >= 0.5 on
+    the 20 chains above. That is why the cutoff is calibrated rather than taken over. Check
+    the selected-pocket counts (`counts.selected`) before similarity.
   - **Calibration on DoGSite3's own scale:** `scripts/calibrate_dogsite3_volume.py` runs a
     tool on the 2023 net2 inputs and finds the DoGSite3 volume cutoff that keeps the same
     fraction of pockets as drugScore >= 0.5 did in 2023 (pockets and subpockets on both
-    sides), and compares the two selections by residue overlap. On 488 net2 models it
-    proposes 120 Å³ (pending a decision; the default is still 300).
-- **DoGSiteScorer 2**: flags `-s -i -y -d -w 4`, outputs
-  `<UniProt>_<pdb>_<chain>.pdb_desc.txt` / `..._res_P_<n>.pdb` as in 2023, selection
-  `drugScore >= 0.5` (`--drugscore-cutoff`).
+    sides), and compares the two selections by residue overlap. On 488 net2 models the kept
+    fraction is f = 0.129 and the cutoff is **120 Å³** (the default). The two selections
+    agree only loosely: precision 0.57 and recall 0.26 against the DoGSiteScorer 2
+    selection, and only 54 % of the DoGSiteScorer 2 pockets have any DoGSite3 match. Treat
+    DoGSite3 as a different method, not a drop-in substitute.
 - **`DrugScore.csv`** (name kept from 2023) has `UniProt ID, Gene Name, Protein, Pocket`, the
   tool's descriptor columns, `Pocket Filename` (the residue file on disk), `Tool` and
   `Selected` (the tool's rule). The manifest records `selection_rule`. `similarity` uses the

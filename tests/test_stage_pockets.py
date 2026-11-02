@@ -450,8 +450,8 @@ def _run_worker(run_dir, dogsite, *extra):
 
 
 def _real_tool():
-    """The tool of the real binary in $DOGSITE_BIN: $POLYPHAR_POCKET_TOOL, default dogsite3."""
-    return os.environ.get("POLYPHAR_POCKET_TOOL") or "dogsite3"
+    """The tool of the real binary in $DOGSITE_BIN: $POLYPHAR_POCKET_TOOL, default dogsite2."""
+    return os.environ.get("POLYPHAR_POCKET_TOOL") or "dogsite2"
 
 
 @pytest.mark.dogsite
@@ -552,7 +552,7 @@ def test_fusion_bounds_recovered_from_seqres_drop_the_partner_pocket(tmp_path):
     assert counts["outside_segment"] == 2 and counts["segment_unverified"] == 0
 
 
-# --- DoGSite3 (default tool) -----------------------------------------------------------
+# --- DoGSite3 (the sensitivity analysis) -----------------------------------------------
 
 FAKE3 = FIX / "fake_dogsite3_data"
 DS3 = SimpleNamespace(nprocs=1, worker_timeout=600, pocket_tool="dogsite3", min_volume=300.0,
@@ -573,16 +573,18 @@ def _finish3(layout, job_id, out, label="O60218_4gqg_A", sha="abc", version="1.3
                      "tool_version": version}))
 
 
-def test_default_tool_is_dogsite3(monkeypatch):
+def test_default_tool_is_dogsite2_and_dogsite3_uses_the_calibrated_volume(monkeypatch):
+    """DoGSiteScorer 2 is the primary tool; DoGSite3 (sensitivity analysis) keeps pockets
+    with volume >= 120 A^3 (scripts/calibrate_dogsite3_volume.py)."""
     from polyphar import cli
     monkeypatch.delenv("POLYPHAR_POCKET_TOOL", raising=False)
     args = cli.build_parser().parse_args(["pockets"])
-    assert (args.pocket_tool, args.min_volume, args.drugscore_cutoff) == ("dogsite3", 300.0, 0.5)
-    args = cli.build_parser().parse_args(["run", "--pocket-tool", "dogsite2",
+    assert (args.pocket_tool, args.min_volume, args.drugscore_cutoff) == ("dogsite2", 120.0, 0.5)
+    args = cli.build_parser().parse_args(["run", "--pocket-tool", "dogsite3",
                                           "--min-volume", "250"])
-    assert (args.pocket_tool, args.min_volume) == ("dogsite2", 250.0)
-    monkeypatch.setenv("POLYPHAR_POCKET_TOOL", "dogsite2")
-    assert cli.build_parser().parse_args(["pockets"]).pocket_tool == "dogsite2"
+    assert (args.pocket_tool, args.min_volume) == ("dogsite3", 250.0)
+    monkeypatch.setenv("POLYPHAR_POCKET_TOOL", "dogsite3")
+    assert cli.build_parser().parse_args(["pockets"]).pocket_tool == "dogsite3"
     with pytest.raises(SystemExit):
         cli.build_parser().parse_args(["pockets", "--pocket-tool", "fpocket"])
 

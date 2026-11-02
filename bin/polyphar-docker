@@ -7,7 +7,7 @@
 #   POLYPHAR_RUN_DIR      run folder on the host (default: current directory)
 #   DOGSITE_BIN           host pocket-detection binary of the chosen tool (needed by
 #                         pockets / run / benchmark), e.g. /opt/ZBH/dogsite3/dogsite3
-#   POLYPHAR_POCKET_TOOL  dogsite3 (default) or dogsite2; a `--pocket-tool X` argument wins.
+#   POLYPHAR_POCKET_TOOL  dogsite2 (default) or dogsite3; a `--pocket-tool X` argument wins.
 #                         The same tool goes to the host worker (--tool) and the container
 #                         (env; the stage also writes it into every job file)
 #   POLYPHAR_HOME         calibration / pushover.env dir (default: ~/.polyphar)
@@ -30,8 +30,8 @@ home_dir="${POLYPHAR_HOME:-$HOME/.polyphar}"
 mkdir -p "$home_dir"
 home_dir="$(realpath "$home_dir")"
 
-# --- pocket tool: --pocket-tool X / --pocket-tool=X, else $POLYPHAR_POCKET_TOOL, else dogsite3
-pocket_tool="${POLYPHAR_POCKET_TOOL:-dogsite3}"
+# --- pocket tool: --pocket-tool X / --pocket-tool=X, else $POLYPHAR_POCKET_TOOL, else dogsite2
+pocket_tool="${POLYPHAR_POCKET_TOOL:-dogsite2}"
 prev=""
 for a in "$@"; do
     if [ "$prev" = "--pocket-tool" ]; then

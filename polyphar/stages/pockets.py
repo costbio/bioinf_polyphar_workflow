@@ -1,16 +1,16 @@
-"""Stage 04: pocket detection with DoGSite3 (default) or DoGSiteScorer 2, run on the HOST
+"""Stage 04: pocket detection with DoGSiteScorer 2 (default) or DoGSite3, run on the HOST
 through a file queue.
 
 Both tools are licensed for the host, so they never run in the container. This stage
 (container side) writes one job file per model into 04_pockets/queue/ and waits while
 bin/polyphar-dogsite-worker (host side) consumes them.
 
-Tool (--pocket-tool, default $POLYPHAR_POCKET_TOOL or dogsite3): one tool per run folder.
+Tool (--pocket-tool, default $POLYPHAR_POCKET_TOOL or dogsite2): one tool per run folder.
 It is recorded in 04_pockets/TOOL when a run starts, in every job file, .done and the
 manifest; a run asking for the other tool than the run folder's existing pocket outputs
 (TOOL, manifest, or queue records; records without a tool are DoGSiteScorer 2, the only
 tool before) fails before anything is queued. Pocket selection (the `Selected` column):
-  dogsite3   volume >= --min-volume (default 300 A^3; DoGSite3 has no drugScore)
+  dogsite3   volume >= --min-volume (default 120 A^3, calibrated; DoGSite3 has no drugScore)
   dogsite2   drugScore >= --drugscore-cutoff (default 0.5; the 2023 rule)
 
 Inputs (from 02_structures/Protein_info.csv, never globbed):
@@ -69,11 +69,11 @@ REASON_NO_FIXED = "no pdbfixer output"
 NO_WORKER = ("No DoGSiteScorer worker is consuming the queue — "
              "start bin/polyphar-dogsite-worker on the host")
 TOOLS = ("dogsite3", "dogsite2")
-DEFAULT_TOOL = "dogsite3"
+DEFAULT_TOOL = "dogsite2"
 LEGACY_TOOL = "dogsite2"        # queue records / manifests without a tool field
 TOOL_ENV = "POLYPHAR_POCKET_TOOL"
 TOOL_FILE = "TOOL"
-DEFAULT_MIN_VOLUME = 300.0      # A^3, dogsite3 selection
+DEFAULT_MIN_VOLUME = 120.0      # A^3, dogsite3 selection (scripts/calibrate_dogsite3_volume.py)
 DEFAULT_DRUGSCORE_CUTOFF = 0.5  # dogsite2 selection (2023)
 _DS3_POCKET = re.compile(r"^(.*)_(P_\d+(?:_\d+)*)_res\.pdb$")
 
