@@ -23,6 +23,7 @@ def _ann(af=True, plddt=90.0, size=(18.0, 18.0, 18.0), residues=(10, 11, 12)):
 
 
 OPTS = panel.Options()
+ONE = panel.Options(per_protein=1)
 
 
 @pytest.mark.parametrize("kw,ann_kw,expect", [
@@ -99,7 +100,7 @@ class TestTMPolicies:
 
 def test_funnel_is_a_chain_that_sums():
     rows = [_row(acc="A", ds=0.4), _row(acc="B", vol=99.0), _row(acc="C")]
-    anns = {r["Pocket Filename"]: _ann() for r in rows}
+    anns = {(r["UniProt ID"], r["Pocket Filename"]): _ann() for r in rows}
     pan, elig, funnel, rej = panel.select_panel(rows, anns, {}, {}, OPTS)
     assert funnel[0] == ("selected", 3)
     assert [s for s, _ in funnel][1:] == panel.STEPS
@@ -111,19 +112,19 @@ def test_funnel_is_a_chain_that_sums():
 
 def test_one_row_per_protein_takes_the_highest_drugscore():
     rows = [_row(acc="P1", pocket="P_1", ds=0.6), _row(acc="P1", pocket="P_2", ds=0.95)]
-    anns = {r["Pocket Filename"]: _ann() for r in rows}
-    pan, _, _, _ = panel.select_panel(rows, anns, {}, {}, OPTS)
+    anns = {(r["UniProt ID"], r["Pocket Filename"]): _ann() for r in rows}
+    pan, _, _, _ = panel.select_panel(rows, anns, {}, {}, panel.Options(per_protein=1))
     assert len(pan) == 1
-    assert pan["P1"][0]["Pocket"] == "P_2"
+    assert pan["P1"][0][0]["Pocket"] == "P_2"
 
 
 def test_tie_on_drugscore_breaks_on_pocket_name_not_row_order():
     a = _row(acc="P1", pocket="P_1", ds=0.8)
     b = _row(acc="P1", pocket="P_2", ds=0.8)
-    anns = {r["Pocket Filename"]: _ann() for r in (a, b)}
-    first, _, _, _ = panel.select_panel([a, b], anns, {}, {}, OPTS)
-    second, _, _, _ = panel.select_panel([b, a], anns, {}, {}, OPTS)
-    assert first["P1"][0]["Pocket"] == second["P1"][0]["Pocket"] == "P_1"
+    anns = {(r["UniProt ID"], r["Pocket Filename"]): _ann() for r in (a, b)}
+    first, _, _, _ = panel.select_panel([a, b], anns, {}, {}, ONE)
+    second, _, _, _ = panel.select_panel([b, a], anns, {}, {}, ONE)
+    assert first["P1"][0][0]["Pocket"] == second["P1"][0][0]["Pocket"] == "P_1"
 
 
 def test_a_pocket_without_an_annotation_is_reported_not_silently_dropped():
@@ -153,7 +154,7 @@ def test_subpocket_parent_lookup_does_not_cross_structures():
     rows = [{"UniProt ID": "P1", "Gene Name": "G_HUMAN", "Protein": "1ABC_A",
              "Pocket": "P_1_1", "Pocket Filename": "1abc_A_res_P_1_1.pdb",
              "drugScore": "0.9", "volume": "800", "surf/vol": "0.40"}]
-    anns = {"1abc_A_res_P_1_1.pdb": _ann(af=False, plddt=None)}
+    anns = {("P1", "1abc_A_res_P_1_1.pdb"): _ann(af=False, plddt=None)}
     volumes = {("P1", "1ABC_A", "P_1"): 1200.0,      # its real parent: under the ceiling
                ("P1", "AF-P1-F1", "P_1"): 25840.0}   # another structure's: irrelevant
     pan, _, _, rej = panel.select_panel(rows, anns, {}, volumes, OPTS)
@@ -164,6 +165,50 @@ def test_eligible_returns_every_passing_pocket_not_one_per_protein():
     """`similarity` runs on the eligible set, so it must not be collapsed to the panel."""
     rows = [_row(acc="P1", pocket="P_1", ds=0.9), _row(acc="P1", pocket="P_2", ds=0.8),
             _row(acc="P2", pocket="P_1", ds=0.7)]
-    anns = {r["Pocket Filename"]: _ann() for r in rows}
+    anns = {(r["UniProt ID"], r["Pocket Filename"]): _ann() for r in rows}
     pan, elig, _, _ = panel.select_panel(rows, anns, {}, {}, OPTS)
     assert len(pan) == 2 and len(elig) == 3
+
+
+def test_up_to_n_pockets_per_protein_best_drugscore_first():
+    """Picking one pocket per protein was close to a coin flip against known ligand
+    sites (17 of 29), so the best few are docked instead."""
+    rows = [_row(acc="P1", pocket="P_1", ds=0.70), _row(acc="P1", pocket="P_2", ds=0.95),
+            _row(acc="P1", pocket="P_3", ds=0.80)]
+    anns = {(r["UniProt ID"], r["Pocket Filename"]): _ann() for r in rows}
+    pan, _, _, _ = panel.select_panel(rows, anns, {}, {}, panel.Options(per_protein=2))
+    assert [p[0]["Pocket"] for p in pan["P1"]] == ["P_2", "P_3"]
+
+
+def test_a_protein_with_one_eligible_pocket_contributes_one():
+    """`per_protein` is a cap, not a quota: nothing is padded in that fails the filters."""
+    rows = [_row(acc="P1", pocket="P_1"), _row(acc="P1", pocket="P_2", vol=9000.0)]
+    anns = {(r["UniProt ID"], r["Pocket Filename"]): _ann() for r in rows}
+    pan, _, _, _ = panel.select_panel(rows, anns, {}, {}, panel.Options(per_protein=2))
+    assert len(pan["P1"]) == 1
+
+
+def test_funnel_still_sums_when_an_annotation_is_missing():
+    """A missing annotation is a rejection; if it is not counted the funnel reports more
+    eligible pockets than passed, and the manifest contradicts its own table."""
+    rows = [_row(acc="A"), _row(acc="B"), _row(acc="C")]
+    anns = {("C", rows[2]["Pocket Filename"]): _ann()}
+    pan, elig, funnel, rej = panel.select_panel(rows, anns, {}, {}, OPTS)
+    assert funnel[-1][1] == len(elig) == 1
+    assert len(rej) == 2
+
+
+def test_a_missing_box_dimension_fails_the_grid_guard():
+    """Defaulting a missing size to 0 made a malformed row a 1-point box, which is
+    'legal' and silently becomes a dockable target."""
+    ann = _ann(); ann.pop("box_size_y")
+    assert panel.classify(_row(), ann, [], None, OPTS) == "grid"
+
+
+def test_defaults_come_from_the_module_not_from_test_literals():
+    """A test that hardcodes thresholds stays green when the production default moves —
+    the failure mode that has already bitten this repo twice."""
+    o = panel.Options()
+    assert (o.surfvol_max, o.volume_min, o.volume_max, o.plddt_min, o.per_protein) == (
+        panel.SURFVOL_MAX, panel.VOLUME_MIN, panel.VOLUME_MAX, panel.PLDDT_MIN,
+        panel.PER_PROTEIN)

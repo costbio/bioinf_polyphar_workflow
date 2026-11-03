@@ -32,6 +32,8 @@ Run order (each needs the previous one's cached JSON in `~/scratch_clust`):
 | `discriminate.py` | AUC per descriptor against ligand occupancy; drugScore 0.684 vs volume 0.851 |
 | `surfvol.py` | surf/vol does NOT reject the oversized cavities (0.539 vs 0.510); volume does |
 | `panel_v2.py` | the surf/vol x volume-ceiling sweep behind the 0.45 / 1500 choice |
+| `verify_panel.py` | **produces the design's funnel and panel numbers** by running the shipped modules on real data |
+| `audit2_checks.py` | AF/experimental pass rate per filter, and whether the panel picks the known ligand site |
 | `ligsize.py` | eDrug3D size/flexibility profile; the `rot>15 OR MW>900` dockability filter |
 | `boxeff.py` | docking-box volume per pocket (NOTE: its default PAD=4 is wrong -- dock.py pads nothing) |
 | `gpsbox.py` | cavity (`_gps_`) vs residue-envelope (`_res_`) box; shows cavity boxes are WORSE |

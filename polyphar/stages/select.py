@@ -39,6 +39,8 @@ from polyphar import tmfetch
 from polyphar.common import WorkUnits, write_manifest
 
 STAGE = "select"
+# bumped whenever the filter SET changes, so a run folder records which rules made it
+PANEL_VERSION = 3
 DEFAULT_EXCLUDE = ("O15350",)
 EXCLUDE_REASONS = {"O15350": "p73: problematic for docking (legacy decision)"}
 OUTPUTS = ("final_targets.csv", "eligible_pockets.csv", "panel_funnel.tsv",
@@ -71,6 +73,10 @@ def add_arguments(parser) -> None:
     parser.add_argument("--no-fetch-tm", action="store_true",
                         help="do not contact UniProt for missing transmembrane data; "
                              "fail instead, so a run can be reproduced offline")
+    parser.add_argument("--per-protein", type=int, default=p.PER_PROTEIN, metavar="N",
+                        help=f"pockets docked per protein, best drugScore first "
+                             f"(default: {p.PER_PROTEIN}); picking one is close to a "
+                             f"coin flip against known ligand sites")
     parser.add_argument("--exclude", nargs="*", default=list(DEFAULT_EXCLUDE),
                         metavar="UNIPROT",
                         help=f"accessions to keep out of the panel "
@@ -89,6 +95,7 @@ def _options(args) -> panel_mod.Options:
         surfvol_max=getattr(args, "surf_vol_max", panel_mod.SURFVOL_MAX),
         tm_policy=getattr(args, "tm_policy", "C"),
         tm_overlap_max=getattr(args, "tm_overlap", panel_mod.TM_OVERLAP_MAX),
+        per_protein=getattr(args, "per_protein", panel_mod.PER_PROTEIN),
     )
 
 
@@ -151,7 +158,9 @@ def _load(layout):
     annotations = {}
     for a in _read_csv(ann_path):
         a["_residues"] = decode_residues(a.get("residues", ""))
-        annotations[a["Pocket Filename"]] = a
+        # keyed on the PAIR, not the filename: a chimeric or shared chain can give the
+        # same pocket file name under two accessions
+        annotations[(a["UniProt ID"], a["Pocket Filename"])] = a
     return rows, annotations, parent_volumes
 
 
@@ -194,7 +203,8 @@ def _receptor_paths(panel, protein_info):
     """(Receptor_Path by accession, real author chain by accession)."""
     pdb, af = _receptor_index(protein_info)
     paths, chains, missing, ambiguous = {}, {}, [], []
-    for acc, (row, _ann) in panel.items():
+    for acc, picks in panel.items():
+        row, _ann = picks[0]
         structure_id, chain = split_protein(str(row.get("Protein", "")))
         if structure_id.startswith("AF-"):
             file = af.get(acc)
@@ -234,7 +244,7 @@ def target_rows(panel, paths, chains) -> list[dict]:
     """final_targets.csv rows, sorted by accession so the output is reproducible."""
     out = []
     for acc in sorted(panel):
-        row, _ann = panel[acc]
+      for row, _ann in panel[acc]:
         entry = str(row.get("Gene Name", ""))
         gene, organism = split_entry_name(entry)
         structure_id, _ = split_protein(str(row.get("Protein", "")))
@@ -330,17 +340,21 @@ def run(layout, args, progress) -> dict:
         append_failure(d, acc, STAGE, why)
     progress.advance(1, size=1.0)
 
-    af = sum(1 for _r, a in pan.values()
-             if str(a.get("AlphaFold", "")).strip().lower() == "true")
-    counts = {"selected_pockets": len(rows), "eligible_pockets": len(eligible),
-              "panel": len(pan), "alphafold": af, "experimental": len(pan) - af,
-              "excluded": len(dropped), "rejected_pockets": len(rejections)}
+    af = sum(1 for picks in pan.values()
+             if str(picks[0][1].get("AlphaFold", "")).strip().lower() == "true")
+    targets = sum(len(v) for v in pan.values())
+    # eligible_pockets must match eligible_pockets.csv, which drops excluded accessions
+    eligible_kept = sum(1 for r, _a in eligible if r["UniProt ID"] not in excluded)
+    counts = {"selected_pockets": len(rows), "eligible_pockets": eligible_kept,
+              "panel": len(pan), "targets": targets, "alphafold": af,
+              "experimental": len(pan) - af, "excluded": len(dropped),
+              "rejected_pockets": len(rejections)}
     # The manifest is written last: its presence marks the stage as finished.
     write_manifest(d, STAGE,
                    args={**opts.as_dict(), "exclude": sorted(excluded)},
                    inputs=[layout.drugscore_csv, annotation_path(layout),
                            layout.protein_info],
-                   versions={"panel": "rg"}, counts=counts, timing={},
+                   versions={"panel": "surfvol-volume", "per_protein": PANEL_VERSION}, counts=counts, timing={},
                    extra={"funnel": dict(funnel),
                           "outputs": {n: (d / n).stat().st_size for n in OUTPUTS}})
     return counts

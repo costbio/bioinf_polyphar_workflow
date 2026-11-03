@@ -765,8 +765,10 @@ def _inputs(layout):
             f"{path} not found: run `select` first (similarity now runs on the panel's "
             f"eligible pockets, after selection, not before it)")
     with open(path, newline="", encoding="utf-8") as fh:
-        keep = {r["Pocket Filename"] for r in _csv.DictReader(fh)}
-    table = table[table["Pocket Filename"].isin(keep)].reset_index(drop=True)
+        # keyed on the pair: a filename-only key can admit another accession's pocket
+        keep = {(r["UniProt_ID"], r["Pocket Filename"]) for r in _csv.DictReader(fh)}
+    mask = [(a, f) in keep for a, f in zip(table["UniProt ID"], table["Pocket Filename"])]
+    table = table[mask].reset_index(drop=True)
     return table, _paths(layout.pockets, table), missing
 
 

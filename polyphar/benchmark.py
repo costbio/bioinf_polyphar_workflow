@@ -69,8 +69,8 @@ PRIORS = {
     "af_model_bytes": 333980,
     "fixed_chain_bytes": 333660,
     "kept_pockets_per_model": 1191 / (1145 + 156),
-    "targets": 8,
-    "ligands": 2083,   # e-Drug3D_2083
+    "targets": 316,
+    "ligands": 1960,   # e-Drug3D_2083
 }
 PRIORS_SOURCE = "2023 HCC net2 run"
 # kept (selected) pockets per submitted model, by pocket tool. dogsite2: the PRIORS value
@@ -81,8 +81,9 @@ KEPT_POCKETS_PRIOR = {"dogsite2": PRIORS["kept_pockets_per_model"], "dogsite3": 
 
 BENCH_STAGES = ("uniprot", "structures", "fix", "pockets", "similarity", "dock")
 # share of selected pockets that survive the panel filters, for the pre-run estimate
-# only (measured on net1: 599 of 11,599). The real count comes from `select`.
-ELIGIBLE_FRACTION = 0.052
+# only (measured on net1: 1,367 of 11,599). Pairs scale as n^2, so a stale value
+# makes the similarity ETA wrong quadratically. The real count comes from `select`.
+ELIGIBLE_FRACTION = 0.118
 HOST_CALIBRATED = ("host-calibrated: DoGSite3 / DoGSiteScorer runs on the host only; calibrate "
                    "with bin/polyphar-dogsite-worker --benchmark --tool <tool> "
                    "(bin/polyphar-docker does it)")

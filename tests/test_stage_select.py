@@ -13,14 +13,18 @@ from pathlib import Path
 import pytest
 
 from polyphar.common import RunLayout
+from polyphar import panel
 from polyphar.stages import select
 from polyphar.stages.annotate import encode_residues
 
 
 def _args(**kw):
-    base = dict(surf_vol_max=0.45, volume_min=300.0, volume_max=1500.0, drugscore_min=0.5,
-                plddt_min=70.0, tm_policy="C", tm_overlap=0.10, exclude=["O15350"],
-                no_fetch_tm=True)
+    # taken from the module, so the suite cannot stay green past a default change
+    base = dict(surf_vol_max=panel.SURFVOL_MAX, volume_min=panel.VOLUME_MIN,
+                volume_max=panel.VOLUME_MAX, drugscore_min=panel.DRUGSCORE_MIN,
+                plddt_min=panel.PLDDT_MIN, tm_policy="C",
+                tm_overlap=panel.TM_OVERLAP_MAX, per_protein=panel.PER_PROTEIN,
+                exclude=["O15350"], no_fetch_tm=True)
     base.update(kw)
     return types.SimpleNamespace(**base)
 
@@ -50,8 +54,13 @@ def _make_run(tmp_path, drugscore_rows, annotation_rows, protein_info_rows, tm=N
     write(run / "04_pockets" / "DrugScore.csv", drugscore_rows,
           ["UniProt ID", "Gene Name", "Protein", "Pocket", "Pocket Filename",
            "volume", "drugScore", "surf/vol", "Selected"])
+    # the annotation key is (accession, filename), so fill the accession in from the
+    # DrugScore rows rather than making every caller repeat it
+    acc_of = {r["Pocket Filename"]: r["UniProt ID"] for r in drugscore_rows}
+    for a in annotation_rows:
+        a["UniProt ID"] = acc_of.get(a["Pocket Filename"], a.get("UniProt ID", ""))
     write(run / "04_pockets" / "annotation" / "pocket_annotation.csv", annotation_rows,
-          ["Pocket Filename", "AlphaFold", "pocket_plddt_mean",
+          ["UniProt ID", "Pocket Filename", "AlphaFold", "pocket_plddt_mean",
            "box_size_x", "box_size_y", "box_size_z", "residues"])
     write(run / "02_structures" / "Protein_info.csv", protein_info_rows,
           ["UniProt ID", "PDB", "Chain ID", "AlphaFold", "File"])
@@ -66,8 +75,8 @@ def _ds(acc, protein, pocket, fname, vol=800.0, ds=0.9, sv=0.40):
             "drugScore": str(ds), "surf/vol": str(sv), "Selected": "True"}
 
 
-def _an(fname, af=True, plddt=90.0, residues=(10, 11, 12)):
-    return {"Pocket Filename": fname, "AlphaFold": str(af),
+def _an(fname, af=True, plddt=90.0, residues=(10, 11, 12), acc="P1"):
+    return {"UniProt ID": acc, "Pocket Filename": fname, "AlphaFold": str(af),
             "pocket_plddt_mean": "" if plddt is None else str(plddt),
             "box_size_x": "18", "box_size_y": "18", "box_size_z": "18",
             "residues": encode_residues(list(residues))}
@@ -89,7 +98,7 @@ def test_split_entry_name_splits_at_the_last_underscore():
 # --- receptor paths -------------------------------------------------------------------
 
 def test_receptor_path_for_alphafold_uses_the_model_file():
-    panel = {"P1": (_ds("P1", "AF-P1-F1", "P_1", "f.pdb"), _an("f.pdb"))}
+    panel = {"P1": [(_ds("P1", "AF-P1-F1", "P_1", "f.pdb"), _an("f.pdb"))]}
     info = [{"UniProt ID": "P1", "PDB": "", "Chain ID": "A", "AlphaFold": "True",
              "File": "02_structures/P1/AF-P1-F1.pdb"}]
     paths, chains = select._receptor_paths(panel, info)
@@ -100,7 +109,7 @@ def test_receptor_path_for_alphafold_uses_the_model_file():
 def test_receptor_path_for_a_pdb_chain_points_at_pdbfixer_and_keeps_the_real_chain():
     """The Protein field upper-cases the chain, so the lookup must be case-insensitive
     while Chain reports the real author chain."""
-    panel = {"P1": (_ds("P1", "2MJW_B", "P_1", "f.pdb"), _an("f.pdb", af=False))}
+    panel = {"P1": [(_ds("P1", "2MJW_B", "P_1", "f.pdb"), _an("f.pdb", af=False))]}
     info = [{"UniProt ID": "P1", "PDB": "2MJW", "Chain ID": "b", "AlphaFold": "False",
              "File": "02_structures/P1/2mjw_b.pdb"}]
     paths, chains = select._receptor_paths(panel, info)
@@ -109,7 +118,7 @@ def test_receptor_path_for_a_pdb_chain_points_at_pdbfixer_and_keeps_the_real_cha
 
 
 def test_chains_differing_only_by_case_are_ambiguous_not_guessed():
-    panel = {"P1": (_ds("P1", "2MJW_B", "P_1", "f.pdb"), _an("f.pdb", af=False))}
+    panel = {"P1": [(_ds("P1", "2MJW_B", "P_1", "f.pdb"), _an("f.pdb", af=False))]}
     info = [{"UniProt ID": "P1", "PDB": "2MJW", "Chain ID": "b", "AlphaFold": "False",
              "File": "02_structures/P1/2mjw_b.pdb"},
             {"UniProt ID": "P1", "PDB": "2MJW", "Chain ID": "B", "AlphaFold": "False",
@@ -119,7 +128,7 @@ def test_chains_differing_only_by_case_are_ambiguous_not_guessed():
 
 
 def test_a_target_with_no_protein_info_row_is_an_error():
-    panel = {"P1": (_ds("P1", "9XYZ_A", "P_1", "f.pdb"), _an("f.pdb", af=False))}
+    panel = {"P1": [(_ds("P1", "9XYZ_A", "P_1", "f.pdb"), _an("f.pdb", af=False))]}
     with pytest.raises(ValueError, match="no row in Protein_info"):
         select._receptor_paths(panel, [])
 
@@ -129,7 +138,7 @@ def test_a_target_with_no_protein_info_row_is_an_error():
 def test_target_rows_keep_the_columns_dock_consumes():
     """dock reads Protein, Pocket, Receptor_Path and Pocket_Path; the schema must not
     drift even though Similarity and Is_Hub are now meaningless."""
-    panel = {"P1": (_ds("P1", "AF-P1-F1", "P_2", "AF-P1-F1_res_P_2.pdb"), _an("x"))}
+    panel = {"P1": [(_ds("P1", "AF-P1-F1", "P_2", "AF-P1-F1_res_P_2.pdb"), _an("x"))]}
     rows = select.target_rows(panel, {"P1": "02_structures/P1/AF-P1-F1.pdb"}, {"P1": "A"})
     assert list(rows[0]) == select.TARGET_COLUMNS
     r = rows[0]
@@ -142,8 +151,8 @@ def test_target_rows_keep_the_columns_dock_consumes():
 
 def test_target_rows_are_sorted_by_accession_not_input_order():
     panel = {
-        "P2": (_ds("P2", "AF-P2-F1", "P_1", "b.pdb"), _an("b.pdb")),
-        "P1": (_ds("P1", "AF-P1-F1", "P_1", "a.pdb"), _an("a.pdb")),
+        "P2": [(_ds("P2", "AF-P2-F1", "P_1", "b.pdb"), _an("b.pdb", acc="P2"))],
+        "P1": [(_ds("P1", "AF-P1-F1", "P_1", "a.pdb"), _an("a.pdb"))],
     }
     rows = select.target_rows(panel, {"P1": "x", "P2": "y"}, {"P1": "A", "P2": "A"})
     assert [r["UniProt_ID"] for r in rows] == ["P1", "P2"]
@@ -180,7 +189,7 @@ def test_run_writes_the_panel_the_funnel_and_a_reason_per_rejection(tmp_path):
 
     manifest = json.loads((layout.targets / "manifest.json").read_text())
     assert manifest["counts"]["panel"] == 1
-    assert manifest["args"]["surfvol_max"] == 0.45
+    assert manifest["args"]["surfvol_max"] == panel.SURFVOL_MAX
 
 
 def test_excluded_accessions_are_dropped_and_recorded(tmp_path):

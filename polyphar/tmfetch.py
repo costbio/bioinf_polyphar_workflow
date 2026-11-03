@@ -39,6 +39,7 @@ def fetch(accessions, session=None) -> dict[str, list[tuple[int, int]]]:
     """{accession: [(start, end)]} from UniProt, in batches."""
     session = session or http_session()
     out: dict[str, list[tuple[int, int]]] = {}
+    missed: set[str] = set()
     accs = sorted(set(accessions))
     for i in range(0, len(accs), BATCH):
         batch = accs[i:i + BATCH]
@@ -46,10 +47,19 @@ def fetch(accessions, session=None) -> dict[str, list[tuple[int, int]]]:
         r = session.get(URL, params={"query": query, "fields": FIELDS,
                                      "format": "tsv", "size": "500"}, timeout=120)
         r.raise_for_status()
+        got = set()
         for row in csv.DictReader(r.text.splitlines(), delimiter="\t"):
             out[row["Entry"]] = parse_transmem(row.get("Transmembrane", ""))
-        for a in batch:
-            out.setdefault(a, [])
+            got.add(row["Entry"])
+        missed.update(a for a in batch if a not in got)
+    if missed:
+        # recording a miss as "no TM segments" would pass every TM policy, so a
+        # multi-pass membrane protein could enter the panel silently
+        raise RuntimeError(
+            f"UniProt returned no record for {len(missed)} accession(s), so their "
+            f"transmembrane status is unknown: {', '.join(sorted(missed)[:10])}"
+            + (" ..." if len(missed) > 10 else "")
+            + ". These may be demerged, secondary or renamed accessions.")
     return out
 
 

@@ -66,6 +66,7 @@ SPACING = 0.375
 MAX_AXIS = 128
 MAX_POINTS = 531441
 TM_POLICIES = ("A", "B", "C")
+PER_PROTEIN = 2   # pockets docked per protein, best drugScore first
 
 # The funnel steps, in order. Each pocket is attributed to the FIRST step it fails, so
 # the counts form a chain and sum correctly.
@@ -87,7 +88,8 @@ class Options:
     def __init__(self, drugscore_min=DRUGSCORE_MIN, volume_min=VOLUME_MIN,
                  volume_max=VOLUME_MAX, parent_volume_max=PARENT_VOLUME_MAX,
                  plddt_min=PLDDT_MIN, surfvol_max=SURFVOL_MAX, tm_policy="C",
-                 tm_overlap_max=TM_OVERLAP_MAX, spacing=SPACING):
+                 tm_overlap_max=TM_OVERLAP_MAX, spacing=SPACING,
+                 per_protein=PER_PROTEIN):
         if tm_policy not in TM_POLICIES:
             raise ValueError(f"tm_policy must be one of {TM_POLICIES}, got {tm_policy!r}")
         self.drugscore_min = float(drugscore_min)
@@ -99,6 +101,12 @@ class Options:
         self.tm_policy = tm_policy
         self.tm_overlap_max = float(tm_overlap_max)
         self.spacing = float(spacing)
+        # More than one pocket per protein because picking one is a coin flip: measured
+        # against pockets with a co-crystal ligand, the highest-drugScore pick was the
+        # known site in only 17 of 29 cases (59%). Docking the best few removes the
+        # choice instead of trying to make it correctly. Only pockets that pass every
+        # filter are taken, so a protein with one eligible pocket contributes one.
+        self.per_protein = max(1, int(per_protein))
 
     def as_dict(self) -> dict:
         return {k: v for k, v in vars(self).items()}
@@ -168,8 +176,10 @@ def classify(row, ann, tm_segments, parent_volume, opts) -> str | None:
     residues = ann.get("_residues") or []
     if tm_reject(is_af, tm_segments, residues, opts):
         return "tm"
-    size = [_f(ann.get(f"box_size_{k}"), 0.0) for k in "xyz"]
-    if not grid_legal(size, opts.spacing):
+    size = [_f(ann.get(f"box_size_{k}")) for k in "xyz"]
+    # a missing dimension must FAIL: defaulting to 0.0 made a malformed annotation into
+    # a 1-point-per-axis box, which is "legal" and silently becomes a dockable target
+    if any(s is None or s <= 0 for s in size) or not grid_legal(size, opts.spacing):
         return "grid"
     return None
 
@@ -188,8 +198,9 @@ def parent_key(row):
 def select_panel(rows, annotations, tm, parent_volumes, opts):
     """(panel, eligible, funnel, rejections).
 
-    panel      {accession: (DrugScore row, annotation row)} — one pocket per protein,
-               highest drugScore, ties to the smallest pocket name.
+    panel      {accession: [(DrugScore row, annotation row), ...]} — up to
+               `opts.per_protein` pockets per protein, highest drugScore first, ties to
+               the smallest pocket name. `annotations` is keyed by (accession, filename).
     eligible   [(DrugScore row, annotation row)] — every pocket that passed the filters,
                not just the one per protein. This is what `similarity` runs on: the
                post hoc test needs pairwise similarity among panel pockets, and the
@@ -199,11 +210,16 @@ def select_panel(rows, annotations, tm, parent_volumes, opts):
     """
     eligible, rejections = [], []
     failed_at = {s: 0 for s in STEPS}
+    missing_annotation = 0
     for row in rows:
         acc = row["UniProt ID"]
         fname = row.get("Pocket Filename", "")
-        ann = annotations.get(fname)
+        # keyed on the PAIR: a chimeric or shared chain can give the same pocket file
+        # name under two accessions, and a filename-only key silently overwrites one
+        # annotation with the other
+        ann = annotations.get((acc, fname))
         if ann is None:
+            missing_annotation += 1
             rejections.append((f"{acc}/{fname}", "missing annotation"))
             continue
         pk = parent_key(row)
@@ -216,14 +232,20 @@ def select_panel(rows, annotations, tm, parent_volumes, opts):
             rejections.append((f"{acc}/{fname}", step))
 
     total = len(rows)
-    funnel, remaining = [("selected", total)], total
+    funnel = [("selected", total)]
+    remaining = total - missing_annotation
+    if missing_annotation:
+        funnel.append(("annotation", remaining))
     for s in STEPS:
         remaining -= failed_at[s]
         funnel.append((s, remaining))
+    assert remaining == len(eligible), "funnel must end at the eligible count"
 
-    panel: dict[str, tuple] = {}
+    panel: dict[str, list] = {}
     for row, ann in sorted(eligible,
                            key=lambda ra: (-_f(ra[0].get("drugScore"), 0.0),
                                            str(ra[0].get("Pocket", "")))):
-        panel.setdefault(row["UniProt ID"], (row, ann))
+        picks = panel.setdefault(row["UniProt ID"], [])
+        if len(picks) < opts.per_protein:
+            picks.append((row, ann))
     return panel, eligible, funnel, rejections

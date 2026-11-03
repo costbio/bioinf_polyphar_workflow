@@ -19,16 +19,16 @@ UniProt ID, Gene Name, Protein, Pocket, Pocket Filename, AlphaFold
     identity, copied from DrugScore.csv.
 n_atoms, n_residues
     lining atoms and distinct lining residues in the `_res_P_` file.
-radius_of_gyration
-    RMS distance of lining atoms from their centroid. **This is the compactness
-    criterion the panel filters on.** It is measured in space, so unlike a
-    sequence-segment count it does not depend on the residue-numbering coordinate
-    system, which differs between pdbfixer output (renumbered 1..N, missing loops
-    modelled in) and AlphaFold models (UniProt positions).
-segments, span
-    sequence-based compactness, recorded for provenance only. Measured on net1 these
-    are strongly provenance-dependent (AlphaFold pockets pass `segments <= 3` at 39.4%
-    against 17.5% for experimental ones), which is why they are not used to filter.
+radius_of_gyration, segments, span
+    DESCRIPTIVE ONLY — none of these filters the panel. Both were tried as compactness
+    criteria and both failed: `segments <= 3` is provenance-dependent (AlphaFold pockets
+    pass at 39.4% against 17.5% for experimental ones, because pdbfixer renumbers
+    experimental chains 1..N with missing loops modelled in while AlphaFold pockets
+    carry UniProt positions), and `Rg <= 8.5` kept only 8% of pockets holding a
+    co-crystal drug-like ligand against 69% of the rest — real binding sites have LARGE
+    lining-residue envelopes. The panel filters on volume, surf/vol and drugScore
+    instead; see polyphar/panel.py. These columns are kept because they are cheap and
+    were the evidence for that conclusion.
 box_center_{x,y,z}, box_size_{x,y,z}, box_max_dim, box_volume
     the unpadded bounding box of the lining atoms, i.e. exactly what
     `dock.pocket_box` computes, so the panel can be filtered on the box that will
