@@ -383,7 +383,16 @@ client that hangs, under a ~24-hour session ceiling — roughly 26 attended sess
 TRUBA is the fallback and has never been sized: no partition, no queue wait, and no
 Apptainer build validated. Size one of them before committing.
 
-### Dock stage rework — a stage-sized piece of work
+### Dock stage rework — designed separately
+
+**See `2026-11-03-dock-stage-gpu-design.md`.** It is a rewrite of the stage's execution
+model, not a parameter change, and it is the only stage with design risk left in it.
+Summary of what that document settles: the work unit becomes (target, replicate) over the
+whole library rather than a 50-ligand chunk, because Uni-Dock batches onto the GPU and is
+less efficient on small inputs; execution is session-sized export/run/merge round trips,
+because Colab VMs are ephemeral with no inbound network; and a `.done` marker can no
+longer certify *which* scores, only that a replicate was run, so resume must skip rather
+than redo. The notes below are the constraints it was written against.
 
 `dock.py` is built around a deterministic CLI engine and must change substantially:
 
