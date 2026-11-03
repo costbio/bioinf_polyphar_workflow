@@ -24,6 +24,10 @@ Run order (each needs the previous one's cached JSON in `~/scratch_clust`):
 | `build_calib.py` | builds the 48-pocket / 250-ligand calibration run folder |
 | `unidock_preflight.py` | Uni-Dock grid-cap pre-flight (<=128/axis, <=531,441 total at 0.375 A) |
 | `reconcile.py` | **authoritative**: the full funnel on the DOCKABLE set — 183 proteins / 492 pockets, and the cluster collapse that ended the cluster layer |
+| `sifts_check.py` | SIFTS cache has SP_BEG; but 65-71% of experimental chains use the seqres fallback |
+| `bias_check.py` | the `segments<=3` cross-class bias runs the WRONG way: AF 39.4% vs exp 17.5% |
+| `spatial.py` | spatial compactness candidates at matched stringency; Rg gap 1.5 pts vs 21.9 |
+| `reconcile2.py` | **authoritative**: Rg<=8.5 panel — 164 proteins / 537 pockets / 57% AF |
 | `ligsize.py` | eDrug3D size/flexibility profile; the `rot>15 OR MW>900` dockability filter |
 | `boxeff.py` | docking-box volume per pocket (NOTE: its default PAD=4 is wrong -- dock.py pads nothing) |
 | `gpsbox.py` | cavity (`_gps_`) vs residue-envelope (`_res_`) box; shows cavity boxes are WORSE |

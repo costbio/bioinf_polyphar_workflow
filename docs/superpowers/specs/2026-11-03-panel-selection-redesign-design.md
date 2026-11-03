@@ -49,51 +49,80 @@ not whether the effect is real.
 
 ## Panel definition
 
-A pocket is eligible when all hold. The funnel is from `reconcile.py` on net1:
+A pocket is eligible when all hold. The funnel is from `reconcile2.py` on net1:
 
 | filter | pockets surviving |
 |---|---|
 | DoGSiteScorer 2 selected, drugScore >= 0.5 | 11,599 |
 | volume 300-2000 A^3 | 4,992 |
-| segments <= 3 (gap > 5 residues starts a segment) | 1,284 |
-| subpocket rejected if its parent exceeds 2000 A^3 | 1,011 |
-| AlphaFold pockets: mean pocket pLDDT >= 70 | 859 |
-| TM policy C: drop multi-pass (>= 2 TM segments) | 645 |
-| TM policy C: drop pockets overlapping a TM segment > 10% | 643 |
-| docking box longest side <= 30 A | 492 |
-| Uni-Dock grid legal at 0.375 A (<=128/axis, <=531,441 total) | 492 |
+| subpocket rejected if its parent exceeds 2000 A^3 | 3,780 |
+| AlphaFold pockets: mean pocket pLDDT >= 70 | 3,590 |
+| TM policy C: drop multi-pass (>= 2 TM segments) | 2,676 |
+| TM policy C: drop pockets overlapping a TM segment > 10% | 2,672 |
+| **radius of gyration <= 8.5 A** | **537** |
+| Uni-Dock grid legal at 0.375 A (<=128/axis, <=531,441 total) | 537 |
 
-**Panel: 183 proteins, 492 eligible pockets, 68% AlphaFold.** One row per protein, the
-eligible pocket with the highest drugScore (ties: smallest pocket name). Experimental-only
-sensitivity subset: **58 proteins**.
+**Panel: 164 proteins, 537 eligible pockets, 57% AlphaFold** (93 AF, 71 experimental).
+One row per protein, the eligible pocket with the highest drugScore (ties: smallest
+pocket name).
 
-Notes that matter:
-- The **upper** volume bound, the segment cap and the subpocket-parent rule are the
+### Compactness is measured in space, not in sequence
+
+This replaces an earlier `segments <= 3` rule (a segment break being a gap of more than 5
+residues in the sorted lining-residue numbers) **and** a separate 30 A cap on the docking
+box's longest side. Both are gone.
+
+`segments` measures compactness in **sequence**, so it depends on the residue-numbering
+coordinate system — and experimental pockets are numbered by pdbfixer (1..N, with missing
+loops modelled in) while AlphaFold pockets carry UniProt positions. Measured on net1 that
+made the filter badly provenance-dependent:
+
+| filter, at matched stringency (645 pockets) | AF pass | experimental pass | gap |
+|---|---|---|---|
+| `segments <= 3` | 39.4% | 17.5% | **21.9 points** |
+| **Rg <= 8.60 A** | 25.1% | 23.7% | **1.5 points** |
+| box longest side <= 23.3 A | 21.8% | 25.1% | 3.3 points |
+| asphericity <= 0.217 | 16.0% | 27.6% | 11.7 points |
+| Rg / n_atoms^(1/3) <= 1.514 | 14.0% | 28.5% | 14.5 points |
+
+Note the direction: the sequence rule favoured **AlphaFold** by 22 points, and the gap
+survived controlling for pocket size (widest at 15-30 lining residues, where ordinary drug
+pockets sit). Radius of gyration is identical across both classes by construction.
+
+Adopting it (user, 2026-11-03) also:
+- **Subsumes the box cap.** Over the eligible set the box's longest side is median 21.2 A
+  and **maximum 28.8 A** — nothing exceeds 30 A, because a compact pocket bounds its own
+  box. One criterion replaces two.
+- **Removes the SIFTS dependency entirely** (see below).
+- Drops the AlphaFold share from 68% to **57%**, easing the interface-artifact exposure.
+- Leaves panel size essentially unchanged (164 against 183).
+
+The cutoff is **8.5 A**, chosen as a round value in the physically plausible range for a
+drug-binding site (Rg typically 5-8 A), not inherited from the stringency of the rule it
+replaces — the earlier 8.60 A was calibrated that way and that anchor was weak. Eligible
+pockets run median Rg 8.08. **Validate the cutoff on a second subtype before the
+production run.**
+
+### The docking box itself is unchanged
+
+`pocket_box` (`dock.py`) takes the unpadded bounding box of the `_res_P_*.pdb` lining
+residues. Deriving it from the DoGSiteScorer cavity (`_gps_`) was tested and is **worse**:
+the cavity spans 18.1 A median unpadded, but Vina needs the whole ligand inside, and
+cavity + 4 A already exceeds the current box. The lining-residue envelope is effectively
+"cavity + ~3 A". Leave it alone.
+
+### Other filter notes
+
+- The **upper** volume bound, the Rg criterion and the subpocket-parent rule are the
   load-bearing additions. None existed before, because drugScore rewards large pockets
   and has no ceiling.
-- TM policy C costs **2 pockets** over policy A. Earlier spikes used policy A; the
+- TM policy C costs **4 pockets** over policy A. Earlier spikes used policy A; the
   discrepancy was real but harmless.
-- Grid legality removes nothing once the 30 A box cap is applied.
+- Grid legality removes nothing once Rg is applied.
 - The TM pocket-overlap check runs on AlphaFold models only, where PDB residue number
   equals UniProt position. For experimental chains only the protein-level multi-pass rule
   applies, on the assumption that a crystallised construct of a single-pass protein is the
-  soluble domain. State that in Methods. The SIFTS work below would let it be dropped.
-
-### Why the box cap stays, and what it costs
-
-The box is the unpadded bounding box of the `_res_P_*.pdb` lining residues
-(`dock.py:pocket_box`). Measured over eligible pockets its median longest side is 24.6 A
-and median volume 9,550 A^3, which is normal Vina practice.
-
-Deriving the box from the DoGSiteScorer cavity (`_gps_`) instead was tested and is
-**worse**: the cavity spans 18.1 A median unpadded, but Vina needs the whole ligand
-inside, and cavity + 4 A already exceeds the current box. The lining-residue envelope is
-effectively "cavity + ~3 A". `pocket_box` stays unchanged.
-
-The 30 A cap exists for **pose validity**, not performance: a box with a 45 A side can
-swallow a neighbouring groove, so a good score need not involve the selected pocket. On
-GPU, throughput is flat across a 5x range of box volume, so there is no speed argument
-either way. The cap costs 151 pockets (643 → 492) and is accepted (user, 2026-11-03).
+  soluble domain. State that in Methods.
 
 ## Ligand library
 
@@ -143,11 +172,11 @@ PDBQTs, ligands and boxes.
 
 | scope | GPU-hours | units (L4 @ 1.94/hr measured) |
 |---|---|---|
-| 183-protein panel, 1,960 ligands, 1 replicate | 17.5 | 34 |
-| all 7 subtypes, 1 replicate | 122.8 | 238 |
-| **all 7 subtypes, 5 replicates** | 614 | **1,191** |
+| 164-protein panel, 1,960 ligands, 1 replicate | 15.7 | 30 |
+| all 7 subtypes, 1 replicate | 110.0 | 213 |
+| **all 7 subtypes, 5 replicates** | 550 | **1,067** |
 
-Against a 1,600-unit balance (~74%), units expiring after 90 days. Caveat: the 7.0x
+Against a 1,600-unit balance (~67%), units expiring after 90 days. Caveat: the 7.0x
 subtype multiplier is an overestimate — AD subtypes have 78/88/132/21 input accessions
 against net1's 461 — so this errs safe.
 
@@ -218,13 +247,13 @@ pocket volume. This is the test of the study's actual claim and needs no new doc
 One inherited filter must be examined first: `parse_scores` (`similarity.py:714`) drops
 pairs with `Pmax == 1.0` as a "legacy filter". Since same-accession pairs are excluded
 separately, this discards *cross-protein* pairs with perfect similarity — the strongest
-possible evidence for the claim. Count them among the 492 eligible pockets before
+possible evidence for the claim. Count them among the 537 eligible pockets before
 inheriting the rule.
 
 ### Positive control — a prerequisite, not optional
 
 The study would otherwise report cumulative sub-threshold binding on receptors that are
-68% AlphaFold models, with a new engine carrying an uncharacterised +0.33 kcal/mol offset,
+57% AlphaFold models, with a new engine carrying an uncharacterised +0.33 kcal/mol offset,
 and **nothing anchoring score to real binding**. The subtype gene lists do not contain the
 known targets of the approved HCC drugs, so that control is unavailable.
 
@@ -267,7 +296,7 @@ the earlier reading of their co-clustering as evidence of validity inverted the 
 The cap appears to act as an accidental interface-artifact filter.
 
 **There is no control for interface pockets.** The AlphaFold controls target only
-oversized pockets. At 68% AF this remains an open exposure for the panel, and must be
+oversized pockets. At 57% AF this remains an open exposure for the panel, and must be
 stated in Methods.
 
 Two factual errors in the earlier cluster reading, withdrawn: NDC80 has no RWD domain
@@ -381,27 +410,33 @@ Image digest or lockfile hash; Uni-Dock and `unidock-tools` versions; CUDA versi
 model**; `search_mode`; `--batch_size`; **replicate index and seed**; prepared-library
 hash; per-score mean and SE across replicates.
 
-### SIFTS: segment counts use two coordinate systems
+### SIFTS mapping — dropped
 
-`pockets.py` numbers experimental pocket residues as in the pdbfixer output (renumbered
-1..N with missing loops modelled in by `fix.py`), while AlphaFold pockets are in UniProt
-positions. Gap-filling systematically lowers segment counts for experimental chains — a
-cross-class bias on `segments <= 3`, which gates panel membership, in a 68% AF panel.
+An earlier version made this "the largest implementation risk": map experimental pocket
+residues to UniProt through SIFTS, to remove a cross-class bias in `segments <= 3`.
+Two measurements retired it.
 
-**Decision: map experimental pocket residues to UniProt through SIFTS.** Scope, corrected:
+**The predicted bias ran the wrong way.** The reasoning was that pdbfixer models in
+missing loops, so experimental numbering is contiguous, so experimental pockets get fewer
+segments and the filter favours them. Measured: experimental pockets have **more**
+segments (median 5, mean 5.63) than AlphaFold ones (median 4, mean 4.33), and pass
+`segments <= 3` at 17.5% against 39.4%. Restoring the real gaps by mapping to UniProt
+would have pushed experimental counts higher still and **widened** the gap.
 
-- **Already implemented:** `pockets.py` `_coord_key()`/`_author_atoms()` (L550-592) maps
-  pdbfixer output back to author numbering via heavy-atom coordinate keys. Do not rebuild.
-- **SIFTS is already cached** at `02_structures/sifts/pdb_chain_uniprot.tsv.gz`
-  (`structures.py:47-52`). No re-fetch, so no risk to `uniprot.csv`/`Protein_info.csv`.
-- **The real blocker:** `Protein_info.csv` stores author bounds only; `SP_BEG`/`SP_END`
-  are read (`structures.py:182-191`) and discarded. Read them from the cached file or add
-  them to `INFO_COLUMNS`.
-- **Caveats:** the flat file is segment-range-level, so the mapping is affine only without
-  insertion codes, microheterogeneity or non-monotonic numbering — residue-level fidelity
-  needs per-entry SIFTS XML. And `author_segments()` falls back to a seqres-derived range
-  for some chains (`segment_unverified`), where the offset is unrecoverable by any route.
-  **Measure that fraction for net1 first.**
+**And it was unverifiable where it mattered.** `author_segments()` falls back to a
+seqres-derived range when PDB bounds are unusable, and that applies to **71% of eligible
+experimental pockets and 65% of experimental panel rows** — so the pdbfixer → author →
+UniProt chain breaks for roughly 213 of the 327 pockets the fix would have acted on.
+
+Switching to Rg removes the need entirely: it is coordinate-system independent, so there
+is nothing to map.
+
+Recorded for whoever revisits this: the cached SIFTS flat file **is** present at
+`02_structures/sifts/pdb_chain_uniprot.tsv.gz` and **does** carry `SP_BEG`/`SP_END`
+(the offset `Protein_info.csv` discards after `structures.py:182-191`), and
+`pockets.py` `_coord_key()`/`_author_atoms()` already maps pdbfixer output back to author
+numbering. So if a UniProt mapping is ever needed for another purpose, it is far more
+tractable than the earlier text claimed — the blocker is only the discarded `SP_BEG`.
 
 ## Open, and blocking the statistic
 
@@ -420,12 +455,13 @@ cross-class bias on `segments <= 3`, which gates panel membership, in a 68% AF p
 
 Each stage ends with verification before the next begins.
 
-1. **Annotation pass** — `pocket_annotation.csv` from existing outputs, including the
-   SIFTS mapping and the `segment_unverified` measurement. Gates everything.
+1. **Annotation pass** — `pocket_annotation.csv` from existing outputs: lining residues,
+   radius of gyration, box dimensions, parent-pocket volume, AF pocket pLDDT. No SIFTS.
+   Gates everything.
 2. **Panel in `select`** — filters, one row per protein, funnel counts, `failed.tsv`
-   reasons. Verify: reproduces 183 proteins / 492 pockets on net1.
+   reasons. Verify: reproduces 164 proteins / 537 pockets on net1.
 3. **Similarity-side filtering** — pocket filters before PocketMatch; re-check the ETA
-   model (645 eligible pockets give ~205k pairs against 67.2M).
+   model (537 eligible pockets give ~144k pairs against 67.2M).
 4. **Ligand preparation** — MMFF94 in place, deterministic, hashed.
 5. **Dock stage rework** — Uni-Dock, replicates, remote GPU execution model.
 6. **Statistics** — positive set, size/geometry adjustment, multiple testing, the post hoc
