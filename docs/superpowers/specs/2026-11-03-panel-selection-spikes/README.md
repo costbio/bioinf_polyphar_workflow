@@ -22,6 +22,8 @@ Run order (each needs the previous one's cached JSON in `~/scratch_clust`):
 | `families.py` | the 7 clusters at Pmax>=0.7 and panel coverage; corrected 209-protein panel |
 | `mw_check.py` | eDrug3D heavy-atom distribution; HCC drugs at the 64th-88th percentile |
 | `build_calib.py` | builds the 48-pocket / 250-ligand calibration run folder |
+| `unidock_preflight.py` | Uni-Dock grid-cap pre-flight (<=128/axis, <=531,441 total at 0.375 A) |
+| `reconcile.py` | **authoritative**: the full funnel on the DOCKABLE set — 183 proteins / 492 pockets, and the cluster collapse that ended the cluster layer |
 | `ligsize.py` | eDrug3D size/flexibility profile; the `rot>15 OR MW>900` dockability filter |
 | `boxeff.py` | docking-box volume per pocket (NOTE: its default PAD=4 is wrong -- dock.py pads nothing) |
 | `gpsbox.py` | cavity (`_gps_`) vs residue-envelope (`_res_`) box; shows cavity boxes are WORSE |
