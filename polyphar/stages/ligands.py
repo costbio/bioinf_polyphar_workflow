@@ -566,7 +566,7 @@ def _prepare_one(index: int, lines: list) -> dict:
 
 def _worker(index: int, lines: list) -> dict:
     """`_prepare_one` inside pool.task(), like every other stage's pool worker (dock's
-    _chunk_worker, fix.py, similarity.py): failures cross the process boundary as
+    _unit_worker, fix.py, similarity.py): failures cross the process boundary as
     TaskError and SIGTERM ends the worker instead of returning it to the idle loop."""
     return pool.task(lambda: _prepare_one(index, lines))
 

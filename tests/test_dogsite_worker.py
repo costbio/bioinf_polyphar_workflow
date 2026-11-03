@@ -361,8 +361,15 @@ def _wait_until(pred, timeout=30, proc=None):
         time.sleep(0.05)
 
 
-def _no_fake_running():
-    out = subprocess.run(["pgrep", "-f", str(FAKE)], capture_output=True, text=True)
+def _no_fake_running(run_dir):
+    """No fake-DoGSiteScorer child of THIS test is still alive.
+
+    Scoped to the test's own run directory, which is in every child's argv (-o <out>):
+    a bare `pgrep -f <FAKE>` matches any concurrent pytest running the same fixture out
+    of the same checkout, and fails this assertion for reasons that have nothing to do
+    with the worker under test."""
+    out = subprocess.run(["pgrep", "-f", f"{FAKE}.*{run_dir}"],
+                         capture_output=True, text=True)
     return out.stdout.strip() == ""
 
 
@@ -384,7 +391,7 @@ def test_sighup_mid_job_kills_children_and_unclaims(tmp_path):
     assert p.returncode == 128 + signal.SIGHUP
     assert _queue(layout) == ["P25815_2mjw_B.job", "P25815_2mjw_C.job"]   # no heartbeat
     assert list(outdir.iterdir()) == []
-    assert _no_fake_running()
+    assert _no_fake_running(tmp_path)
     time.sleep(2.5)     # an orphaned fake would have written its outputs by now
     assert list(outdir.iterdir()) == []
 
@@ -441,7 +448,7 @@ def test_preflight_timeout(tmp_path):
     assert r.returncode == 3
     assert "timed out after 1 s" in r.stderr and HINT in r.stderr
     assert _queue(layout) == ["P25815_2mjw_B.job"]
-    assert _no_fake_running()
+    assert _no_fake_running(tmp_path)
 
 
 def _load_worker_module():
@@ -537,8 +544,7 @@ def test_watch_stops_at_closed_and_sigterm_unclaims(tmp_path):
     # interrupted jobs go back to the queue; no output that would look done
     assert _queue(layout) == ["P25815_2mjw_B.job", "P25815_2mjw_C.job"], (t_sig, out, err)
     assert not list(layout.pockets.glob("P25815/*_desc.txt"))
-    out = subprocess.run(["pgrep", "-f", str(FAKE)], capture_output=True, text=True)
-    assert out.stdout.strip() == "", "fake dogsite children left running"
+    assert _no_fake_running(tmp_path), "fake dogsite children left running"
 
     # --watch: runs the queue, then exits only once CLOSED appears
     p = subprocess.Popen(_worker_cmd(tmp_path, FAKE, "--watch"), env=_env(),
@@ -618,6 +624,9 @@ for f in "$q"/WORKER.*; do
     echo
 done > "$RUN/docker_saw_cmd"
 if [ -n "${FAKE_DOCKER_SLEEP:-}" ]; then
+    # exec keeps this PID, so docker_pid identifies THIS test's container. A
+    # `pgrep -f "sleep 30"` would also match a concurrent pytest's fake container.
+    echo $$ > "$RUN/docker_pid"
     exec sleep "$FAKE_DOCKER_SLEEP"
 fi
 exit "${FAKE_DOCKER_EXIT:-0}"
@@ -640,6 +649,14 @@ def _fake_docker_env(tmp_path, calibrated=True, **kw):
     env = _env(PATH=f"{bindir}:{os.environ['PATH']}", RUN=run_dir, POLYPHAR_RUN_DIR=run_dir,
                POLYPHAR_HOME=home, DOGSITE_BIN=FAKE2, **kw)   # the default tool: dogsite2
     return run_dir, env
+
+
+def _container_stopped(run_dir):
+    """This test's own fake container (the sleeping `docker run`) is gone. Identified by
+    the PID it recorded, not by `pgrep -f "sleep 30"`, which matches any concurrent
+    pytest's fake container just as well."""
+    pid = (Path(run_dir) / "docker_pid").read_text().strip()
+    return subprocess.run(["kill", "-0", pid], capture_output=True).returncode != 0
 
 
 def _no_worker_left(run_dir):
@@ -727,8 +744,7 @@ def test_wrapper_sighup_stops_container_and_worker(tmp_path):
     assert p.returncode == 128 + signal.SIGHUP
     assert time.monotonic() - t0 < 15          # the fake container did not run its 30 s
     assert _no_worker_left(run_dir)
-    sleeping = subprocess.run(["pgrep", "-f", "sleep 30"], capture_output=True, text=True)
-    assert sleeping.stdout.strip() == ""
+    assert _container_stopped(run_dir)
 
 
 def test_wrapper_preflight_timeout_stops_before_container(tmp_path):
@@ -741,7 +757,7 @@ def test_wrapper_preflight_timeout_stops_before_container(tmp_path):
     assert r.returncode == 3
     assert "timed out after 1 s" in r.stderr and "did not start" in r.stderr
     assert not (run_dir / "docker_saw_workers").exists()     # the container never ran
-    assert _no_worker_left(run_dir) and _no_fake_running()
+    assert _no_worker_left(run_dir) and _no_fake_running(run_dir)
     env["POLYPHAR_PREFLIGHT_TIMEOUT"] = "soon"
     r = subprocess.run([str(WRAPPER), "pockets"], env=env, capture_output=True, text=True)
     assert r.returncode == 2 and "POLYPHAR_PREFLIGHT_TIMEOUT" in r.stderr
@@ -862,7 +878,7 @@ def test_job_timeout_kills_the_process_group_and_fails_the_job(tmp_path):
     failed = json.loads((layout.pockets / "queue" / "P25815_2mjw_B.failed").read_text())
     assert failed["reason"] == "timeout after 1 s"
     assert list((layout.pockets / "P25815").iterdir()) == []    # partial .pml removed
-    assert _no_fake_running()
+    assert _no_fake_running(tmp_path)
     assert pockets._failure_reason(failed).startswith("timeout after 1 s")
 
 
@@ -964,8 +980,7 @@ def test_wrapper_stops_the_container_when_the_worker_dies(tmp_path):
     assert p.returncode != 0
     assert time.monotonic() - t0 < 15
     assert "DoGSiteScorer worker exited" in err and "stopping the container" in err
-    sleeping = subprocess.run(["pgrep", "-f", "sleep 30"], capture_output=True, text=True)
-    assert sleeping.stdout.strip() == ""
+    assert _container_stopped(run_dir)
 
 
 def test_wrapper_lets_the_worker_exit_once_the_queue_is_closed(tmp_path):

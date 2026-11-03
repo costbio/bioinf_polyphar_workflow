@@ -31,6 +31,13 @@ PARALLEL_EFFICIENCY = {
     "pockets": lambda nprocs, tpj=1: nprocs,
     "similarity": lambda nprocs, tpj=1: max(1, nprocs / 2),  # block-pair overhead
     "dock": lambda nprocs, tpj=1: max(1, nprocs // max(1, tpj)),
+    # the split stage: dock-worker docks like dock; export and merge are file work.
+    # Neither export nor worker has a calibration of its own yet (the Uni-Dock rate is the
+    # next step of the rework), so their ETA prints as uncalibrated rather than borrowing
+    # a figure measured with another engine.
+    "dock-worker": lambda nprocs, tpj=1: max(1, nprocs // max(1, tpj)),
+    "dock-export": lambda nprocs, tpj=1: 1,
+    "dock-merge": None,
 }
 
 

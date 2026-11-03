@@ -227,10 +227,10 @@ def test_run_accepts_the_stage_options():
     args = cli.build_parser().parse_args(
         ["run", "--txt", "inputs/ids.txt", "--ph", "7.0", "--worker-timeout", "60",
          "--pm-bin-dir", "/opt/pm", "--per-protein", "3", "--exclude",
-         "--library", "inputs/x.sdf", "--seed", "7", "--chunk-size", "5",
-         "--threads-per-job", "2", "--chunk-timeout", "100"])
+         "--library", "inputs/x.sdf", "--seed", "7", "--replicates", "5",
+         "--threads-per-job", "2", "--unit-timeout", "100"])
     assert args.txt == "inputs/ids.txt" and args.per_protein == 3 and args.exclude == []
-    assert args.library == "inputs/x.sdf" and args.chunk_size == 5 and args.seed == 7
+    assert args.library == "inputs/x.sdf" and args.replicates == 5 and args.seed == 7
     assert args.from_stage == "ids" and args.to_stage == "dock"
     # ids' source options stay mutually exclusive
     with pytest.raises(SystemExit):

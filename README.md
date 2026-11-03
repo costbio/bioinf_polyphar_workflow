@@ -164,8 +164,8 @@ pocket worker, and stops it when the container exits.
 It accepts every stage's own options (`--xlsx/--txt/--sheet/--id-column/--reviewed-column/--gene-column`,
 `--ph`, `--worker-timeout`, `--worker-dead-after`, `--pm-bin-dir`, `--volume-min`,
 `--volume-max`, `--plddt-min`, `--tm-policy`, `--per-protein`, `--exclude`,
-`--library`, `--seed`, `--chunk-size`, `--threads-per-job`,
-`--chunk-timeout`), plus `--max-failed-fraction` and `--keep-going`.
+`--library`, `--seed`, `--replicates`, `--threads-per-job`,
+`--unit-timeout`), plus `--max-failed-fraction` and `--keep-going`.
 
 - Each stage goes through the same gate as its own subcommand. The gate computes the exact
   units, then prints and notifies the ETA before the first unit, then reports progress
@@ -233,7 +233,8 @@ modified or deleted.
     <run>/05_similarity/Pocketsim.csv  PocketMatch_score.txt  cabbage/
     <run>/06_targets/final_targets.csv  centrality.csv  unique_pairs.csv
     <run>/07_docking/library/library_prepared.sdf  ligands.csv
-    <run>/07_docking/<label>/poses.sdf  df_results_<label>_fixed.csv  obsolete/
+    <run>/07_docking/<label>/replicates/r<i>.sdf  r<i>.done  poses.sdf
+    <run>/07_docking/df_results_<label>_fixed.csv  discarded.tsv  discarded/  export/  obsolete/
     <run>/logs/<stage>.log  run.log  notifications.log
 
 Every stage directory gets `manifest.json` (written last; its presence marks the stage as
@@ -261,8 +262,12 @@ All stages take `--run-dir` (default `/work` in the container, else the current 
                     [--tm-policy C] [--per-protein 2] [--exclude O15350]
     polyphar similarity [--pm-bin-dir /opt/pocketmatch]   # AFTER select, on the panel
     polyphar ligands --library inputs/e-Drug3D_2083.sdf   # filter + MMFF94 conformers
-    polyphar dock --library inputs/e-Drug3D_2083.sdf [--seed 42] [--chunk-size 50] \
-                  [--threads-per-job 1] [--chunk-timeout 43200]
+    polyphar dock --library inputs/e-Drug3D_2083.sdf [--seed 42] [--replicates 3] \
+                  [--threads-per-job 1] [--unit-timeout 43200]
+                                                      # single host: plan, run, merge
+    polyphar dock-export [--bundle DIR] [--max-units N]   # engine on another machine:
+    polyphar dock-worker --bundle DIR                     #   export here, run there,
+    polyphar dock-merge  --bundle DIR                     #   merge back here
     polyphar run [--from STAGE] [--to STAGE] [stage options...]
     polyphar estimate                                 # ETA table, next stage exact
     polyphar benchmark [--stages uniprot fix dock]    # per-machine calibration
@@ -407,15 +412,71 @@ exits 3, like `run`, and sends its `done` notification at priority 1.
   and its output is descriptive: pocket similarity is applied post hoc to docking results, not
   used to choose targets. See `docs/superpowers/specs/2026-11-03-panel-selection-redesign-design.md`.
 
-## Docking parallelism
+## Docking units, replicates and resume
 
-smina runs with exhaustiveness 12. With `--threads-per-job 1` (the default), `NPROCS` smina
-processes run at once and each does its 12 searches serially. That is the same total work as
-`--cpu 12`, and the results are byte-identical (`test_cpu_and_chunk_invariance`). For a tail
-of peptide-sized ligands that dominate the run time, use `--threads-per-job 12` so the last
-chunks use all cores. `NPROCS` also sets how many DoGSite3 / DoGSiteScorer jobs the host worker
-runs at once. Results do not depend on `--chunk-size`, but changing it re-docks everything (the chunk
-is part of the job key).
+**One work unit is one (target, replicate): one engine invocation over the whole prepared
+library.** `--replicates` (default 3) is how many independent draws each target gets;
+replicate `i` runs with seed `--seed + i` and records it. The recorded seed is
+**provenance, not a reproducibility claim** -- the GPU engine this stage is being moved to
+scores 95-98% of ligands differently across identical same-seed repeats.
+
+Because of that, a unit's identity includes its replicate index --
+`(receptor sha, pocket sha, library sha, replicate, seed, search parameters, engine
+version)` -- and **resume skips, it never redoes**. A `.done` marker certifies that the
+draw was made and recorded, not what it scored; the result file
+(`07_docking/<label>/replicates/r<i>.sdf`) is the only record of the scores, and its
+marker `r<i>.done` sits beside it in the same directory, so a copy or a tar of
+`replicates/` cannot separate a draw from its certificate. Raising `--replicates` adds
+units and leaves the recorded ones alone; lowering it keeps the surplus records and
+counts them as `units_present_outside_plan`.
+
+The one legitimate repeat is a unit whose record is missing or truncated: it is discarded
+and re-drawn under the **same** replicate index, and appended to
+`07_docking/discarded.tsv` (append-only, across runs), because the discarded draw was a
+real sample and dropping it is a small selection effect. Replacing a record whose key has
+changed, or one left uncertified by an interrupted run, is logged the same way.
+
+Two rules keep a discard from costing more than it says. **It is deferred**: what would be
+thrown away is decided when the run is planned, but nothing is thrown away until the
+replacement is actually about to be written, so a pass that is filtered, aborted, or does
+not execute at all (`dock-merge`) costs no draws. And **the record is archived, not
+deleted**: it moves to `07_docking/discarded/<timestamp>/<label>/r<i>.sdf` (with its log),
+named in discarded.tsv's `archived` column, the same "moved, never deleted" policy orphan
+labels follow.
+
+A target counts as complete only when **every** replicate holds poses for every library
+ligand. A record truncated on a clean `$$$$` boundary looks intact, so each replicate's
+ligand coverage is checked, not only replicate 0's.
+
+The receptor PDBQT the engine reads is deliberately **not** in the unit key (an Open Babel
+upgrade must not invalidate every recorded draw). Instead, Open Babel's version is in
+`07_docking/<label>/receptor.key`, so an upgrade re-prepares the receptor, and a PDBQT
+whose sha256 differs from the previous manifest's is reported as a warning.
+
+With `--threads-per-job 1` (the default), `NPROCS` units run at once and each does its 12
+searches serially; `--threads-per-job 12` gives one unit all cores. `NPROCS` also sets how
+many DoGSite3 / DoGSiteScorer jobs the host worker runs at once.
+
+### Engine on another machine
+
+`dock` needs the engine and the run folder on one host. When they are apart, the same work
+splits in three around a bundle directory: `dock-export` plans here and writes the
+outstanding units (replicate-major, capped by `--max-units` to one session's worth),
+`dock-worker --bundle DIR` runs them there with no run folder, and `dock-merge --bundle
+DIR` folds the results back in without needing an engine. A result is merged only when the
+current plan has a unit with the same label, replicate **and key**, and a draw already on
+record is never replaced.
+
+`dock-merge` records the engine that actually drew the results (from the bundle's
+`worker.json`) in the manifest as `engine_worker`, beside the `engine` the keys were
+planned under, and warns up front when the bundle's options are not this merge's.
+
+**`--max-units` does not coordinate between sessions.** Export only excludes units already
+on record here, so two bundles exported before either is merged contain the same units. If
+both are worked, the first merge wins and the second bundle's draw for that unit is
+dropped -- logged in `discarded.tsv` with the bundle it came from, since dropping a real
+sample is a selection effect. Merge a bundle before exporting the next one to avoid
+spending engine time on draws that will be dropped.
 
 ## Pushover notifications
 
@@ -572,8 +633,11 @@ here.
     but they are counted under `counts.unmapped`, not `failed`.
   - `pockets`: pockets dropped as outside the target's SIFTS segment are listed in
     `failed.tsv` and counted under `counts.outside_segment`, not `failed`.
-  - `dock`: `failed` counts failed **chunks**. `incomplete_targets` counts targets with no
-    results (missing ligands, receptor preparation failure, or a missing receptor). An
+  - `dock`: `failed` counts failed **units** ((target, replicate) pairs), `discarded` the
+    draws thrown away and re-drawn in that run (see `discarded.tsv`).
+    `incomplete_targets` counts targets with no
+    results (a replicate not recorded, missing ligands, receptor preparation failure, or a
+    missing receptor). An
     incomplete target gets no `df_results_<label>_fixed.csv`, and `failed.tsv` lists its
     missing ligand IDs. Treat `incomplete_targets > 0` as a failure.
 - When `select` drops a target on a rerun, its docking outputs are moved to

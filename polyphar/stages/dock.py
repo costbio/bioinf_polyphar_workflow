@@ -19,32 +19,76 @@ each receptor PDBQT's sha256 is recorded in the manifest.
 Kept legacy parameters (smina_screen_P_2_2023_08_15.py): box = the pocket's atom extent,
 unpadded (centre (max+min)/2, size max-min); `--exhaustiveness 12 --num_modes 12`; the
 ligand records as supplied, with smina's ligand hydrogen addition pinned explicitly to its
-default `--addH 1` (recorded in the manifest and the job key). New: a fixed recorded `--seed` (default 42), and ligand
+default `--addH 1` (recorded in the manifest and the unit key). New: a recorded per-replicate
+`--seed` (base `--seed`, default 42, plus the replicate index), and ligand
 identity from the library `ID` field: every record's title line is set to EDRUG3D_<ID>
 (the library's titles are blank or placeholders, and 35 different drugs are named
 "Molecule-1"), and poses are mapped back to the library by it.
 
-Work units are (target x chunk of --chunk-size ligands, in library order), docked with
---cpu --threads-per-job (default 1) on nprocs // threads_per_job spawn processes. A
-ligand's result depends neither on --cpu nor on its chunk or position in it (pinned by
-test_cpu_and_chunk_invariance), so the output is the same for any chunking and nprocs.
-A chunk is done when 07_docking/<label>/chunks/<chunk>.done holds its job key (receptor
-and pocket sha256, chunk sha256, seed, exhaustiveness, num_modes, ligand addH, smina
-version, receptor preparation); outputs are atomic, so a killed run redoes only unfinished
-chunks. A smina call running longer than --chunk-timeout (default 12 h) is killed and the
-chunk failed; its log (07_docking/<label>/chunks/<chunk>.log, also kept on failure) is
-named in failed.tsv. counts["failed"] is the number of failed chunks; incomplete targets
-are counted in counts["incomplete_targets"].
+Work unit = (target, replicate): ONE docking engine invocation over the WHOLE prepared
+library, repeated --replicates times (default 3). Replicate i uses seed base_seed + i
+(--seed is the base, default 42), recorded per unit.
+
+**The replicate index is part of a unit's identity, and resume must skip, never redo.**
+The engine this stage is being moved to (Uni-Dock) is not deterministic: identical
+same-seed repeats move 95-98% of ligand scores. So a unit's key --
+
+    (receptor sha256, pocket sha256, library sha256, replicate i, seed_i,
+     search parameters, engine version)
+
+-- does NOT assert "re-running would give these numbers". It asserts "this (target,
+replicate) was run under this identity and its result file is the record of it". The
+recorded seed is provenance, not a reproducibility claim (the engine's seeding is broken
+upstream). Replicate 2 is a distinct observation, not a repeat of replicate 1: re-running
+a finished unit would not reproduce it, it would draw a different sample. Hence:
+
+* `unit_state` == "done" (marker holds the key, the result file is intact) -> SKIPPED. The
+  stage never re-runs it, for any reason short of the key changing.
+* "corrupt" (marker holds the key but the result file is gone, empty or not terminated) ->
+  the draw is unrecoverable, so it is DISCARDED and re-drawn under the SAME replicate
+  index. This is the only legitimate repeat. It is appended to 07_docking/discarded.tsv
+  (append-only, across runs) because the discarded draw was a real sample and dropping it
+  is a small selection effect. A unit whose engine output is systematically unusable is
+  therefore re-drawn, and logged, on every invocation -- discarded.tsv is where that shows.
+* "missing" (no marker, or a marker for another key) -> run it. When a result file from a
+  superseded key is about to be overwritten that, too, is logged as a discard.
+
+**Discarding is DEFERRED to the moment a replacement is actually about to be written** --
+inside the worker, immediately before the engine call that replaces the record, and inside
+`import_bundle` immediately before the bundle's copy lands. Planning what would be thrown
+away (`plan_discards`) throws nothing away, so a pass that is filtered (`--max-units`, a
+target whose receptor preparation failed), aborted, or not executing at all
+(`dock-merge`, which plans with execute=False) costs no draws.
+
+**And a discarded record is MOVED, never deleted**, to
+07_docking/discarded/<timestamp>/<label>/r<i>.sdf, the policy orphan labels already follow;
+discarded.tsv names the archived file in its `archived` column.
+
+Markers live in 07_docking/<label>/replicates/r<i>.done, beside the record they certify --
+inside the directory a copy, a tar or an `rm -rf` would treat as the unit, so the two
+cannot be separated. Results are 07_docking/<label>/replicates/r<i>.sdf with r<i>.log
+beside them. An engine
+call running longer than --unit-timeout (default 12 h) is killed and the unit failed; its
+log is named in failed.tsv. counts["failed"] is the number of failed units,
+counts["discarded"] the number of discarded draws; incomplete targets are counted in
+counts["incomplete_targets"].
 
 Outputs per target, label = f"{Protein}_{Pocket}": 07_docking/<label>/poses.sdf and
-07_docking/df_results_<label>_fixed.csv (Pose, SMINA_Score, Ligand, ID, Pocket; Ligand is
-the library `name`, ID the library ID, SMINA_Score smina's minimizedAffinity). A target
-with any ligand ID missing from its poses (a failed chunk, or a ligand smina skipped) is
-incomplete: failed.tsv lists the missing IDs and NO df_results/poses.sdf is written for it.
+07_docking/df_results_<label>_fixed.csv, both from REPLICATE 0 (Pose, SMINA_Score, Ligand,
+ID, Pocket). The summary over all replicates (n, mean, sd, se) is the next step of the
+rework and replaces these; the per-replicate SDFs are the raw record it will be built
+from. A target with a replicate not done, or with any ligand ID missing from replicate 0's
+poses, is incomplete: failed.tsv says why and NO df_results/poses.sdf is written for it.
 Outputs of labels no longer in final_targets.csv (df_results_<label>_fixed.csv, <label>/)
 are moved, never deleted, to 07_docking/obsolete/<timestamp>/ and listed in the manifest
 (`obsoleted`); the manifest's `outputs` lists the current targets' files only.
 manifest.json is written last; a rerun on the same inputs changes nothing.
+
+`dock` is the single-host path: it plans, runs the outstanding units in place and merges.
+When the engine is on a different machine from the run folder, the same work is split
+into `dock-export` (bundle the outstanding units), `dock-worker` (run them, no run folder
+needed) and `dock-merge` (fold the results back in). See `bundle_*` below and the
+polyphar.stages.dock_export / dock_worker / dock_merge modules.
 """
 
 from __future__ import annotations
@@ -60,13 +104,13 @@ from polyphar.stages import ligands
 from polyphar.stages.fix import H_SEED, reference_platform, seeded_placement, strip_date_remark
 
 STAGE = "dock"
-DEFAULT_SEED = 42
-DEFAULT_CHUNK = 50
+DEFAULT_SEED = 42         # BASE seed: replicate i runs with base_seed + i
+DEFAULT_REPLICATES = 3
 DEFAULT_TPJ = 1
 EXHAUSTIVENESS = 12
 NUM_MODES = 12
 LIGAND_ADDH = True   # smina --addH: add ligand hydrogens (smina's default, pinned explicitly)
-DEFAULT_CHUNK_TIMEOUT = 43200   # seconds per smina call (12 h)
+DEFAULT_UNIT_TIMEOUT = 43200   # seconds per engine call (12 h)
 AF_H_SEED = H_SEED   # seeds OpenMM's random hydrogen placement (deterministic output)
 AF_PH = 7.0   # AlphaFold receptors: pdbfixer addMissingHydrogens, as the fix stage
 TITLE_PREFIX = "EDRUG3D_"
@@ -341,19 +385,22 @@ def _positive_int(value: str) -> int:
 
 
 def add_arguments(parser) -> None:
+    """Options shared by `dock`, `dock-export`, `dock-worker` and `dock-merge`: they all
+    have to agree on what a unit is, or the keys they compute would not match."""
     parser.add_argument("--library", default=DEFAULT_LIBRARY,
                         help=f"ligand SDF, relative to the run folder (default {DEFAULT_LIBRARY})")
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED,
-                        help=f"smina --seed, recorded (default {DEFAULT_SEED})")
-    parser.add_argument("--chunk-size", type=_positive_int, default=DEFAULT_CHUNK,
-                        help=f"ligands per job (default {DEFAULT_CHUNK}); results do not "
-                             f"depend on it, but changing it re-docks everything")
+                        help=f"BASE seed; replicate i runs with base + i and records it "
+                             f"(provenance, not reproducibility) (default {DEFAULT_SEED})")
+    parser.add_argument("--replicates", type=_positive_int, default=DEFAULT_REPLICATES,
+                        help=f"independent draws per target (default {DEFAULT_REPLICATES}); "
+                             f"raising it adds units, it never re-runs existing ones")
     parser.add_argument("--threads-per-job", type=_positive_int, default=DEFAULT_TPJ,
-                        help=f"smina --cpu per job; nprocs // this jobs run at once "
+                        help=f"engine threads per unit; nprocs // this units run at once "
                              f"(default {DEFAULT_TPJ})")
-    parser.add_argument("--chunk-timeout", type=_positive_int, default=DEFAULT_CHUNK_TIMEOUT,
-                        help=f"seconds before one chunk's smina call is killed and the chunk "
-                             f"failed (default {DEFAULT_CHUNK_TIMEOUT})")
+    parser.add_argument("--unit-timeout", type=_positive_int, default=DEFAULT_UNIT_TIMEOUT,
+                        help=f"seconds before one unit's engine call is killed and the unit "
+                             f"failed (default {DEFAULT_UNIT_TIMEOUT})")
 
 
 @dataclass
@@ -493,30 +540,186 @@ def _sha_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8", "surrogateescape")).hexdigest()
 
 
-@dataclass
-class Chunk:
-    name: str
-    ids: list[str]
-    text: str             # titled records
-    sha256: str
+# --- units: (target, replicate) --------------------------------------------------------
+
+STATE_DONE = "done"           # ran under this key, the record of it is intact: SKIP
+STATE_MISSING = "missing"     # never ran under this key: run it
+STATE_CORRUPT = "corrupt"     # ran under this key, the record is unusable: discard + re-draw
+
+LIB_DIRNAME = "ligands"       # 07_docking/ligands/ (this stage's engine input, see RESERVED_DIRS)
+TITLED_LIBRARY = "library_titled.sdf"
+DISCARD_LOG = "discarded.tsv"
+DISCARD_DIRNAME = "discarded"   # 07_docking/discarded/<ts>/<label>/r<i>.sdf (archive)
+EXPORT_DIRNAME = "export"       # 07_docking/export/<ts>/ (dock_export's default bundle dir)
 
 
-def make_chunks(records: list[Record], size: int) -> list[Chunk]:
-    out = []
-    for k in range(0, len(records), size):
-        part = records[k:k + size]
-        text = "".join(_titled(r) for r in part)
-        out.append(Chunk(f"c{size}_{k // size:05d}", [r.fields["ID"] for r in part], text,
-                         _sha_text(text)))
-    return out
+@dataclass(frozen=True)
+class Unit:
+    """One (target, replicate): one engine invocation over the whole library.
+
+    `seed` is base_seed + replicate, recorded for provenance. It is NOT a claim that the
+    unit can be reproduced from it: the GPU engine this stage targets scores the same
+    ligand differently across identical same-seed repeats."""
+
+    label: str
+    replicate: int
+    seed: int
+    key: str
+
+    @property
+    def name(self) -> str:
+        return f"r{self.replicate}"
 
 
-def _target_dir(layout, t: Target) -> Path:
-    return layout.docking / t.label
+def seed_for(base_seed: int, replicate: int) -> int:
+    return int(base_seed) + int(replicate)
+
+
+def _target_dir(layout, t) -> Path:
+    label = t if isinstance(t, str) else t.label
+    return layout.docking / label
+
+
+def unit_paths(layout, u: Unit) -> tuple[Path, Path, Path]:
+    """(result SDF, log, done marker), all three in <label>/replicates/.
+
+    The marker lives beside the record it certifies, not in a sibling directory: the spec's
+    return step is "pack only new results", and packing <label>/replicates/ alone must not
+    turn a drawn unit into an undrawn one. A copy, a tar or an `rm -rf` that treats the
+    directory as the unit now moves the record and its certificate together."""
+    d = _target_dir(layout, u.label) / "replicates"
+    return d / f"{u.name}.sdf", d / f"{u.name}.log", d / f"{u.name}.done"
+
+
+def result_intact(sdf) -> bool:
+    """Whether a unit's result file is a usable record of its draw: present, non-empty and
+    terminated by the SDF end marker. Engine output is written atomically, so what this
+    catches is a file deleted, truncated or half-copied out of a bundle."""
+    sdf = Path(sdf)
+    try:
+        if not sdf.is_file() or sdf.stat().st_size == 0:
+            return False
+        with open(sdf, "rb") as fh:
+            fh.seek(max(0, sdf.stat().st_size - 4096))
+            tail = fh.read().decode("utf-8", "replace")
+    except OSError:
+        return False
+    lines = [l for l in tail.splitlines() if l.strip()]
+    return bool(lines) and lines[-1].strip() == END
+
+
+def unit_state(layout, u: Unit) -> str:
+    """STATE_DONE / STATE_MISSING / STATE_CORRUPT. Reads only; it never discards anything
+    (so `units()` can call it for the ETA without side effects)."""
+    sdf, _, done = unit_paths(layout, u)
+    try:
+        marked = done.read_text().strip() == u.key
+    except OSError:
+        marked = False
+    if not marked:
+        return STATE_MISSING
+    return STATE_DONE if result_intact(sdf) else STATE_CORRUPT
+
+
+def log_discard(stage_dir, u: Unit, reason: str, archived: str = "") -> None:
+    """Append one discarded draw to <stage_dir>/discarded.tsv. Append-only and never
+    truncated, across runs: a discarded sample was a real draw and dropping it is a (small)
+    selection effect, so the record of it has to outlive the run that did it."""
+    import time
+
+    stage_dir = Path(stage_dir)
+    stage_dir.mkdir(parents=True, exist_ok=True)
+    path = stage_dir / DISCARD_LOG
+    clean = lambda x: str(x).replace("\t", " ").replace("\r", " ").replace("\n", " ")
+    _ensure_discard_log(stage_dir)
+    # One O_APPEND write of one short line: the discards of a run now happen in the worker
+    # processes (deferred to the moment each replacement is written), so several of them
+    # append here at once. The header is created exclusively by _ensure_discard_log, or two
+    # workers would each write one and the second header would count as a discarded draw.
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S%z')}\t{clean(u.label)}\t{u.replicate}\t"
+                 f"{u.seed}\t{u.key}\t{clean(reason)}\t{clean(archived)}\n")
+
+
+def _ensure_discard_log(stage_dir) -> Path:
+    """Create <stage_dir>/discarded.tsv with its header, exactly once, whoever gets there
+    first (O_EXCL). Never truncates an existing log."""
+    path = Path(stage_dir) / DISCARD_LOG
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+    except FileExistsError:
+        return path
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(DISCARD_COLUMNS + "\n")
+    return path
+
+
+DISCARD_COLUMNS = "timestamp\tlabel\treplicate\tseed\tunit_key\treason\tarchived"
+
+
+def _archive_record(layout, u: Unit) -> str:
+    """Move a unit's result file out of the way instead of deleting it, to
+    07_docking/discarded/<timestamp>/<label>/r<i>.sdf (its log goes with it). Returns the
+    archived SDF's path relative to 07_docking, or "" when there was no file.
+
+    A docking result is a draw from a non-deterministic engine: destroying one is
+    irreversible. Orphan labels are already "moved, never deleted"; a per-unit draw is a
+    smaller thing to lose, not a less valuable one."""
+    import time
+
+    sdf, log, _ = unit_paths(layout, u)
+    if not sdf.exists():
+        return ""
+    root = Path(layout.docking) / DISCARD_DIRNAME
+    stamp, k = time.strftime("%Y%m%dT%H%M%S"), 1
+    dest = root / stamp / u.label
+    while (dest / f"{u.name}.sdf").exists():
+        k += 1
+        dest = root / f"{stamp}_{k}" / u.label
+    dest.mkdir(parents=True, exist_ok=True)
+    os.replace(sdf, dest / f"{u.name}.sdf")
+    if log.is_file():
+        os.replace(log, dest / f"{u.name}.log")
+    return (dest / f"{u.name}.sdf").relative_to(Path(layout.docking)).as_posix()
+
+
+def discard(layout, u: Unit, reason: str, archived: str | None = None) -> None:
+    """Take a unit's record off the books so it can be re-drawn under the SAME replicate
+    index, and log it. The only legitimate repeat of a completed replicate.
+
+    The record itself is ARCHIVED (moved under 07_docking/discarded/), never deleted; only
+    the marker goes, because a marker with no record is a false certificate. `archived`
+    overrides where the draw can still be found (for a bundle's draw that was dropped: it
+    stays in the bundle)."""
+    _, _, done = unit_paths(layout, u)
+    where = _archive_record(layout, u) if archived is None else archived
+    done.unlink(missing_ok=True)
+    log_discard(layout.docking, u, reason, where)
 
 
 def _df_path(layout, t: Target) -> Path:
     return layout.docking / f"df_results_{t.label}_fixed.csv"
+
+
+def _openbabel_version() -> str:
+    import importlib.metadata
+
+    try:
+        return importlib.metadata.version("openbabel")
+    except Exception:
+        return "unknown"
+
+
+def _prep_stamp(t: Target) -> str:
+    """What 07_docking/<label>/receptor.pdbqt was built from: the source key PLUS the Open
+    Babel version that wrote it.
+
+    Open Babel is deliberately NOT in `_src_key` and so not in any unit key: putting it
+    there would invalidate every recorded draw on a Babel upgrade. It IS in this stamp, so
+    an upgrade re-prepares the receptor instead of a resumed folder and a fresh one feeding
+    the engine different PDBQTs under identical unit keys. A changed PDBQT sha256 is
+    warned about against the previous manifest (see `_warn_receptor_drift`)."""
+    return _sha_text(_json({"src": _src_key(t), "openbabel": _openbabel_version()}))
 
 
 def _src_key(t: Target) -> str:
@@ -533,62 +736,73 @@ def _json(obj) -> str:
     return json.dumps(obj, sort_keys=True)
 
 
-def _job_key(src_key: str, pocket_sha: str, chunk: Chunk, opts: dict) -> str:
+def _unit_key(src_key: str, pocket_sha: str, library_sha: str, replicate: int, seed: int,
+              opts: dict) -> str:
+    """The identity of one (target, replicate) draw: receptor, pocket, library, REPLICATE
+    INDEX, that replicate's seed, the search parameters and the engine version.
+
+    Two replicates of one target differ in `replicate` and `seed`, so they are different
+    units with different keys and different result files. The key says which draw this is,
+    not what it scored."""
     return _sha_text(_json({"receptor": src_key, "pocket_sha256": pocket_sha,
-                                 "chunk_sha256": chunk.sha256, **opts}))
+                            "library_sha256": library_sha, "replicate": int(replicate),
+                            "seed": int(seed),
+                            # how MANY draws the run wants is not part of what ONE draw is:
+                            # raising --replicates must add units, never invalidate the
+                            # recorded ones (it is still in the stage fingerprint).
+                            **{k: v for k, v in opts.items() if k != "replicates"}}))
 
 
-def _options(args, smina: str) -> dict:
-    return {"seed": int(getattr(args, "seed", DEFAULT_SEED)),
+def _options(args, engine: str) -> dict:
+    """What every unit of this run shares. `base_seed`, not `seed`: the seed is per unit."""
+    return {"base_seed": int(getattr(args, "seed", DEFAULT_SEED)),
+            "replicates": int(getattr(args, "replicates", DEFAULT_REPLICATES)),
             "exhaustiveness": EXHAUSTIVENESS, "num_modes": NUM_MODES,
-            "ligand_addH": LIGAND_ADDH, "smina": smina}
-
-
-def _chunk_paths(layout, t: Target, chunk: Chunk) -> tuple[Path, Path, Path]:
-    d = _target_dir(layout, t) / "chunks"
-    return d / f"{chunk.name}.sdf", d / f"{chunk.name}.log", d / f"{chunk.name}.done"
-
-
-def _chunk_done(layout, t: Target, chunk: Chunk, key: str) -> bool:
-    sdf, _, done = _chunk_paths(layout, t, chunk)
-    try:
-        return done.read_text().strip() == key and sdf.is_file()
-    except OSError:
-        return False
+            "ligand_addH": LIGAND_ADDH, "engine": engine}
 
 
 @dataclass
 class _Plan:
     targets: list[Target]
-    chunks: list[Chunk]
-    keys: dict            # (label, chunk name) -> job key
-    usable: list[Target]  # receptor and pocket present
+    library_sha: str
+    n_ligands: int
+    usable: list[Target]             # receptor and pocket present
     missing: list[tuple[str, str]]   # (label, reason) for unusable targets
+    units: list[Unit]                # every (usable target, replicate)
+    opts: dict
 
-    def todo(self, layout) -> list[tuple[Target, Chunk]]:
-        return [(t, c) for t in self.usable for c in self.chunks
-                if not _chunk_done(layout, t, c, self.keys[(t.label, c.name)])]
+    def units_of(self, label: str) -> list[Unit]:
+        return [u for u in self.units if u.label == label]
+
+    def outstanding(self, layout) -> list[tuple[Unit, str]]:
+        """(unit, state) for every unit that is not STATE_DONE. A done unit never appears
+        here: the stage does not re-run a recorded draw."""
+        states = ((u, unit_state(layout, u)) for u in self.units)
+        return [(u, s) for u, s in states if s != STATE_DONE]
 
 
-def _plan(layout, args, lib: Path, smina: str) -> _Plan:
+def _plan(layout, args, lib: Path, engine: str) -> _Plan:
     from polyphar.common import sha256_file
 
     targets = read_targets(layout)
-    chunks = make_chunks(_library_records(lib), int(getattr(args, "chunk_size", DEFAULT_CHUNK)))
-    opts = _options(args, smina)
-    keys, usable, missing = {}, [], []
+    records = _library_records(lib)
+    library_sha = _sha_text("".join(_titled(r) for r in records))
+    opts = _options(args, engine)
+    base = opts["base_seed"]
+    usable, missing, units = [], [], []
     for t in targets:
-        absent = [p for p, what in ((t.receptor, "receptor"), (t.pocket, "pocket"))
-                  if not p.is_file()]
+        absent = [p for p in (t.receptor, t.pocket) if not p.is_file()]
         if absent:
             missing.append((t.label, "missing file: " + ", ".join(
                 _rel(p, layout.run_dir) for p in absent)))
             continue
         usable.append(t)
         src, pocket = _src_key(t), sha256_file(t.pocket)
-        for c in chunks:
-            keys[(t.label, c.name)] = _job_key(src, pocket, c, opts)
-    return _Plan(targets, chunks, keys, usable, missing)
+        for i in range(opts["replicates"]):
+            seed = seed_for(base, i)
+            units.append(Unit(t.label, i, seed,
+                              _unit_key(src, pocket, library_sha, i, seed, opts)))
+    return _Plan(targets, library_sha, len(records), usable, missing, units, opts)
 
 
 def _prepare_receptor(layout, t: Target) -> Path:
@@ -596,7 +810,7 @@ def _prepare_receptor(layout, t: Target) -> Path:
     d = _target_dir(layout, t)
     d.mkdir(parents=True, exist_ok=True)
     pdbqt, stamp = d / "receptor.pdbqt", d / "receptor.key"
-    key = _src_key(t)
+    key = _prep_stamp(t)
     try:
         if pdbqt.is_file() and stamp.read_text().strip() == key:
             return pdbqt
@@ -614,47 +828,101 @@ def _prepare_receptor(layout, t: Target) -> Path:
 
 # --- workers (spawn processes) -------------------------------------------------------
 
-def _dock_chunk(receptor, ligands, center, size, sdf, log, done, seed, cpu, key,
-                timeout) -> int:
+def _dock_unit(receptor, ligands, center, size, sdf, log, done, seed, cpu, key,
+               timeout, docking_dir=None, unit=None, discard_reason=None) -> int:
+    """Run one unit and, only once its result file is in place, write the marker. The
+    marker is the claim "this draw was made and recorded", so it must never precede the
+    record.
+
+    When a record of a superseded or uncertified draw is standing in this unit's place, it
+    is archived and logged HERE -- at the last moment before the engine call that replaces
+    it. That is the whole of P1: a pass that plans this unit but never reaches this point
+    (filtered, aborted, or merging rather than executing) costs no draws. The archive is
+    taken before the engine runs rather than after, because `run_smina` renames its output
+    over the record; a failed engine call therefore leaves the old draw in
+    07_docking/discarded/ rather than destroyed."""
+    if discard_reason is not None and unit is not None:
+        discard(_ArchiveLayout(docking_dir), unit, discard_reason)
     run_smina(receptor, ligands, center, size, sdf, log, seed=seed, cpu=cpu, timeout=timeout)
     _atomic_text(Path(done), key + "\n")
     return 0
 
 
-def _chunk_worker(*args) -> int:
+class _ArchiveLayout:
+    """The minimum `discard` needs (a 07_docking directory), picklable for a worker
+    process: neither RunLayout nor BundleLayout has to cross the process boundary."""
+
+    def __init__(self, docking):
+        self.docking = Path(docking)
+        self.run_dir = self.docking
+
+
+def _unit_worker(*args) -> int:
     from polyphar.pool import task
 
-    return task(lambda: _dock_chunk(*args))
+    return task(lambda: _dock_unit(*args))
 
 
 # --- merge -----------------------------------------------------------------------------
 
-def _merge(layout, t: Target, chunks: list[Chunk], library, failed_chunks: set) -> list[str]:
-    """Merge a target's done chunks. Returns the library IDs without poses ([] when the
-    target is complete; then poses.sdf and df_results are written atomically). An
-    incomplete target gets neither, and stale ones are removed."""
+def _check_replicate(layout, t: Target, u: Unit, library):
+    """(DataFrame, reason). Parse one replicate's record and check that EVERY library
+    ligand has poses in it.
+
+    `result_intact` only looks at the last line, so a record truncated on a clean record
+    boundary passes it: 6 of 2,083 ligands with a final `$$$$` is "intact" and, before
+    this check existed, entered the mean over replicates as a complete draw. Completeness
+    is per replicate, not a property of r0."""
+    sdf, log = unit_paths(layout, u)[:2]
+    try:
+        df = parse_poses(sdf, library, t.label)
+    except ValueError as exc:
+        return None, (f"{u.name}: unusable result: {exc}; "
+                      f"log: {_rel(log, layout.run_dir)}")
+    missing = [i for i in library["ID"] if i not in set(df["ID"])]
+    if missing:
+        return None, (f"incomplete: {len(missing)} ligand ID(s) without poses in {u.name}: "
+                      f"{','.join(missing)}; log: {_rel(log, layout.run_dir)}")
+    return df, None
+
+
+def _merge(layout, t: Target, units: list[Unit], library) -> list[str]:
+    """Build the target's poses.sdf and df_results from REPLICATE 0 (the summary over all
+    replicates is the next step of the rework). Returns the reasons the target is
+    incomplete ([] when it is complete); an incomplete target gets neither file, and stale
+    ones are removed.
+
+    EVERY replicate must be done AND complete: only r0's poses are written out, but a
+    target whose r1 holds 6 of 2,083 ligands is not finished, however good r0 looks (the
+    summary over replicates would average a 0.3%-complete draw in silently)."""
     d = _target_dir(layout, t)
     poses, df_path = d / "poses.sdf", _df_path(layout, t)
-    texts = []
-    for c in chunks:
-        if c.name in failed_chunks:
-            continue
-        sdf, _, _ = _chunk_paths(layout, t, c)
-        if sdf.is_file():
-            texts.append(_read_text(sdf))
-    text = "".join(texts)
+    ordered = sorted(units, key=lambda u: u.replicate)
+    undrawn = [u.name for u in ordered if unit_state(layout, u) != STATE_DONE]
+    first = [u for u in units if u.replicate == 0]
+    r0 = unit_paths(layout, first[0])[0] if first else None
+    if undrawn or r0 is None or not result_intact(r0):
+        poses.unlink(missing_ok=True)
+        df_path.unlink(missing_ok=True)
+        return [f"replicate(s) not recorded: {', '.join(undrawn)}"] if undrawn else \
+               ["replicate r0 has no usable result"]
+    reasons, df = [], None
+    for u in ordered:
+        frame, why = _check_replicate(layout, t, u, library)
+        if why:
+            reasons.append(why)
+        elif u.replicate == 0:
+            df = frame
+    if reasons or df is None:
+        poses.unlink(missing_ok=True)
+        df_path.unlink(missing_ok=True)
+        return reasons or ["replicate r0 has no usable result"]
+    text = _read_text(r0)
     fd, tmp = tempfile.mkstemp(dir=d, prefix=".poses.sdf.", suffix=".tmp")
     os.close(fd)
     tmp = Path(tmp)
     try:
         tmp.write_text(text, encoding="utf-8", errors="surrogateescape")
-        df = parse_poses(tmp, library, t.label)
-        have = set(df["ID"])
-        missing = [i for i in library["ID"] if i not in have]
-        if missing:
-            poses.unlink(missing_ok=True)
-            df_path.unlink(missing_ok=True)
-            return missing
         os.chmod(tmp, 0o644)
         os.replace(tmp, poses)
     finally:
@@ -674,10 +942,14 @@ def _merge(layout, t: Target, chunks: list[Chunk], library, failed_chunks: set) 
 # --- fingerprint / skip --------------------------------------------------------------
 
 def _stage_fingerprint(layout, plan: _Plan, lib_md5: str, opts: dict) -> str | None:
-    """What the finished outputs depend on (not nprocs, chunk size or threads): the
-    final_targets.csv, each target's receptor, pocket and receptor PDBQT sha256, the
-    library md5, seed, exhaustiveness, num_modes, ligand addH and smina version. None when a receptor
-    PDBQT is not prepared yet."""
+    """What the finished outputs depend on (not nprocs or threads): the final_targets.csv,
+    each target's receptor, pocket and receptor PDBQT sha256, the library md5, the base
+    seed, the replicate count, exhaustiveness, num_modes, ligand addH and the engine
+    version. None when a receptor PDBQT is not prepared yet.
+
+    This decides whether the STAGE is finished, never whether a unit must be re-drawn:
+    a changed fingerprint makes the stage re-plan and re-merge, and the units whose key is
+    unchanged are still skipped."""
     from polyphar.common import sha256_file
 
     rows = []
@@ -704,16 +976,30 @@ def _outputs(layout, plan: _Plan) -> dict:
 
 
 # Subdirectories of 07_docking that are NOT target labels and must never be swept into
-# obsolete/. The two names look swapped and are not: "ligands" is THIS stage's chunk
-# directory (07_docking/ligands/*.sdf), while ligands.DIRNAME == "library" is the
-# `ligands` STAGE's own directory (07_docking/library/library_prepared.sdf).
-RESERVED_DIRS = ("ligands", "obsolete", ligands.DIRNAME)   # chunks, archive, prepared lib
+# obsolete/. The two first names look swapped and are not: "ligands" is THIS stage's
+# titled-library directory (07_docking/ligands/library_titled.sdf), while
+# ligands.DIRNAME == "library" is the `ligands` STAGE's own directory
+# (07_docking/library/library_prepared.sdf).
+#
+# "export" and "discarded" are here because `_obsolete` runs on every `dock` AND every
+# `dock-merge`: without them a worked-but-unmerged bundle under the default
+# 07_docking/export/<ts>/, or the archive of already-discarded draws, would be relocated
+# into obsolete/ behind the user's back (and `dock-merge --bundle` would then fail to find
+# its own bundle). Pinned by test_orphans_never_sweep_the_export_or_discard_directories.
+RESERVED_DIRS = (LIB_DIRNAME, "obsolete", ligands.DIRNAME, EXPORT_DIRNAME, DISCARD_DIRNAME)
 _DF_RE = re.compile(r"^df_results_(.+)_fixed\.csv$")
 
 
 def _orphans(layout, plan: _Plan) -> list[Path]:
     """df_results_<label>_fixed.csv files and <label>/ dirs in 07_docking whose label is
-    not a current target."""
+    not a current target.
+
+    It looks only at the TOP level of 07_docking and only at whole labels, so a current
+    target's replicate records (<label>/replicates/r<i>.sdf and their r<i>.done markers)
+    can never be swept: they are inside the label's directory, and the shape of what a
+    label contains plays no part in the decision. Adding or removing replicates therefore
+    does not turn anything into an orphan. Pinned by
+    test_orphans_never_sweep_replicate_results."""
     d = layout.docking
     if not d.is_dir():
         return []
@@ -760,107 +1046,196 @@ def _finished(layout, plan: _Plan, lib_md5: str, opts: dict) -> dict | None:
     if (fp is None or manifest.get("fingerprint") != fp
             or manifest.get("outputs") != _outputs(layout, plan) or _orphans(layout, plan)):
         return None
-    if plan.todo(layout):   # a chunk lost its .done marker: redo it
+    if plan.outstanding(layout):   # a unit lost its marker or its record: it is not done
         return None
     return dict(manifest["counts"])
 
 
+def engine_version(layout, args) -> str:
+    """The engine version that goes into the unit keys.
+
+    `dock-merge` sets args.engine_version from the bundle's run_key.json, because the host
+    that merges need not have the engine at all; without that, the local binary decides,
+    and when it is missing the engine recorded in an existing manifest is used so that a
+    merge-only host still reports its finished units as finished."""
+    pinned = getattr(args, "engine_version", None)
+    if pinned:
+        return str(pinned)
+    local = smina_version()
+    if local != "unavailable":
+        return local
+    return _recorded_engine(layout) or local
+
+
+def _recorded_engine(layout) -> str | None:
+    import json
+
+    try:
+        manifest = json.loads((layout.docking / "manifest.json").read_text())
+    except (OSError, ValueError):
+        return None
+    engine = manifest.get("engine") or manifest.get("smina")
+    return str(engine) if engine and engine != "unavailable" else None
+
+
 def units(layout, args):
-    """Ligands still to dock: the ligands of every (target, chunk) without a valid .done
-    marker (0 when the stage finished on exactly these inputs)."""
+    """Ligands still to draw: n_ligands for every (target, replicate) that is not done
+    (0 when the stage finished on exactly these inputs). A done replicate is never counted:
+    it is not re-run."""
     from polyphar.common import WorkUnits
 
     lib = _library_path(layout, args, copy=False)
-    smina = smina_version()
-    plan = _plan(layout, args, lib, smina)
-    if _finished(layout, plan, _md5(lib), _options(args, smina)) is not None:
+    engine = engine_version(layout, args)
+    plan = _plan(layout, args, lib, engine)
+    if _finished(layout, plan, _md5(lib), plan.opts) is not None:
         return WorkUnits(0, "ligand")
-    return WorkUnits(sum(len(c.ids) for _, c in plan.todo(layout)), "ligand")
+    return WorkUnits(plan.n_ligands * len(plan.outstanding(layout)), "ligand")
 
 
-def run(layout, args, progress) -> dict:
+def titled_library(layout, lib: Path, plan: _Plan) -> Path:
+    """07_docking/ligands/library_titled.sdf: the whole library, titles set to
+    EDRUG3D_<ID>, written once and reused while its sha matches the plan's."""
+    from polyphar.common import sha256_file
+
+    ligdir = layout.docking / LIB_DIRNAME
+    ligdir.mkdir(parents=True, exist_ok=True)
+    out = ligdir / TITLED_LIBRARY
+    text = "".join(_titled(r) for r in _library_records(lib))
+    if not (out.is_file() and sha256_file(out) == _sha_text(text)
+            and _sha_text(text) == plan.library_sha):
+        _atomic_text(out, text)
+    return out
+
+
+def prepare_receptors(layout, plan: _Plan, rows: list) -> dict:
+    """{label: (receptor pdbqt, box centre, box size)} for every usable target; failures
+    are appended to `rows` as (label, reason)."""
+    out: dict[str, tuple[Path, tuple, tuple]] = {}
+    for t in plan.usable:
+        try:
+            out[t.label] = (_prepare_receptor(layout, t), *pocket_box(t.pocket))
+        except Exception as exc:
+            rows.append((t.label, f"receptor/pocket preparation failed: "
+                                  f"{type(exc).__name__}: {exc}"))
+    return out
+
+
+CORRUPT_REASON = ("result file missing, empty or not terminated; "
+                  "re-drawn under the same replicate index")
+SUPERSEDED_REASON = ("superseded: the unit key changed (receptor, pocket, library, seed, "
+                     "parameters or engine); the recorded draw is replaced")
+UNCERTIFIED_REASON = ("uncertified: a result file with no marker (the run was interrupted "
+                      "between writing it and recording it); it is replaced")
+
+
+def pending_discard(layout, u: Unit, state: str) -> str | None:
+    """Why running `u` would cost a recorded draw, or None when it would cost nothing.
+
+    PURE: it decides, it does not discard. The discard happens where the replacement is
+    written (`_dock_unit`, `import_bundle`), so planning a unit that is then filtered out,
+    aborted or never executed destroys nothing. This is the fix for the bug where
+    `dock-merge` on a fully docked run folder deleted every draw before establishing that
+    it had nothing to put in their place."""
+    sdf, _, marker = unit_paths(layout, u)
+    if state == STATE_CORRUPT:
+        return CORRUPT_REASON
+    if result_intact(sdf):
+        return SUPERSEDED_REASON if marker.exists() else UNCERTIFIED_REASON
+    # A result file that exists but is not terminated, with no marker, is overwritten
+    # without a discard row: it is not a record of a draw (nothing certifies it and it is
+    # not even a complete file), so there is no sample to account for. Note that
+    # "unterminated" and "incomplete" are different things -- a record truncated on a
+    # clean $$$$ boundary IS terminated, and _check_replicate is what catches that.
+    return None
+
+
+def plan_discards(layout, plan: _Plan) -> list[tuple[Unit, str | None]]:
+    """[(unit to run, the discard its replacement would cost or None)] for every unit that
+    is not STATE_DONE. STATE_DONE units are not here at all: they are skipped, never
+    redone. Discards nothing; see `pending_discard`."""
+    return [(u, pending_discard(layout, u, state))
+            for u, state in plan.outstanding(layout)]
+
+
+def run(layout, args, progress, execute: bool = True, discard_baseline: int | None = None,
+        extra_counts: dict | None = None, extra_manifest: dict | None = None) -> dict:
+    """Plan, run the outstanding units (unless execute is False: `dock-merge` only folds
+    in results produced elsewhere) and merge.
+
+    `discard_baseline` is the discarded.tsv row count to measure counts["discarded"]
+    against; `dock-merge` takes it BEFORE it imports (importing is what discards there),
+    so the merge's own discards are not under-reported as 0. `extra_counts` /
+    `extra_manifest` let `dock-merge` record that a merge happened -- which bundle, how
+    many units, which engine actually drew them -- in the manifest this function writes."""
     from polyphar.common import append_failure, sha256_file, write_manifest
     from polyphar.pool import run_pool as _run_pool
 
     lib = _library_path(layout, args, progress=progress)
-    smina = smina_version()
-    if smina == "unavailable":
+    engine = engine_version(layout, args)
+    if execute and engine == "unavailable":
         raise FileNotFoundError(f"smina ({smina_bin()}) not runnable")
-    opts = _options(args, smina)
     lib_md5 = _md5(lib)
-    plan = _plan(layout, args, lib, smina)
+    plan = _plan(layout, args, lib, engine)
+    opts = plan.opts
     done = _finished(layout, plan, lib_md5, opts)
     if done is not None:   # finished on exactly these inputs: touch nothing
+        done.update(extra_counts or {})   # ... but say what THIS invocation did
         return done
 
     d = layout.docking
     d.mkdir(parents=True, exist_ok=True)
+    previous = _read_manifest(layout)   # read before it goes: receptor drift is vs this
     (d / "manifest.json").unlink(missing_ok=True)   # outputs below are about to change
-    (d / "failed.tsv").write_text("item\tstage\treason\n")
+    (d / "failed.tsv").write_text("item\tstage\treason\n")   # discarded.tsv is NOT reset
     obsoleted = _obsolete(layout, _orphans(layout, plan))   # targets dropped by `select`
     library = read_library(lib)
     rows: list[tuple[str, str]] = list(plan.missing)
 
-    # receptors (once per target) and boxes, in the parent
-    prepared: dict[str, tuple[Path, tuple, tuple]] = {}
-    for t in plan.usable:
-        try:
-            pdbqt = _prepare_receptor(layout, t)
-            prepared[t.label] = (pdbqt, *pocket_box(t.pocket))
-        except Exception as exc:
-            rows.append((t.label, f"receptor/pocket preparation failed: "
-                                  f"{type(exc).__name__}: {exc}"))
-    ligdir = d / "ligands"
-    ligdir.mkdir(exist_ok=True)
-    for c in plan.chunks:
-        f = ligdir / f"{c.name}.sdf"
-        if not (f.is_file() and sha256_file(f) == c.sha256):
-            _atomic_text(f, c.text)
+    prepared = prepare_receptors(layout, plan, rows)   # receptors and boxes, in the parent
+    ligands_sdf = titled_library(layout, lib, plan)
 
     tpj = int(getattr(args, "threads_per_job", DEFAULT_TPJ))
-    timeout = int(getattr(args, "chunk_timeout", DEFAULT_CHUNK_TIMEOUT))
+    timeout = int(getattr(args, "unit_timeout", None) or DEFAULT_UNIT_TIMEOUT)
     slots = max(1, args.nprocs // tpj)
-    todo = [(t, c) for t, c in plan.todo(layout) if t.label in prepared]
-    n_of = {c.name: len(c.ids) for c in plan.chunks}
+    n_outstanding = len(plan.outstanding(layout))
+    # BEFORE anything that discards. `dock-merge` discards in import_bundle, before it
+    # calls this, and passes its own earlier baseline.
+    discarded = _count_discards(d) if discard_baseline is None else int(discard_baseline)
+    todo = [(u, why) for u, why in plan_discards(layout, plan)
+            if execute and u.label in prepared]
     tasks = []
-    for t, c in todo:
-        pdbqt, center, size = prepared[t.label]
-        sdf, log, marker = _chunk_paths(layout, t, c)
+    for u, why in todo:
+        pdbqt, center, size = prepared[u.label]
+        sdf, log, marker = unit_paths(layout, u)
         sdf.parent.mkdir(parents=True, exist_ok=True)
-        tasks.append(((t.label, c.name), _chunk_worker,
-                      (str(pdbqt), str(ligdir / f"{c.name}.sdf"), center, size, str(sdf),
-                       str(log), str(marker), opts["seed"], tpj,
-                       plan.keys[(t.label, c.name)], timeout)))
-    chunk_of = {i: c for c in plan.chunks for i in c.ids}
-    by_label = {t.label: t for t in plan.targets}
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        tasks.append(((u.label, u.name), _unit_worker,
+                      (str(pdbqt), str(ligands_sdf), center, size, str(sdf), str(log),
+                       str(marker), u.seed, tpj, u.key, timeout, str(d), u, why)))
+    unit_by_item = {(u.label, u.name): u for u in plan.units}
 
-    def log_rel(label: str, chunk: Chunk) -> str:
-        return _rel(_chunk_paths(layout, by_label[label], chunk)[1], layout.run_dir)
-
-    failed_chunks: dict[str, set] = {}
+    failed_units: set = set()
     try:
         outcome = _run_pool(tasks, slots,
-                            on_result=lambda item, _r: progress.advance(n_of[item[1]]))
-        chunk_by_name = {c.name: c for c in plan.chunks}
-        for (label, chunk), reason in outcome.failures:
-            failed_chunks.setdefault(label, set()).add(chunk)
+                            on_result=lambda item, _r: progress.advance(plan.n_ligands))
+        for item, reason in outcome.failures:
+            failed_units.add(item)
             reason = reason.removeprefix("SminaError: ")
-            rows.append((f"{label}/{chunk}",
-                         f"{reason}; log: {log_rel(label, chunk_by_name[chunk])}"))
-            progress.advance(n_of[chunk])
+            log = _rel(unit_paths(layout, unit_by_item[item])[1], layout.run_dir)
+            rows.append((f"{item[0]}/{item[1]}", f"{reason}; log: {log}"))
+            progress.advance(plan.n_ligands)
 
         complete = incomplete = 0
         for t in plan.usable:
             if t.label not in prepared:
                 incomplete += 1
                 _df_path(layout, t).unlink(missing_ok=True)
+                (_target_dir(layout, t) / "poses.sdf").unlink(missing_ok=True)
                 continue
-            missing = _merge(layout, t, plan.chunks, library, failed_chunks.get(t.label, set()))
-            if missing:
+            reasons = _merge(layout, t, plan.units_of(t.label), library)
+            if reasons:
                 incomplete += 1
-                logs = sorted({log_rel(t.label, chunk_of[i]) for i in missing})
-                rows.append((t.label, f"incomplete: {len(missing)} ligand ID(s) without "
-                                      f"poses: {','.join(missing)}; log: {', '.join(logs)}"))
+                rows.extend((t.label, r) for r in reasons)
             else:
                 complete += 1
     finally:
@@ -868,34 +1243,114 @@ def run(layout, args, progress) -> dict:
             append_failure(d, item, STAGE, reason)
 
     incomplete += len(plan.missing)
-    n_failed_chunks = sum(map(len, failed_chunks.values()))
     counts = {"targets": len(plan.targets), "complete": complete,
               "incomplete_targets": incomplete,
-              "ligands": len(library), "chunks": len(plan.chunks) * len(plan.usable),
-              "chunks_docked": len(tasks) - n_failed_chunks,
-              "skipped_existing": len(plan.chunks) * len(prepared) - len(tasks),
-              "obsoleted": len(obsoleted), "failed": n_failed_chunks}
+              "ligands": plan.n_ligands, "replicates": opts["replicates"],
+              "units": len(plan.units),
+              "units_docked": len(tasks) - len(failed_units),
+              "skipped_existing": len(plan.units) - n_outstanding,
+              "discarded": _count_discards(d) - discarded,
+              # records of replicate indices this run does not plan (e.g. after lowering
+              # --replicates): they are KEPT, never swept, and this is where that shows.
+              "units_present_outside_plan": _records_outside_plan(layout, plan),
+              "obsoleted": len(obsoleted), "failed": len(failed_units)}
+    counts.update(extra_counts or {})
     receptors = {t.label: {"receptor": t.receptor_rel, "pocket": t.pocket_rel,
                            "preparation": t.prep,
                            "pdbqt_sha256": sha256_file(prepared[t.label][0])}
                  for t in plan.usable if t.label in prepared}
+    _warn_receptor_drift(progress, previous, receptors)
     fingerprint = _stage_fingerprint(layout, plan, lib_md5, opts)
     write_manifest(d, STAGE,
-                   args={"nprocs": args.nprocs, "seed": opts["seed"],
-                         "chunk_size": int(getattr(args, "chunk_size", DEFAULT_CHUNK)),
+                   args={"nprocs": args.nprocs, "seed": opts["base_seed"],
+                         "replicates": opts["replicates"],
                          "threads_per_job": tpj, "exhaustiveness": EXHAUSTIVENESS,
                          "num_modes": NUM_MODES, "ligand_addH": LIGAND_ADDH,
-                         "chunk_timeout": timeout, "library": _rel(lib, layout.run_dir)},
-                   inputs=[layout.final_targets_csv, lib], versions=_versions(smina),
+                         "unit_timeout": timeout, "library": _rel(lib, layout.run_dir)},
+                   inputs=[layout.final_targets_csv, lib], versions=_versions(engine),
                    counts=counts, timing={},
                    extra={"fingerprint": fingerprint, "outputs": _outputs(layout, plan),
-                          "library_md5": lib_md5,
+                          "library_md5": lib_md5, "library_sha256": plan.library_sha,
                           # True: the scores come from the `ligands` stage's prepared
                           # library; False: from the raw SDF (Methods needs to say which).
                           "library_prepared": _library_is_prepared(layout, args, lib),
-                          "seed": opts["seed"], "smina": smina,
-                          "receptors": receptors, "obsoleted": obsoleted})
+                          "base_seed": opts["base_seed"], "engine": engine, "smina": engine,
+                          # per unit: which draw it is, what seed it recorded, its key
+                          "units": [{"label": u.label, "replicate": u.replicate,
+                                     "seed": u.seed, "key": u.key,
+                                     "state": unit_state(layout, u)}
+                                    for u in plan.units],
+                          "receptors": receptors, "obsoleted": obsoleted,
+                          **(extra_manifest or {})})
     return counts
+
+
+def _read_manifest(layout) -> dict:
+    import json
+
+    try:
+        return json.loads((Path(layout.docking) / "manifest.json").read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+_REPLICATE_RE = re.compile(r"^r(\d+)\.sdf$")
+
+
+def _records_outside_plan(layout, plan: _Plan) -> int:
+    """How many <label>/replicates/r<i>.sdf files belong to a replicate index this run
+    does not plan. Lowering --replicates keeps r3, r4 ... (a recorded draw is never thrown
+    away for being surplus); without this count nothing said so."""
+    want = {(u.label, u.replicate) for u in plan.units}
+    labels = {t.label for t in plan.targets}
+    n = 0
+    for label in labels:
+        for f in sorted((Path(layout.docking) / label / "replicates").glob("r*.sdf")):
+            m = _REPLICATE_RE.match(f.name)
+            if m and (label, int(m.group(1))) not in want:
+                n += 1
+    return n
+
+
+def _warn_receptor_drift(progress, previous: dict, receptors: dict) -> None:
+    """Warn when a target's receptor PDBQT is not byte-identical to the one the previous
+    manifest recorded.
+
+    The PDBQT is what the engine actually reads, and it is deliberately NOT in the unit key
+    (an Open Babel upgrade must not invalidate every recorded draw). The cost of leaving it
+    out is that draws under one key could come from two different receptors, so the change
+    is reported rather than silently absorbed."""
+    import sys
+
+    old = (previous.get("extra") or previous).get("receptors") or {}
+    drift = sorted(label for label, info in receptors.items()
+                   if label in old and old[label].get("pdbqt_sha256")
+                   and old[label]["pdbqt_sha256"] != info["pdbqt_sha256"])
+    if not drift:
+        return
+    message = (f"the prepared receptor PDBQT changed for {len(drift)} target(s) since the "
+               f"last run ({', '.join(drift[:5])}"
+               f"{', ...' if len(drift) > 5 else ''}). The PDBQT is what the engine reads "
+               f"but is not part of a unit key, so draws recorded before and after this "
+               f"change came from DIFFERENT receptors under the same keys. Check the "
+               f"Open Babel version and the receptor inputs before using them together.")
+    print(f"{STAGE}: WARNING: {message}", file=sys.stderr, flush=True)
+    notifier = getattr(progress, "notifier", None)
+    if notifier is not None:
+        try:
+            notifier(f"{STAGE}: receptor PDBQT changed", message, priority=1)
+        except Exception:
+            pass
+
+
+def _count_discards(stage_dir) -> int:
+    """Rows in discarded.tsv (0 without one). The difference across a run is how many
+    recorded draws that run threw away."""
+    path = Path(stage_dir) / DISCARD_LOG
+    try:
+        return max(0, sum(1 for _ in open(path, encoding="utf-8")) - 1)
+    except OSError:
+        return 0
 
 
 def _versions(smina: str) -> dict:
@@ -908,3 +1363,288 @@ def _versions(smina: str) -> dict:
         except importlib.metadata.PackageNotFoundError:
             out[pkg] = "unknown"
     return out
+
+
+# --- bundles: export / worker / merge ---------------------------------------------------
+#
+# `dock` needs a GPU (soon) and the run folder on one machine. When they are on different
+# machines the same work is split in three, around a bundle directory:
+#
+#   dock-export   plan here, write the outstanding units and everything they need
+#   dock-worker   run them there; no run folder, no plan, no key arithmetic
+#   dock-merge    fold the results back in here
+#
+# The bundle's on-disk layout mirrors the run folder's (results/<label>/replicates/r<i>.sdf
+# with its r<i>.done marker beside it), so the same unit_state / discard / resume code runs
+# on both sides and merging is a copy. Packing it into a tarball with a verified run_key.json
+# is a later step; what it needs from this one is that the unit KEY is computed once, at
+# export, and carried through: the worker never recomputes it and the merge accepts only
+# results whose key is the one the current plan expects.
+
+BUNDLE_UNITS = "units.tsv"
+BUNDLE_KEY = "run_key.json"
+BUNDLE_LIBRARY = "library.sdf"
+BUNDLE_UNIT_COLUMNS = ["label", "replicate", "seed", "key", "receptor",
+                       "center_x", "center_y", "center_z", "size_x", "size_y", "size_z"]
+
+
+@dataclass(frozen=True)
+class BundleUnit:
+    unit: Unit
+    receptor: str          # relative to the bundle
+    center: tuple
+    size: tuple
+
+
+class BundleLayout:
+    """Enough of a RunLayout for the unit helpers: a bundle's results/ directory stands in
+    for 07_docking, so unit_paths / unit_state / discard work unchanged on both sides."""
+
+    def __init__(self, bundle):
+        self.bundle = Path(bundle)
+        self.run_dir = self.bundle
+
+    @property
+    def docking(self) -> Path:
+        return self.bundle / "results"
+
+
+def write_bundle(layout, args, dest, plan: _Plan, prepared: dict, ligands_sdf: Path,
+                 max_units: int | None = None) -> list[BundleUnit]:
+    """Write the outstanding units and their inputs into `dest`. Returns the units written
+    (at most max_units, in replicate-major order so a lost session costs one draw of many
+    targets rather than every draw of a few).
+
+    Exporting touches nothing in the run folder: a record that is going to be replaced is
+    discarded by whoever actually replaces it (`dock-merge`, or `dock` itself), not here,
+    so a session that is never worked costs no draws at all."""
+    import shutil
+
+    dest = Path(dest)
+    (dest / "receptors").mkdir(parents=True, exist_ok=True)
+    (dest / "results").mkdir(parents=True, exist_ok=True)
+    todo = [u for u, _state in plan.outstanding(layout) if u.label in prepared]
+    todo.sort(key=lambda u: (u.replicate, u.label))
+    if max_units is not None:
+        todo = todo[:max_units]
+    out = []
+    for u in todo:
+        pdbqt, center, size = prepared[u.label]
+        rel = f"receptors/{u.label}.pdbqt"
+        if not (dest / rel).is_file():
+            shutil.copyfile(pdbqt, dest / rel)
+        out.append(BundleUnit(u, rel, center, size))
+    shutil.copyfile(ligands_sdf, dest / BUNDLE_LIBRARY)
+    lines = ["\t".join(BUNDLE_UNIT_COLUMNS)]
+    for b in out:
+        u = b.unit
+        lines.append("\t".join([u.label, str(u.replicate), str(u.seed), u.key, b.receptor]
+                               + [repr(float(c)) for c in b.center]
+                               + [repr(float(s)) for s in b.size]))
+    _atomic_text(dest / BUNDLE_UNITS, "\n".join(lines) + "\n")
+    _atomic_text(dest / BUNDLE_KEY, _json_indent({
+        "run": Path(layout.run_dir).name, "library_sha256": plan.library_sha,
+        "n_ligands": plan.n_ligands, "options": plan.opts,
+        "unit_timeout": int(getattr(args, "unit_timeout", None) or DEFAULT_UNIT_TIMEOUT),
+        "units": len(out), "outstanding_total": len(plan.outstanding(layout))}))
+    return out
+
+
+def _json_indent(obj) -> str:
+    import json
+
+    return json.dumps(obj, indent=2, sort_keys=True) + "\n"
+
+
+def read_run_key(bundle) -> dict:
+    import json
+
+    path = Path(bundle) / BUNDLE_KEY
+    if not path.is_file():
+        raise FileNotFoundError(f"{path} not found: {bundle} is not a dock bundle")
+    return json.loads(path.read_text())
+
+
+def read_bundle_units(bundle) -> list[BundleUnit]:
+    """The bundle's units.tsv. The key is read, never recomputed: it was decided at export
+    and is what the merge will check against the plan."""
+    path = Path(bundle) / BUNDLE_UNITS
+    if not path.is_file():
+        raise FileNotFoundError(f"{path} not found: {bundle} is not a dock bundle")
+    rows = [l.split("\t") for l in path.read_text().splitlines() if l.strip()]
+    if not rows or rows[0] != BUNDLE_UNIT_COLUMNS:
+        raise ValueError(f"{path}: expected columns {', '.join(BUNDLE_UNIT_COLUMNS)}")
+    out = []
+    for r in rows[1:]:
+        if len(r) != len(BUNDLE_UNIT_COLUMNS):
+            raise ValueError(f"{path}: malformed row {r!r}")
+        out.append(BundleUnit(Unit(r[0], int(r[1]), int(r[2]), r[3]), r[4],
+                              tuple(float(x) for x in r[5:8]),
+                              tuple(float(x) for x in r[8:11])))
+    return out
+
+
+def bundle_outstanding(bundle) -> list[tuple[BundleUnit, str | None]]:
+    """[(unit still to draw, the discard re-drawing it would cost or None)]. Done units are
+    skipped, exactly as in the run folder.
+
+    The reason is only PLANNED here; it is acted on in `_dock_unit`, where the replacement
+    is written. Both the corrupt case AND the uncertified one (an intact result whose
+    marker was dropped on the way back from the engine host) are accounted for: before,
+    only the first was, so a worker handed results without their markers re-docked over
+    them with nothing in discarded.tsv."""
+    bl = BundleLayout(bundle)
+    out = []
+    for b in read_bundle_units(bundle):
+        state = unit_state(bl, b.unit)
+        if state == STATE_DONE:
+            continue
+        out.append((b, pending_discard(bl, b.unit, state)))
+    return out
+
+
+def work_bundle(bundle, args, progress) -> dict:
+    """Run the bundle's outstanding units in place. No run folder is needed and no key is
+    computed: the keys come from units.tsv."""
+    from polyphar.pool import run_pool as _run_pool
+
+    bundle = Path(bundle)
+    key = read_run_key(bundle)
+    bl = BundleLayout(bundle)
+    todo = bundle_outstanding(bundle)
+    engine = smina_version()
+    if todo and engine == "unavailable":
+        raise FileNotFoundError(f"smina ({smina_bin()}) not runnable")
+    n_lig = int(key.get("n_ligands") or 0)
+    tpj = int(getattr(args, "threads_per_job", DEFAULT_TPJ))
+    timeout = int(getattr(args, "unit_timeout", None) or key.get("unit_timeout")
+                  or DEFAULT_UNIT_TIMEOUT)
+    tasks = []
+    for b, why in todo:
+        sdf, log, marker = unit_paths(bl, b.unit)
+        sdf.parent.mkdir(parents=True, exist_ok=True)
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        tasks.append(((b.unit.label, b.unit.name), _unit_worker,
+                      (str(bundle / b.receptor), str(bundle / BUNDLE_LIBRARY), b.center,
+                       b.size, str(sdf), str(log), str(marker), b.unit.seed, tpj,
+                       b.unit.key, timeout, str(bl.docking), b.unit, why)))
+    outcome = _run_pool(tasks, max(1, args.nprocs // tpj),
+                        on_result=lambda item, _r: progress.advance(n_lig))
+    for item, reason in outcome.failures:
+        progress.advance(n_lig)
+        append_bundle_failure(bundle, f"{item[0]}/{item[1]}",
+                              reason.removeprefix("SminaError: "))
+    _atomic_text(bundle / "worker.json", _json_indent(
+        {"engine": engine, "units": len(read_bundle_units(bundle)),
+         "units_docked": len(tasks) - len(outcome.failures),
+         "failed": len(outcome.failures), "versions": _versions(engine)}))
+    return {"units": len(read_bundle_units(bundle)),
+            "units_docked": len(tasks) - len(outcome.failures),
+            "skipped_existing": len(read_bundle_units(bundle)) - len(todo),
+            "failed": len(outcome.failures)}
+
+
+def append_bundle_failure(bundle, item, reason) -> None:
+    from polyphar.common import append_failure
+
+    append_failure(Path(bundle), item, "dock-worker", reason)
+
+
+def import_bundle(layout, plan: _Plan, bundle):
+    """Copy the bundle's finished unit records into the run folder.
+    Returns (taken, rejected, dropped).
+
+    A result is taken only when the current plan has a unit with the SAME label, replicate
+    AND key: a bundle made under other settings (another receptor, library, seed or engine)
+    describes different draws, and mixing them silently is the thing this check exists to
+    stop. Rejections are returned, not swallowed, and a bundle draw dropped because this
+    unit is already on record is written to discarded.tsv -- the selection has to be
+    auditable even when nothing failed."""
+    import shutil
+
+    bl = BundleLayout(bundle)
+    want = {(u.label, u.replicate): u for u in plan.units}
+    taken, rejected, dropped = [], [], []
+    logged = _discard_log_text(layout.docking)   # re-merging a bundle must not re-log
+    for b in read_bundle_units(bundle):
+        u = b.unit
+        mine = want.get((u.label, u.replicate))
+        if mine is None:
+            rejected.append((f"{u.label}/{u.name}", "not a unit of this run"))
+            continue
+        if mine.key != u.key:
+            rejected.append((f"{u.label}/{u.name}",
+                             "unit key differs from this run's: the bundle was made under "
+                             "different settings and its draws are not these draws"))
+            continue
+        if unit_state(bl, u) != STATE_DONE:
+            continue   # not drawn yet in the bundle; a later worker pass will
+        src_sdf, src_log, src_done = unit_paths(bl, u)
+        dst_sdf, dst_log, dst_done = unit_paths(layout, mine)
+        if unit_state(layout, mine) == STATE_DONE:
+            # Already recorded here; a recorded draw is never replaced. But the bundle's
+            # draw was a real sample too, and it is now being dropped -- which happens
+            # whenever two bundles were exported before either was merged, since export
+            # only excludes what is already ON RECORD. Dropping it is a (small) selection
+            # effect, so it is logged like any other discarded draw. Its bytes stay in the
+            # bundle: `archived` says where.
+            dropped.append((f"{u.label}/{u.name}", str(bundle)))
+            if f"{u.key}\t" not in logged or str(src_sdf) not in logged:
+                log_discard(layout.docking, u,
+                            f"dropped on merge: a draw for this unit is already on record "
+                            f"here, so the bundle's draw was not merged (bundle: {bundle})",
+                            str(src_sdf))
+            continue
+        if dst_sdf.exists() or dst_done.exists():
+            # Something is standing in this unit's place and is about to be replaced by
+            # the bundle's copy: archive and log it here, at the moment of replacement.
+            discard(layout, mine, "replaced by a draw merged from a bundle")
+        dst_sdf.parent.mkdir(parents=True, exist_ok=True)
+        dst_done.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(src_sdf, dst_sdf)
+        if src_log.is_file():
+            shutil.copyfile(src_log, dst_log)
+        _atomic_text(dst_done, mine.key + "\n")   # written last: the record is in place
+        taken.append(mine)
+    _carry_discards(bundle, layout)
+    return taken, rejected, dropped
+
+
+def _discard_log_text(stage_dir) -> str:
+    try:
+        return (Path(stage_dir) / DISCARD_LOG).read_text(encoding="utf-8")
+    except OSError:
+        return ""
+
+
+def _carry_discards(bundle, layout) -> None:
+    """Append the bundle's discarded draws to the run folder's log: a draw thrown away on
+    the GPU host is still a draw thrown away.
+
+    The bundle's own log is LEFT IN PLACE (it used to be deleted, so a bundle merged into a
+    second run folder arrived with no discard history at all), and repeat merges are
+    idempotent on CONTENT: a row already present here is not appended again."""
+    src = BundleLayout(bundle).docking / DISCARD_LOG
+    if not src.is_file():
+        return
+    rows = [l for l in src.read_text().splitlines()[1:] if l.strip()]
+    if not rows:
+        return
+    dst = Path(layout.docking) / DISCARD_LOG
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    have = set()
+    if dst.is_file():
+        have = {l for l in dst.read_text().splitlines()[1:] if l.strip()}
+    rows = [r for r in rows if r not in have]
+    if not rows:
+        return
+    _ensure_discard_log(layout.docking)
+    with open(dst, "a", encoding="utf-8") as fh:
+        fh.write("\n".join(rows) + "\n")
+
+
+def plan_for(layout, args, engine: str | None = None):
+    """(plan, library path, engine version) for the bundle subcommands."""
+    lib = _library_path(layout, args, copy=False)
+    engine = engine or engine_version(layout, args)
+    return _plan(layout, args, lib, engine), lib, engine
