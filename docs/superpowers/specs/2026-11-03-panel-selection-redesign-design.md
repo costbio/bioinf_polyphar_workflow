@@ -1,13 +1,13 @@
 # Panel selection and GPU docking redesign
 
-**Date:** 2026-11-03 (rewritten after audit; see git history for the superseded version)
-**Status:** design, approved for staged implementation
+**Date:** 2026-11-03 (third rewrite; see git history for superseded versions)
+**Status:** design — stages 1-3 implemented, stage 5 designed, stages 4 and 6 open
 **Supersedes:** hub-and-neighbours target selection in `polyphar/stages/select.py`
 
-This file was rewritten rather than amended. The previous version carried three
-generations of numbers side by side and contradicted itself; an audit found that to be
-its worst defect. **Every number here is from the same run of `reconcile.py` against
-`disease_subtypes_v2/Liver_cancer/net1` unless stated otherwise.**
+This file is rewritten rather than amended whenever the numbers change. An audit found
+that its worst defect had been carrying several generations of figures side by side.
+**Every number here comes from `verify_panel.py` run against the shipped modules on
+`disease_subtypes_v2/Liver_cancer/net1`, unless stated otherwise.**
 
 ## Intent
 
@@ -15,95 +15,108 @@ The claim is **drug-centric and cumulative**: an approved HCC drug may owe part 
 efficacy to weak but real binding across a set of *related* pockets, beyond its primary
 target. The old pipeline selected targets as "highest-degree node of the pocket-similarity
 graph, plus its neighbours", which served that claim badly — the hub is a topology
-artifact and the target count tracked pocket coverage rather than biology.
+artifact and the target count tracked how many structures were processed rather than
+biology.
 
-The redesign has two parts:
+Two parts replace it:
 
 1. A **panel** defined by explicit pocket filters, docked in full.
 2. Pocket similarity used **post hoc, on the docking results** — not to build the panel.
 
 ## The central methodological decision
 
-**Pocket similarity is never used to select or group targets.** It is used only to ask,
-after docking:
+**Pocket similarity never selects or groups targets.** It is used only after docking:
 
 > Are the targets a given drug hits more similar to one another than a random set of the
 > same size drawn from the same panel?
 
-This replaces an earlier design that pre-grouped pockets into clusters and tested within
-them. That design was dropped (user, 2026-11-03) after `reconcile.py` showed it collapsed
-on the dockable set — see "Why the cluster layer was dropped". The post hoc form is better
-on three counts:
-
-- **No circularity.** Similarity touches neither panel construction nor group definition,
-  so it cannot manufacture the structure it then detects.
-- **No arbitrary thresholds.** No Pmax cut, no minimum group size, no community-detection
-  resolution. The full `Pocketsim` distribution is used as a continuous measure.
-- **A clean null.** Permutation over random same-size target sets from the panel,
-  optionally matched on pocket volume. No distributional assumptions.
-
-It also contains the interface-artifact problem (below): if a drug's hit set is enriched
-for mutually similar pockets, that holds whether or not those pockets are partner-binding
-surfaces. The artifact question then affects interpretation of *which* proteins appear,
-not whether the effect is real.
+This replaced an earlier design that pre-grouped pockets into clusters, dropped (user,
+2026-11-03) after it collapsed on the dockable set — see "Why the cluster layer was
+dropped". The post hoc form is better on three counts: no circularity, since similarity
+touches neither panel construction nor group definition; no arbitrary thresholds, since
+the full `Pocketsim` distribution is a continuous measure; and a clean permutation null
+over random same-size target sets.
 
 ## Panel definition
 
-A pocket is eligible when all hold. The funnel is from `reconcile2.py` on net1:
+### How the filters were chosen — and chosen wrongly twice
 
-| filter | pockets surviving |
+Recorded because the failures are instructive and must not be repeated.
+
+**First attempt: `segments <= 3`,** a count of contiguous runs in the lining-residue
+numbering. It is provenance-biased — pdbfixer renumbers experimental chains 1..N with
+missing loops modelled in, while AlphaFold pockets carry UniProt positions. Measured, it
+passed AF pockets at 39.4% against 17.5% for experimental ones, a 21.9-point gap.
+
+**Second attempt: `radius of gyration <= 8.5 A`,** adopted because it closed that gap to
+1.5 points. It was never checked against whether it selects *druggable* pockets, which is
+its job. Calibrating against the 687 of 8,005 experimental net1 pockets holding a
+co-crystallised drug-like ligand:
+
+| | ligand-occupied (n=687) | no ligand (n=7,318) |
+|---|---|---|
+| median Rg | **10.48** | 7.34 |
+
+`Rg <= 8.5` kept **8%** of pockets known to bind a drug and 69% of the rest —
+**anti-enriching roughly eightfold**. Real binding sites have *large* lining-residue
+envelopes; a shallow surface dent has a small one. Covering 90% of ligand-bound pockets
+would need `Rg <= 13.97`, which filters nothing.
+
+**What the field actually does.** Druggability prediction is a trained-model problem, not
+a geometry-threshold problem: DoGSiteScorer's `drugScore` is an SVM over size, shape and
+hydrophobicity descriptors with ~88% reported accuracy, and fpocket, SiteMap, PockDrug and
+DrugPred all learn a score from the same descriptor families. We had stacked four
+hand-chosen geometric thresholds on top of a validated classifier.
+
+**Third attempt, and the current one.** Filters chosen on physical grounds and stated
+plainly, rather than tuned to net1 — one subtype with a known-bad history.
+
+### The filters
+
+| filter | what it does |
 |---|---|
-| DoGSiteScorer 2 selected, drugScore >= 0.5 | 11,599 |
-| volume 300-2000 A^3 | 4,992 |
-| subpocket rejected if its parent exceeds 2000 A^3 | 3,780 |
-| AlphaFold pockets: mean pocket pLDDT >= 70 | 3,590 |
-| TM policy C: drop multi-pass (>= 2 TM segments) | 2,676 |
-| TM policy C: drop pockets overlapping a TM segment > 10% | 2,672 |
-| **radius of gyration <= 8.5 A** | **537** |
-| Uni-Dock grid legal at 0.375 A (<=128/axis, <=531,441 total) | 537 |
+| `drugScore >= 0.5` | DoGSiteScorer's trained druggability SVM |
+| `300 <= volume <= 1500 A^3` | the cited druggable range is ~300-1000, stricter criteria near 1000; 1500 is a deliberate allowance. **The ceiling is what rejects the oversized interdomain cavities** (~2,600 A^3 against ~270 typical); 2 of the 100 worst survive |
+| subpocket parent `<= 1500 A^3` | without it, a subpocket carved from a 25,840 A^3 cleft passes the ceiling and becomes its protein's representative |
+| AF pocket `pLDDT >= 70` | a sanity floor only — pLDDT does **not** detect the oversized cavities (the worst average 84.8 against 83.3 overall). It is local per-residue confidence, not domain packing; PAE would be the right metric |
+| `surf/vol <= 0.45` | enclosure. Ligand-bound pockets sit at a median 0.410 against 0.510 for all pockets. It does **not** reject the oversized cavities (0.539, barely distinguishable) |
+| TM policy C | drop multi-pass TM proteins; drop AF pockets overlapping a TM segment by > 10% |
+| Uni-Dock grid legality | a guard, not a selector: <=128 points per axis and <=531,441 total at 0.375 A |
 
-**Panel: 164 proteins, 537 eligible pockets, 57% AlphaFold** (93 AF, 71 experimental).
-One row per protein, the eligible pocket with the highest drugScore (ties: smallest
-pocket name).
+**Volume and `surf/vol` are both kept because they do different jobs** — volume rejects
+oversized cavities and cannot judge shape; `surf/vol` judges shape and cannot separate the
+oversized ones.
 
-### Compactness is measured in space, not in sequence
+### Two honest caveats
 
-This replaces an earlier `segments <= 3` rule (a segment break being a gap of more than 5
-residues in the sorted lining-residue numbers) **and** a separate 30 A cap on the docking
-box's longest side. Both are gone.
+- **`drugScore >= 0.5` does no work.** `DrugScore.csv`'s `Selected` column already means
+  exactly that, so the step is inherited from `pockets` and constrains nothing further.
+  Raise it above 0.5 for it to filter.
+- **`surf/vol <= 0.45` has no literature value.** It is placed near the observed
+  ligand-bound centre. Unlike Rg the direction is physically unambiguous, but it is still
+  a descriptive choice and Methods must say so.
 
-`segments` measures compactness in **sequence**, so it depends on the residue-numbering
-coordinate system — and experimental pockets are numbered by pdbfixer (1..N, with missing
-loops modelled in) while AlphaFold pockets carry UniProt positions. Measured on net1 that
-made the filter badly provenance-dependent:
+### The funnel
 
-| filter, at matched stringency (645 pockets) | AF pass | experimental pass | gap |
-|---|---|---|---|
-| `segments <= 3` | 39.4% | 17.5% | **21.9 points** |
-| **Rg <= 8.60 A** | 25.1% | 23.7% | **1.5 points** |
-| box longest side <= 23.3 A | 21.8% | 25.1% | 3.3 points |
-| asphericity <= 0.217 | 16.0% | 27.6% | 11.7 points |
-| Rg / n_atoms^(1/3) <= 1.514 | 14.0% | 28.5% | 14.5 points |
+| step | pockets remaining |
+|---|---|
+| selected (drugScore >= 0.5) | 11,599 |
+| volume 300-1500 | 4,705 |
+| subpocket parent | 3,621 |
+| AF pLDDT >= 70 | 3,458 |
+| surf/vol <= 0.45 | 1,647 |
+| TM policy C | 1,435 |
+| Uni-Dock grid legal | 1,367 |
 
-Note the direction: the sequence rule favoured **AlphaFold** by 22 points, and the gap
-survived controlling for pocket size (widest at 15-30 lining residues, where ordinary drug
-pockets sit). Radius of gyration is identical across both classes by construction.
+**Panel: 158 proteins, 1,367 eligible pockets, 32% AlphaFold** (50 AF, 108 experimental).
+One row per protein, the eligible pocket with the highest drugScore, ties to the smallest
+pocket name. Every rejected pocket carries a reason in `failed.tsv`, and rejections plus
+eligible equals selected.
 
-Adopting it (user, 2026-11-03) also:
-- **Subsumes the box cap.** Over the eligible set the box's longest side is median 21.2 A
-  and **maximum 28.8 A** — nothing exceeds 30 A, because a compact pocket bounds its own
-  box. One criterion replaces two.
-- **Removes the SIFTS dependency entirely** (see below).
-- Drops the AlphaFold share from 68% to **57%**, easing the interface-artifact exposure.
-- Leaves panel size essentially unchanged (164 against 183).
+The AlphaFold share falling from 53-68% to **32%** materially reduces the interface-pocket
+exposure below, which remains the panel's main uncontrolled risk.
 
-The cutoff is **8.5 A**, chosen as a round value in the physically plausible range for a
-drug-binding site (Rg typically 5-8 A), not inherited from the stringency of the rule it
-replaces — the earlier 8.60 A was calibrated that way and that anchor was weak. Eligible
-pockets run median Rg 8.08. **Validate the cutoff on a second subtype before the
-production run.**
-
-### The docking box itself is unchanged
+### The docking box is unchanged
 
 `pocket_box` (`dock.py`) takes the unpadded bounding box of the `_res_P_*.pdb` lining
 residues. Deriving it from the DoGSiteScorer cavity (`_gps_`) was tested and is **worse**:
@@ -111,51 +124,35 @@ the cavity spans 18.1 A median unpadded, but Vina needs the whole ligand inside,
 cavity + 4 A already exceeds the current box. The lining-residue envelope is effectively
 "cavity + ~3 A". Leave it alone.
 
-### Other filter notes
-
-- The **upper** volume bound, the Rg criterion and the subpocket-parent rule are the
-  load-bearing additions. None existed before, because drugScore rewards large pockets
-  and has no ceiling.
-- TM policy C costs **4 pockets** over policy A. Earlier spikes used policy A; the
-  discrepancy was real but harmless.
-- Grid legality removes nothing once Rg is applied.
-- The TM pocket-overlap check runs on AlphaFold models only, where PDB residue number
-  equals UniProt position. For experimental chains only the protein-level multi-pass rule
-  applies, on the assumption that a crystallised construct of a single-pass protein is the
-  soluble domain. State that in Methods.
-
 ## Ligand library
 
-Source: e-Drug3D (2,083 records). Its inclusion limit is MW <= 2000, so it contains
-peptides far outside Vina's domain — afamelanotide at 64 rotatable bonds, ganirelix 58,
-degarelix 53, colistimethate 47, daptomycin 39, sugammadex at 1,994 Da.
+e-Drug3D, 2,083 records. Its inclusion limit is MW <= 2000, so it holds peptides far
+outside Vina's domain — afamelanotide at 64 rotatable bonds, ganirelix 58, degarelix 53,
+sugammadex at 1,994 Da. Including them stalled a calibration run for hours.
 
 **Dockability filter: exclude `rotatable bonds > 15` OR `MW > 900`** — 123 of 2,083
 excluded (5.9%), keeping 1,960. No HCC or AD positive-set drug is affected.
 
-Two things the builder must pin:
-- **The rotatable-bond definition is not standard and must be stated in Methods.**
-  `ligsize.py` counts single, non-ring, non-terminal heavy-atom bonds via bridge
-  detection and does **not** exclude amide C-N bonds; the conventional RDKit/Lipinski
-  definition does, and `obabel` does. Swapping implementations silently changes which
-  ligands are excluded. Pin one and publish the exclusion list.
-- There is no class flag in the SDF (only `status`, `name`, `cas`, `ID`), so the filter
-  must be computed.
+**The rotatable-bond definition is non-standard and must be pinned in Methods.**
+`ligsize.py` counts single, non-ring, non-terminal heavy-atom bonds via bridge detection
+and does **not** exclude amide C-N bonds; the conventional RDKit/Lipinski definition does,
+and so does `obabel`. Swapping implementations silently changes which ligands are
+excluded.
 
-### Conformer preparation
+### Conformer preparation (stage 4, not yet implemented)
 
-Vina-family docking samples torsions but **not ring conformations or stereochemistry**,
-so the input conformer's ring pucker and stereo centres are fixed for the whole run.
-e-Drug3D's coordinates are of unknown provenance, and RDKit reports "tagged as 2D, but at
+Vina-family docking samples torsions but **not ring conformations or stereochemistry**, so
+the input conformer's ring pucker and stereo centres are fixed for the whole run.
+e-Drug3D's coordinates are of unknown provenance and RDKit reports "tagged as 2D, but at
 least one Z coordinate is not zero" for every record.
 
 **Minimise in place with MMFF94**, preserving the library's geometry and stereochemistry.
-Regenerate with ETKDG only for records that fail sanitisation, and log each one. Fix the
-2D/3D flag. One conformer per ligand suffices. Preparation is deterministic, done once,
-and the prepared library is hashed into the dock fingerprint.
+Regenerate with ETKDG only for records that fail sanitisation, and log each one. One
+conformer per ligand suffices. Preparation is deterministic, done once, and the prepared
+library is hashed into the dock fingerprint.
 
-This changes results relative to the smina baseline, so the smina-versus-Uni-Dock
-agreement figures below **must be re-measured after it**.
+This changes results relative to the smina baseline, so the agreement figures below
+**must be re-measured after it**.
 
 ## Docking engine: Uni-Dock 1.2.0 on GPU
 
@@ -167,30 +164,27 @@ PDBQTs, ligands and boxes.
 - **Agreement with smina: n=580, Pearson r=0.962, Spearman rho=0.951**, Uni-Dock
   +0.326 kcal/mol less negative. A shift of the score scale, not a redesign.
 - **Determinism is broken** (upstream issue #133, open since 2024-05): 95-98% of ligands
-  score differently across identical same-seed repeats, mean |delta| 0.07-0.13, max 1.202
-  kcal/mol, against a ~6.4 kcal/mol score range.
+  score differently across identical same-seed repeats, mean |delta| 0.07-0.13, max 1.202.
 
 | scope | GPU-hours | units (L4 @ 1.94/hr measured) |
 |---|---|---|
-| 164-protein panel, 1,960 ligands, 1 replicate | 15.7 | 30 |
-| all 7 subtypes, 1 replicate | 110.0 | 213 |
-| **all 7 subtypes, 5 replicates** | 550 | **1,067** |
+| 158-protein panel, 1,960 ligands, 1 replicate | 15.1 | 29 |
+| all 7 subtypes, 1 replicate | 106 | 206 |
+| **all 7 subtypes, 5 replicates** | 530 | **1,028** |
 
-Against a 1,600-unit balance (~67%), units expiring after 90 days. Caveat: the 7.0x
-subtype multiplier is an overestimate — AD subtypes have 78/88/132/21 input accessions
-against net1's 461 — so this errs safe.
+Against a 1,600-unit balance (~64%), units expiring after 90 days. The 7.0x subtype
+multiplier is an overestimate — AD subtypes have 78/88/132/21 input accessions against
+net1's 461 — so this errs safe.
 
 **Scores are means over 5 replicates with a reported standard error** (user, 2026-11-03).
 
-Unresolved, and it must be before the statistic is trusted: the SE must be derived from a
-proper standard deviation, not from mean |delta| / sqrt(N) (for a normal,
-E|X-Y| ~ 1.13 sigma). Replicate independence is unjustified while the root cause is
-unsettled — `--max_gpu_memory` is an engine flag `unidocktools` rejects, so the
-batch-composition hypothesis is untested. And **the statistic is a threshold count**:
-`min_targets` counts targets below a cutoff, so jitter near the cutoff flips
-classifications in a way averaging the score does not fix. The variance of the count is
-driven by how many ligand-target pairs sit within ~1 sigma of the threshold. No power
-statement exists.
+**Unresolved, and blocking the statistic.** The SE must be derived from a proper standard
+deviation, not from mean |delta| / sqrt(N) (for a normal, E|X-Y| ~ 1.13 sigma). Replicate
+independence is unjustified while the root cause is unsettled — `--max_gpu_memory` is an
+engine flag `unidocktools` rejects, so the batch-composition hypothesis is untested. And
+**the statistic is a threshold count**: `min_targets` counts targets below a cutoff, so
+jitter near the cutoff flips classifications in a way averaging the score does not fix. No
+power statement exists.
 
 ### Engine practical notes
 
@@ -204,7 +198,7 @@ statement exists.
 - **Never use Uni-Dock before 1.2.0**: earlier versions silently corrupted ~20% of results
   for boxes >= 30 A.
 
-## Statistics
+## Statistics (stage 6, open)
 
 The test is panel-wide. Three things must be right.
 
@@ -213,24 +207,23 @@ four hand-added names, one of which (ramucirumab) is an antibody that cannot be 
 Replace with current clinical-guideline systemic therapies (EASL/NCCN/ESMO) intersected
 with dockable small molecules present in e-Drug3D, reporting both counts. No approval-date
 cut. Exclude antibodies and metal complexes. Report targeted agents and cytotoxics
-**separately** — the set is bimodal and the halves carry opposite size biases.
-Alzheimer's is in scope and short enough to enumerate by hand.
+**separately** — the set is bimodal and the halves carry opposite size biases. Alzheimer's
+is in scope.
 
 **2. Ligand size and pocket geometry.** Library median is 25 heavy atoms against 31 for
-HCC drugs (apatinib 88th percentile, sorafenib 75th, fluorouracil 2nd). SMINA/Vina scoring
-is roughly additive over atoms, so the targeted agents clear any cutoff at an elevated rate
-for size reasons alone; the naive Fisher test would be significant against a random panel.
+HCC drugs (apatinib 88th percentile, sorafenib 75th, fluorouracil 2nd). Vina scoring is
+roughly additive over atoms, so targeted agents clear any cutoff at an elevated rate for
+size reasons alone; the naive Fisher test would be significant against a random panel.
 Add rotatable bonds alongside heavy-atom count.
 
-Two routes, and the choice is **not yet made**: residualise on a fitted
+Two routes, **not yet chosen**: residualise on a fitted
 `E[score | pocket geometry, ligand size]`, or match. Residualisation currently rests on a
 calibration that mismatches production on four axes — wrong engine (smina), wrong ligand
-geometry (unprepared), wrong sampling design (the document described `build_calib.py`'s
-maximin sample, which `build_calib2.py` supersedes with a box-volume-stratified one), and
-wrong ligand range. With 48 pockets and ~6 collinear descriptors the geometry term is
-weakly identified regardless. **Either re-run the calibration under production conditions
-or choose matching and say so.** Note that geometry descriptors are entangled with pocket
-similarity, so over-adjusting can remove signal.
+geometry (unprepared), wrong sampling design, wrong ligand range. With 48 pockets and ~6
+collinear descriptors the geometry term is weakly identified regardless. **Either re-run
+the calibration under production conditions, or choose matching and say so.** Note that
+geometry descriptors are entangled with pocket similarity, so over-adjusting can remove
+signal.
 
 **3. Multiple testing.** The legacy `score_threshold` x `min_targets` grid over three
 subtypes is thousands of tests and its best p-value is not a p-value. Either pre-register
@@ -239,65 +232,62 @@ the whole surface.
 
 ### The post hoc similarity test
 
-For each drug, take its hit set (targets beating the threshold) and compute a summary of
-pairwise pocket similarity within that set from `Pocketsim.csv`. Compare against
-permutation: random same-size target sets drawn from the panel, optionally matched on
-pocket volume. This is the test of the study's actual claim and needs no new docking.
+For each drug, take its hit set and summarise pairwise pocket similarity within it from
+`Pocketsim.csv`. Compare against permutation: random same-size target sets drawn from the
+panel, optionally matched on pocket volume. This needs no new docking.
 
 One inherited filter must be examined first: `parse_scores` (`similarity.py:714`) drops
 pairs with `Pmax == 1.0` as a "legacy filter". Since same-accession pairs are excluded
 separately, this discards *cross-protein* pairs with perfect similarity — the strongest
-possible evidence for the claim. Count them among the 537 eligible pockets before
+possible evidence for the claim. Count them among the 1,367 eligible pockets before
 inheriting the rule.
 
-### Positive control — a prerequisite, not optional
+### Positive control — a prerequisite
 
 The study would otherwise report cumulative sub-threshold binding on receptors that are
-57% AlphaFold models, with a new engine carrying an uncharacterised +0.33 kcal/mol offset,
+32% AlphaFold models, with a new engine carrying an uncharacterised +0.33 kcal/mol offset,
 and **nothing anchoring score to real binding**. The subtype gene lists do not contain the
 known targets of the approved HCC drugs, so that control is unavailable.
 
-**Redock co-crystallised ligands and check recovery.** `lig_name` is empty for all 11,599
-pockets, so the ligands must come from HETATM records in the already-downloaded mmCIFs —
-one parsing pass, no new downloads. This was previously filed as "later if wanted"; it is
-promoted to a prerequisite.
+**Redock co-crystallised ligands and check recovery.** The machinery exists: the Rg
+calibration labelled 687 experimental pockets by the drug-like ligand sitting in them,
+read from HETATM records in the already-downloaded extracted chains. Coordinates match the
+pocket files exactly, since `pockets.py` `_author_atoms` maps pdbfixer output back with
+0.001 A tolerance.
+
+**Caveat on that label:** absence of a co-crystal ligand does not mean a pocket is not
+druggable — most such structures were simply solved apo. The label is also biased toward
+large pockets, because a 12-60 heavy-atom ligand needs room, and toward well-studied
+targets, because crystallographers solve complexes for sites they already care about. It
+is a sanity check, not an optimisation target.
 
 ## Why the cluster layer was dropped
 
 An earlier design pre-grouped eligible pockets into Louvain communities at Pmax >= 0.7 and
-tested within them. On the **dockable** set (`reconcile.py`) that layer collapses:
+tested within them. On the dockable set that layer collapsed: 73 pockets / 84 edges became
+23 / 15; seven clusters became four, all at the 3-protein minimum; coverage fell from
+31/209 (15%) to 10/183 (5%). The mitotic and replication groups vanished.
 
-| | pre-cap (209-protein panel) | dockable (183) |
-|---|---|---|
-| cluster graph | 73 pockets, 84 edges | **23 pockets, 15 edges** |
-| clusters of >= 3 proteins | 7 | **4** |
-| panel coverage | 31/209 (15%) | **10/183 (5%)** |
-
-All four survivors are exactly 3 proteins, sitting on the minimum threshold. The
-mitotic/replication groups vanish entirely.
-
-Two further findings made the layer untenable even at its former size:
+Two findings made it untenable even at its former size:
 
 - **8 of 10 cluster proteins would have been docked at a pocket that is not the clustered
   pocket.** Clusters were defined over all eligible pockets while docking uses one pocket
-  per protein chosen by drugScore. The statistic would have measured binding to the wrong
-  site, severing the mechanism the study rests on.
+  per protein chosen by drugScore, so the statistic would have measured binding to the
+  wrong site.
 - The 7 former clusters held 46 protein-slots over 31 distinct proteins (CENPI in four),
   so the same score would have been reused across tests proposed as the multiple-testing
   unit, with no correction scheme.
 
-**The disappearing clusters are themselves informative.** The box cap removes large
-pockets, and the clusters that vanished were the obligate-complex subunits (kinetochore:
-NDC80, SPC24, SPC25, SKA1, CENPI, CENPK; pre-replication complex: CDC6, CDT1, ORC1,
-ORC6). For a monomeric AlphaFold model of a complex subunit, the largest compact
-high-drugScore groove is plausibly the **missing partner's binding surface**. Subunits of
-one complex sharing exposed interface geometry is exactly what that artifact predicts, so
-the earlier reading of their co-clustering as evidence of validity inverted the inference.
-The cap appears to act as an accidental interface-artifact filter.
+**The disappearance was informative.** What vanished were obligate-complex subunits
+(kinetochore: NDC80, SPC24, SPC25, SKA1, CENPI, CENPK; pre-replication complex: CDC6,
+CDT1, ORC1, ORC6). For a monomeric AlphaFold model of a complex subunit, the largest
+compact high-drugScore groove is plausibly the **missing partner's binding surface**.
+Subunits of one complex sharing exposed interface geometry is exactly what that artifact
+predicts, so reading their co-clustering as validation inverted the inference.
 
 **There is no control for interface pockets.** The AlphaFold controls target only
-oversized pockets. At 57% AF this remains an open exposure for the panel, and must be
-stated in Methods.
+oversized cavities. At 32% AF this is reduced but not eliminated, and must be stated in
+Methods.
 
 Two factual errors in the earlier cluster reading, withdrawn: NDC80 has no RWD domain
 (SPC24 and SPC25 do; NDC80 has a calponin-homology domain plus coiled coil), and the
@@ -305,36 +295,43 @@ homeobox proteins did not cluster separately.
 
 ## Goals, non-goals, anti-goals
 
-**Goals.** Panel defined by explicit published filters, with no reference to network
-topology or an anchor. Panel size a property of the filters. AlphaFold models retained
-with artifact control that works. Similarity used post hoc on results. Statistics
-corrected for ligand size, pocket geometry and multiple testing, with a positive control.
-No DoGSiteScorer rerun.
+**Goals.** Panel defined by explicit published filters with no reference to network
+topology. Panel size a property of the filters. AlphaFold models retained with artifact
+control that works. Similarity used post hoc on results. Statistics corrected for ligand
+size, pocket geometry and multiple testing, with a positive control. No DoGSiteScorer
+rerun.
 
-**Non-goals.** Hub or centrality selection in any form. Clustering or community detection
-of the similarity network — tested twice and dropped; do not reintroduce. Size-conditional
-edge thresholds. PAE-based AlphaFold filtering (record as a future option). Changes to
-PocketMatch or DoGSiteScorer invocation. Maybridge. Reconciling 2023 target counts.
+**Non-goals.** Hub or centrality selection. Clustering of the similarity network — tested
+twice, dropped; do not reintroduce. Size-conditional edge thresholds. Radius of gyration
+or sequence-segment compactness — measured to be wrong. PAE-based AlphaFold filtering
+(record as a future option). Changes to PocketMatch or DoGSiteScorer invocation.
+Maybridge. Reconciling 2023 target counts.
 
 **Anti-goals.** A panel whose size changes with pocket coverage. Any claim of biological
 grouping arising from selection. A significant p-value explainable by ligand size or
-pocket geometry. Silently dropping proteins — every exclusion is recorded with its reason.
+pocket geometry. Silently dropping proteins.
 
 ## Architecture
 
-### Stage ownership
+### Stage ownership and order
 
-| stage | change | why there |
-|---|---|---|
-| `uniprot` | TM segment positions into a **side file** `01_uniprot/tm.tsv` | re-running `uniprot` refreshes the PDB xref, which feeds `structures`, creating new chains and models that `pockets` would have to score — unrecoverable inside the DS2 licence window |
-| new annotation pass | `04_pockets/pocket_annotation.csv`: lining residues, segments, span, box dims, parent volume, AF pocket pLDDT | derivable from existing outputs, so DoGSiteScorer is never re-run; a sibling file keeps DS output pristine |
-| `similarity` | apply pocket filters when building the pocket table | cleans the reported network at source |
-| `select` | panel algorithm; same `final_targets.csv` schema | `dock` stays compatible |
-| `dock` | Uni-Dock, replicates, remote GPU | see below |
-| analysis notebook | the three statistical fixes plus the post hoc similarity test | where the inference lives |
+`ids -> uniprot -> structures -> fix -> pockets -> annotate -> select -> similarity -> dock`
+
+| stage | change |
+|---|---|
+| `uniprot` | TM segment positions into a **side file** `01_uniprot/tm.tsv` — re-running `uniprot` refreshes the PDB xref, which feeds `structures`, creating new chains and models that `pockets` would have to score. Unrecoverable inside the DS2 licence window |
+| **`annotate`** (new) | `04_pockets/annotation/pocket_annotation.csv`: lining residues (range-encoded), box dimensions, parent volume, AF pocket pLDDT, plus Rg/segments/span kept as descriptive columns only. Derivable from existing outputs, so DoGSiteScorer is never re-run |
+| `select` | panel filters; `final_targets.csv` (schema unchanged, so `dock` is unaffected), `eligible_pockets.csv`, `panel_funnel.tsv` |
+| `similarity` | **runs after `select`**, on the panel's eligible pockets |
+| `dock` | Uni-Dock, replicates, remote GPU — see `2026-11-03-dock-stage-gpu-design.md` |
+
+**`similarity` moved after `select`** because it no longer feeds selection. On net1 that
+is ~934,000 pairs instead of 67,169,845. The stage directory numbers now read
+`04_pockets -> 06_targets -> 05_similarity`; they are directory names, not semantics, and
+renumbering would invalidate every existing run folder.
 
 `Is_Hub` and `Similarity` in `final_targets.csv` are meaningless now; `dock` reads
-neither. Drop or blank them and document the choice.
+neither. They are retained empty for schema compatibility.
 
 ### Containers
 
@@ -343,29 +340,21 @@ multiarch**, because PocketMatch uses the upstream 32-bit binaries at commit 464
 64-bit build overflows). DoGSiteScorer is never in the image — host-licensed, fed through
 the `04_pockets/queue/` file queue. smina stays, reference-only.
 
-`polyphar-dock` (CUDA 12.x **runtime** base, stage 07) carries Uni-Dock, `unidock-tools`,
-RDKit for conformer prep, OpenBabel for receptor PDBQT.
+`polyphar-dock` (CUDA 12.x **runtime** base, stage 07) carries Uni-Dock,
+`unidock-tools`, RDKit for conformer prep, OpenBabel for receptor PDBQT.
 
 **On Colab, do not use the image.** VMs are ephemeral, so Apptainer would pull and flatten
 3-4 GB every session against a measured 31-second micromamba install. Three runtime paths:
-
-| host | mechanism |
-|---|---|
-| **Colab Pro+** (primary) | micromamba + a **pinned lockfile** |
-| TRUBA | Apptainer `.sif` from the image (persistent filesystem) |
-| RunPod / vast.ai | the Docker image directly |
-
-Reproducibility rests on the **lockfile**, which the image is also built from. Without it
-the Colab path drifts as conda-forge moves and replicate scores stop being comparable
-across sessions. For the TRUBA path the image must be Apptainer-safe: read-only rootfs, no
-fixed UID, every writable path in the bind-mounted run folder, no baked host paths,
-working under `apptainer run --nv`, built from a registry (`docker://`).
+Colab Pro+ (primary) via micromamba and a **pinned lockfile**; TRUBA via an Apptainer
+`.sif` from the image, on a persistent filesystem; RunPod/vast.ai via the Docker image
+directly. Reproducibility rests on the lockfile, which the image is also built from —
+without it the Colab path drifts as conda-forge moves and replicate scores stop being
+comparable across sessions.
 
 ### Remote GPU execution
 
-POSEIDON has no GPU, so stage 07 runs elsewhere. Data movement is not the constraint — a
-docking run needs only the selected targets' receptors and pockets, ~100 MB in and ~400 MB
-out per subtype, against 7.9 GB `02_structures` and 9.8 GB `04_pockets`.
+POSEIDON has no GPU. Data movement is not the constraint: ~100 MB in and ~400 MB out per
+subtype, against 7.9 GB `02_structures` and 9.8 GB `04_pockets`.
 
 **The Colab operating pattern is load-bearing.** `colab exec` reliably hangs the local
 client when driven from POSEIDON (three times out of three, once with
@@ -378,102 +367,33 @@ The Colab CLI needs **Python >= 3.12**; `colab upload` requires both local and r
 paths; the default `--auth` is `oauth2` despite the README, and `--auth adc` works from
 `gcloud auth application-default login --no-launch-browser`.
 
-**This is designed but not sized.** Production is 1,191 units over 614 GPU-hours on a
-client that hangs, under a ~24-hour session ceiling — roughly 26 attended session-days.
-TRUBA is the fallback and has never been sized: no partition, no queue wait, and no
-Apptainer build validated. Size one of them before committing.
+**This is designed but not sized.** Production is ~1,028 units over 530 GPU-hours on a
+client that hangs, under a ~24-hour session ceiling — roughly 22 attended session-days.
+TRUBA is the fallback and has never been sized: no partition, no queue wait, no validated
+Apptainer build.
 
-### Dock stage rework — designed separately
+## Open, and blocking
 
-**See `2026-11-03-dock-stage-gpu-design.md`.** It is a rewrite of the stage's execution
-model, not a parameter change, and it is the only stage with design risk left in it.
-Summary of what that document settles: the work unit becomes (target, replicate) over the
-whole library rather than a 50-ligand chunk, because Uni-Dock batches onto the GPU and is
-less efficient on small inputs; execution is session-sized export/run/merge round trips,
-because Colab VMs are ephemeral with no inbound network; and a `.done` marker can no
-longer certify *which* scores, only that a replicate was run, so resume must skip rather
-than redo. The notes below are the constraints it was written against.
-
-`dock.py` is built around a deterministic CLI engine and must change substantially:
-
-- A chunk's `.done` job key includes the smina version and assumes determinism. With a
-  non-deterministic engine and N replicates it needs a replicate index, and a `.done`
-  marker no longer certifies *which* scores.
-- `RESULT_COLUMNS = ["Pose", "SMINA_Score", "Ligand", "ID", "Pocket"]` has no replicate or
-  SE dimension.
-- `tests/test_stage_dock.py::test_cpu_and_chunk_invariance` **cannot pass** with Uni-Dock
-  and must be retired, along with `test_reproduces_2023_targets`.
-- `run`'s preflight checks `smina --version` and will exit 2 without it.
-- There is **no execution model for a remote GPU**. DoGSiteScorer was solved with an
-  explicit host queue and worker; this needs an equivalent — a queue protocol,
-  cross-host manifest reconciliation, and how the polling loop drives `polyphar dock`.
-
-If a `--targets` selector is added: pruning must be **additive** (out-of-scope labels are
-"not mine", not "obsolete"), because `_orphans()`/`_obsolete()` will otherwise move a
-previous selection's results. Note `_stage_fingerprint` already hashes `plan.targets`, so
-a selector changes the fingerprint on its own — resume will not short-circuit.
-
-### Provenance the dock manifest must record
-
-Image digest or lockfile hash; Uni-Dock and `unidock-tools` versions; CUDA version; **GPU
-model**; `search_mode`; `--batch_size`; **replicate index and seed**; prepared-library
-hash; per-score mean and SE across replicates.
-
-### SIFTS mapping — dropped
-
-An earlier version made this "the largest implementation risk": map experimental pocket
-residues to UniProt through SIFTS, to remove a cross-class bias in `segments <= 3`.
-Two measurements retired it.
-
-**The predicted bias ran the wrong way.** The reasoning was that pdbfixer models in
-missing loops, so experimental numbering is contiguous, so experimental pockets get fewer
-segments and the filter favours them. Measured: experimental pockets have **more**
-segments (median 5, mean 5.63) than AlphaFold ones (median 4, mean 4.33), and pass
-`segments <= 3` at 17.5% against 39.4%. Restoring the real gaps by mapping to UniProt
-would have pushed experimental counts higher still and **widened** the gap.
-
-**And it was unverifiable where it mattered.** `author_segments()` falls back to a
-seqres-derived range when PDB bounds are unusable, and that applies to **71% of eligible
-experimental pockets and 65% of experimental panel rows** — so the pdbfixer → author →
-UniProt chain breaks for roughly 213 of the 327 pockets the fix would have acted on.
-
-Switching to Rg removes the need entirely: it is coordinate-system independent, so there
-is nothing to map.
-
-Recorded for whoever revisits this: the cached SIFTS flat file **is** present at
-`02_structures/sifts/pdb_chain_uniprot.tsv.gz` and **does** carry `SP_BEG`/`SP_END`
-(the offset `Protein_info.csv` discards after `structures.py:182-191`), and
-`pockets.py` `_coord_key()`/`_author_atoms()` already maps pdbfixer output back to author
-numbering. So if a UniProt mapping is ever needed for another purpose, it is far more
-tractable than the earlier text claimed — the blocker is only the discarded `SP_BEG`.
-
-## Open, and blocking the statistic
-
-1. Residualisation or matching, and whether the calibration is re-run under production
+1. **Residualisation or matching**, and whether the calibration is re-run under production
    conditions.
-2. The SE derivation and a power statement for threshold flipping near the `min_targets`
-   cutoff.
-3. The `Pmax == 1.0` legacy filter — count what it discards before inheriting it.
-4. Positive-set source, if a curated list exists.
-5. `MITOTIC`'s provenance — a hardcoded 23-gene set in seven spikes, found nowhere else,
-   whose survival count was printed in the threshold sweeps that chose the filters. Any
-   enrichment claim depending on it is not independent evidence. Document or drop.
-6. Interface-pocket exposure at 68% AF.
+2. **The SE derivation and a power statement** for threshold flipping near the
+   `min_targets` cutoff.
+3. **The `Pmax == 1.0` legacy filter** — count what it discards before inheriting it.
+4. **Positive-set source**, if a curated list exists.
+5. **Interface-pocket exposure** at 32% AlphaFold.
+6. **Thresholds validated on net1 only.** `surf/vol <= 0.45` and the volume range have not
+   been checked on a second subtype, and net1 is the subtype whose 2023 gene list was
+   wrong. Only net1 has v2 pocket output; the DS2 licence expires 2026-11-16.
 
-## Staged implementation plan
+## Implementation status
 
-Each stage ends with verification before the next begins.
+| stage | state |
+|---|---|
+| 1. annotate | **done** — `polyphar/stages/annotate.py`, verified on real data |
+| 2. panel in select | **done** — `polyphar/panel.py` + rewritten `select.py` |
+| 3. similarity after select | **done** — runs on `eligible_pockets.csv` |
+| 4. ligand preparation | open, small |
+| 5. dock rework | **designed** (`2026-11-03-dock-stage-gpu-design.md`), not built; the large one |
+| 6. statistics | open, blocked on the decisions above |
 
-1. **Annotation pass** — `pocket_annotation.csv` from existing outputs: lining residues,
-   radius of gyration, box dimensions, parent-pocket volume, AF pocket pLDDT. No SIFTS.
-   Gates everything.
-2. **Panel in `select`** — filters, one row per protein, funnel counts, `failed.tsv`
-   reasons. Verify: reproduces 164 proteins / 537 pockets on net1.
-3. **Similarity-side filtering** — pocket filters before PocketMatch; re-check the ETA
-   model (537 eligible pockets give ~144k pairs against 67.2M).
-4. **Ligand preparation** — MMFF94 in place, deterministic, hashed.
-5. **Dock stage rework** — Uni-Dock, replicates, remote GPU execution model.
-6. **Statistics** — positive set, size/geometry adjustment, multiple testing, the post hoc
-   similarity test, the redocking positive control.
-
-Stage 1 is the natural starting point and depends on no open question above.
+Suite: 407 passed. `test_stage_dock.py` needs openbabel, absent on the dev laptop.
