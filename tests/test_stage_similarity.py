@@ -225,14 +225,16 @@ EXPECTED_POCKETSIM = """\
 0,P06493,CDK1_HUMAN,AF-P06493-F1,P_1,04_pockets/P06493/AF-P06493-F1.pdb_res_P_1.pdb,P53350,PLK1_HUMAN,4O56_A,P_1,04_pockets/P53350/P53350_4o56_A.pdb_res_P_1.pdb,0.853313,0.805152
 3,P48431,SOX2_HUMAN,6T90_A,P_3,04_pockets/P48431/P48431_6t90_A.pdb_res_P_3.pdb,P53350,PLK1_HUMAN,3P36_A,P_1_1,04_pockets/P53350/P53350_3p36_A.pdb_res_P_1_1.pdb,0.643077,0.135714
 2,O60218,AK1BA_HUMAN,4GAB_A,P_1,04_pockets/O60218/O60218_4gab_A.pdb_res_P_1.pdb,P49450,CENPA_HUMAN,6MUP_A,P_5,04_pockets/P49450/P49450_6mup_A.pdb_res_P_5.pdb,0.943333,0.028673
+5,O14746,TERT_HUMAN,AF-O14746-F1,P_1,04_pockets/O14746/AF-O14746-F1.pdb_res_P_1.pdb,P11388,TOP2A_HUMAN,AF-P11388-F1,P_25,04_pockets/P11388/AF-P11388-F1.pdb_res_P_25.pdb,1.0,0.008645
 1,P06493,CDK1_HUMAN,AF-P06493-F1,P_1,04_pockets/P06493/AF-P06493-F1.pdb_res_P_1.pdb,P53350,PLK1_HUMAN,4O56_A,P_5,04_pockets/P53350/P53350_4o56_A.pdb_res_P_5.pdb,0.714286,0.005018
 """
 
 
 def test_parse_scores_schema_and_filters(tmp_path):
     """8 net2 lines (names in on-disk chain case): kept AF-PDB and PDB-PDB pairs, a
-    same-UniProt pair, a Pmin == 1 pair, a Pmin == Pmax == 1 pair and a NULL____ row
-    (synthetic: no 2023 output has one; the format is what Step3-PM_serial prints)."""
+    cross-protein Pmin == 1 pair (kept), a same-UniProt pair, a same-UniProt
+    Pmin == Pmax == 1 pair and a NULL____ row (synthetic: no 2023 output has one; the
+    format is what Step3-PM_serial prints)."""
     pockets = pd.read_csv(FIX / "pm_scores_sample_DrugScore.csv", index_col=0)
     df = sim.parse_scores(FIX / "pm_scores_sample.txt", pockets,
                           FIX / "pm_scores_sample_Protein_info.csv")
@@ -240,6 +242,65 @@ def test_parse_scores_schema_and_filters(tmp_path):
     out = tmp_path / "Pocketsim.csv"
     df.to_csv(out)
     assert out.read_text() == EXPECTED_POCKETSIM
+
+
+def test_parse_scores_keeps_cross_protein_perfect_pairs():
+    """A cross-protein pair scoring Pmin == 1 survives; a same-UniProt perfect pair does
+    not. The 2023 script dropped every Pmin/Pmax == 1 pair as a deliberate filter of its
+    own (it had a working same-UniProt filter too, from 90f56f2 on). Since Pmin >= Pmax
+    always, that was effectively `Pmin != 1`, and it threw away real cross-protein
+    containment hits above the selection threshold (CDC25C P_4 inside PLK1 at Pmax 0.76).
+    Pmin == 1 alone means containment, not identity, so it is a weak signal on its own."""
+    pockets = pd.read_csv(FIX / "pm_scores_sample_DrugScore.csv", index_col=0)
+    df = sim.parse_scores(FIX / "pm_scores_sample.txt", pockets,
+                          FIX / "pm_scores_sample_Protein_info.csv")
+
+    perfect = df[(df["Pmin"] == 1) | (df["Pmax"] == 1)]
+    assert len(perfect) == 1
+    row = perfect.iloc[0]
+    assert (row["UniProt ID"], row["Pocket"]) == ("O14746", "P_1")
+    assert (row["UniProt ID_2"], row["Pocket_2"]) == ("P11388", "P_25")
+    assert row["Pmin"] == 1.0
+
+    # the same-UniProt Pmin == Pmax == 1 line (P15559 AF model vs its own 5fuq chain)
+    # is still excluded, by the cross-protein test alone.
+    assert not (df["UniProt ID"] == df["UniProt ID_2"]).any()
+    assert "P15559" not in set(df["UniProt ID"]) | set(df["UniProt ID_2"])
+
+
+def test_parse_scores_drops_chimeric_chain_self_comparison(tmp_path):
+    """A chain SIFTS maps to two accessions is extracted into both accession folders, so
+    out_names() prefixes the accession and the same physical pocket appears twice under
+    different accessions. That pair is cross-protein by UniProt ID but identical atoms
+    (Pmin == Pmax == 1): it must be dropped on the shared chain stem. A cross-protein pair
+    with different stems is unaffected."""
+    pockets = pd.DataFrame([
+        {"UniProt ID": "P11111", "Gene Name": "AAA_HUMAN", "Protein": "4ABC_A",
+         "Pocket": "P_1", "drugScore": 0.9,
+         "Pocket Filename": "P11111_4abc_A.pdb_res_P_1.pdb"},
+        {"UniProt ID": "Q22222", "Gene Name": "BBB_HUMAN", "Protein": "4ABC_A",
+         "Pocket": "P_1", "drugScore": 0.9,
+         "Pocket Filename": "Q22222_4abc_A.pdb_res_P_1.pdb"},
+        {"UniProt ID": "Q33333", "Gene Name": "CCC_HUMAN", "Protein": "5XYZ_B",
+         "Pocket": "P_2", "drugScore": 0.8,
+         "Pocket Filename": "Q33333_5xyz_B.pdb_res_P_2.pdb"},
+    ])
+    info = pd.DataFrame([{"UniProt ID": a, "Gene Name": g} for a, g in
+                         (("P11111", "AAA_HUMAN"), ("Q22222", "BBB_HUMAN"),
+                          ("Q33333", "CCC_HUMAN"))])
+    score_file = tmp_path / "PocketMatch_score.txt"
+    score_file.write_text(
+        "P11111_4abc_A.pdb_res_P_1.pdb___ Q22222_4abc_A.pdb_res_P_1.pdb___ "
+        "1.000000 1.000000      351      351      351\n"
+        "P11111_4abc_A.pdb_res_P_1.pdb___ Q33333_5xyz_B.pdb_res_P_2.pdb___ "
+        "0.600000 0.400000      351      500      210\n")
+
+    df = sim.parse_scores(score_file, pockets, info)
+
+    assert len(df) == 1
+    row = df.iloc[0]
+    assert (row["UniProt ID"], row["UniProt ID_2"]) == ("P11111", "Q33333")
+    assert (row["Protein"], row["Protein_2"]) == ("4ABC_A", "5XYZ_B")
 
 
 def test_parse_scores_rejects_unknown_names(tmp_path):

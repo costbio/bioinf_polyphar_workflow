@@ -671,9 +671,29 @@ def _gene_names(protein_info) -> dict[str, str]:
 def parse_scores(score_file, pockets, protein_info):
     """The Pocketsim table from a PocketMatch score file. `pockets` is the DrugScore table
     of the scored pockets (UniProt ID, Gene Name, Protein, Pocket, Pocket Filename);
-    every name in the file must be one of its Pocket Filenames. Legacy filters: drop
-    NULL____ scores, Pmin or Pmax == 1, and same-UniProt pairs. Rows are sorted by Pmax
-    descending (stable); the index is the 0-based line number in the score file.
+    every name in the file must be one of its Pocket Filenames. Filters: drop NULL____
+    scores, same-UniProt pairs, and pairs on the same chain stem (the Protein column) --
+    a chimeric chain SIFTS maps to two accessions is extracted into both accession
+    folders, so the same physical atoms appear twice under different accessions and would
+    otherwise self-compare at Pmin == Pmax == 1. Rows are sorted by Pmax descending
+    (stable); the index is the 0-based line number in the score file.
+
+    The 2023 script (394a337) also dropped every pair with Pmin == 1 or Pmax == 1,
+    alongside a working `UniProt ID != UniProt ID_2` filter (added in 90f56f2); only the
+    very first version, c2132f0, lacked that filter. So the == 1 drop was a deliberate
+    filter of its own, not a self-comparison workaround. It is gone because, measured over
+    every 2023 PocketMatch_score.txt on the drive, it discarded real cross-protein
+    containment hits above the selection threshold -- e.g. CDC25C `P30307_3bzi_a` P_4
+    against PLK1 `P53350_5j19_a` P_5, 210 of 276 elements matched, Pmin 1.0 but
+    Pmax 0.76, present in net1 and net2.
+
+    Caveat for anyone reading the output: because PocketMatch normalises Pmin by the
+    smaller pocket and Pmax by the larger, Pmin >= Pmax always, so Pmax == 1 implies
+    Pmin == 1 and the old mask was effectively just `Pmin != 1`. No cross-protein
+    Pmax == 1 pair exists in any 2023 subtype, and most of the ~49.6k restored rows are
+    degenerate containment (a 3-element pocket inside a 682,696-element AlphaFold
+    whole-surface blob at Pmax 4e-06). Pmin == 1 on its own is therefore a near-meaningless
+    similarity signal; judge pairs on Pmax.
 
     Memory: the file is streamed into integer pocket codes and float scores (24 bytes a
     line); the per-pocket text columns are categoricals over the pocket table."""
@@ -713,8 +733,12 @@ def parse_scores(score_file, pockets, protein_info):
 
     accs = np.asarray([str(x) for x in pockets["UniProt ID"]], dtype=object)
     acc_code, _ = pd.factorize(accs)
-    keep = (~np.isnan(pmin) & ~np.isnan(pmax) & (pmin != 1) & (pmax != 1)
-            & (acc_code[a] != acc_code[b]))
+    # A chimeric chain is extracted once per accession, so two accessions sharing a chain
+    # stem (<pdb>_<chain>, or AF-<acc>-F1, which cannot collide) are the same atoms.
+    stems = np.asarray([str(x) for x in pockets["Protein"]], dtype=object)
+    stem_code, _ = pd.factorize(stems)
+    keep = (~np.isnan(pmin) & ~np.isnan(pmax)
+            & (acc_code[a] != acc_code[b]) & (stem_code[a] != stem_code[b]))
     idx = np.flatnonzero(keep)
     idx = idx[np.argsort(-pmax[idx], kind="stable")]
     ia, ib = a[idx], b[idx]
