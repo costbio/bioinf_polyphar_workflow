@@ -18,7 +18,7 @@ from polyphar.stages.annotate import encode_residues
 
 
 def _args(**kw):
-    base = dict(rg_max=8.5, volume_min=300.0, volume_max=2000.0, drugscore_min=0.5,
+    base = dict(surf_vol_max=0.45, volume_min=300.0, volume_max=1500.0, drugscore_min=0.5,
                 plddt_min=70.0, tm_policy="C", tm_overlap=0.10, exclude=["O15350"],
                 no_fetch_tm=True)
     base.update(kw)
@@ -49,9 +49,9 @@ def _make_run(tmp_path, drugscore_rows, annotation_rows, protein_info_rows, tm=N
 
     write(run / "04_pockets" / "DrugScore.csv", drugscore_rows,
           ["UniProt ID", "Gene Name", "Protein", "Pocket", "Pocket Filename",
-           "volume", "drugScore", "Selected"])
+           "volume", "drugScore", "surf/vol", "Selected"])
     write(run / "04_pockets" / "annotation" / "pocket_annotation.csv", annotation_rows,
-          ["Pocket Filename", "AlphaFold", "radius_of_gyration", "pocket_plddt_mean",
+          ["Pocket Filename", "AlphaFold", "pocket_plddt_mean",
            "box_size_x", "box_size_y", "box_size_z", "residues"])
     write(run / "02_structures" / "Protein_info.csv", protein_info_rows,
           ["UniProt ID", "PDB", "Chain ID", "AlphaFold", "File"])
@@ -60,15 +60,14 @@ def _make_run(tmp_path, drugscore_rows, annotation_rows, protein_info_rows, tm=N
     return RunLayout(run)
 
 
-def _ds(acc, protein, pocket, fname, vol=800.0, ds=0.9):
+def _ds(acc, protein, pocket, fname, vol=800.0, ds=0.9, sv=0.40):
     return {"UniProt ID": acc, "Gene Name": f"{acc}G_HUMAN", "Protein": protein,
             "Pocket": pocket, "Pocket Filename": fname, "volume": str(vol),
-            "drugScore": str(ds), "Selected": "True"}
+            "drugScore": str(ds), "surf/vol": str(sv), "Selected": "True"}
 
 
-def _an(fname, af=True, rg=6.0, plddt=90.0, residues=(10, 11, 12)):
+def _an(fname, af=True, plddt=90.0, residues=(10, 11, 12)):
     return {"Pocket Filename": fname, "AlphaFold": str(af),
-            "radius_of_gyration": str(rg),
             "pocket_plddt_mean": "" if plddt is None else str(plddt),
             "box_size_x": "18", "box_size_y": "18", "box_size_z": "18",
             "residues": encode_residues(list(residues))}
@@ -156,9 +155,9 @@ def test_run_writes_the_panel_the_funnel_and_a_reason_per_rejection(tmp_path):
     ds_rows = [
         _ds("P1", "AF-P1-F1", "P_1", "a.pdb"),                 # kept
         _ds("P2", "AF-P2-F1", "P_1", "b.pdb", vol=5000.0),     # rejected: volume
-        _ds("P3", "AF-P3-F1", "P_1", "c.pdb"),                 # rejected: rg
+        _ds("P3", "AF-P3-F1", "P_1", "c.pdb", sv=0.90),        # rejected: enclosure
     ]
-    anns = [_an("a.pdb"), _an("b.pdb"), _an("c.pdb", rg=20.0)]
+    anns = [_an("a.pdb"), _an("b.pdb"), _an("c.pdb")]
     info = [{"UniProt ID": a, "PDB": "", "Chain ID": "A", "AlphaFold": "True",
              "File": f"02_structures/{a}/AF-{a}-F1.pdb"} for a in ("P1", "P2", "P3")]
     layout = _make_run(tmp_path, ds_rows, anns, info)
@@ -176,11 +175,12 @@ def test_run_writes_the_panel_the_funnel_and_a_reason_per_rejection(tmp_path):
 
     failed = (layout.targets / "failed.tsv").read_text().strip().splitlines()
     assert len(failed) == 3                                     # header + 2 rejections
-    assert any("volume" in l for l in failed) and any("gyration" in l for l in failed)
+    assert any("volume" in l for l in failed)
+    assert any("surface-to-volume" in l for l in failed)
 
     manifest = json.loads((layout.targets / "manifest.json").read_text())
     assert manifest["counts"]["panel"] == 1
-    assert manifest["args"]["rg_max"] == 8.5
+    assert manifest["args"]["surfvol_max"] == 0.45
 
 
 def test_excluded_accessions_are_dropped_and_recorded(tmp_path):

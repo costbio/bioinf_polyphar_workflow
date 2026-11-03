@@ -54,9 +54,10 @@ NO_CHAIN = "-"   # a PDB-style Protein field without a chain
 
 def add_arguments(parser) -> None:
     p = panel_mod
-    parser.add_argument("--rg-max", type=float, default=p.RG_MAX, metavar="A",
-                        help=f"pocket radius-of-gyration cutoff, the compactness "
-                             f"criterion (default: {p.RG_MAX})")
+    parser.add_argument("--surf-vol-max", type=float, default=p.SURFVOL_MAX,
+                        metavar="R",
+                        help=f"pocket surface-to-volume cutoff, the enclosure criterion "
+                             f"(default: {p.SURFVOL_MAX}); lower is more enclosed")
     parser.add_argument("--volume-min", type=float, default=p.VOLUME_MIN, metavar="V")
     parser.add_argument("--volume-max", type=float, default=p.VOLUME_MAX, metavar="V")
     parser.add_argument("--drugscore-min", type=float, default=p.DRUGSCORE_MIN, metavar="S")
@@ -85,7 +86,7 @@ def _options(args) -> panel_mod.Options:
         volume_min=getattr(args, "volume_min", panel_mod.VOLUME_MIN),
         volume_max=getattr(args, "volume_max", panel_mod.VOLUME_MAX),
         plddt_min=getattr(args, "plddt_min", panel_mod.PLDDT_MIN),
-        rg_max=getattr(args, "rg_max", panel_mod.RG_MAX),
+        surfvol_max=getattr(args, "surf_vol_max", panel_mod.SURFVOL_MAX),
         tm_policy=getattr(args, "tm_policy", "C"),
         tm_overlap_max=getattr(args, "tm_overlap", panel_mod.TM_OVERLAP_MAX),
     )

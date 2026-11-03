@@ -28,6 +28,10 @@ Run order (each needs the previous one's cached JSON in `~/scratch_clust`):
 | `bias_check.py` | the `segments<=3` cross-class bias runs the WRONG way: AF 39.4% vs exp 17.5% |
 | `spatial.py` | spatial compactness candidates at matched stringency; Rg gap 1.5 pts vs 21.9 |
 | `reconcile2.py` | **authoritative**: Rg<=8.5 panel — 164 proteins / 537 pockets / 57% AF |
+| `rg_calibrate.py` | **the decisive one**: Rg<=8.5 keeps only 8% of pockets with a co-crystal ligand |
+| `discriminate.py` | AUC per descriptor against ligand occupancy; drugScore 0.684 vs volume 0.851 |
+| `surfvol.py` | surf/vol does NOT reject the oversized cavities (0.539 vs 0.510); volume does |
+| `panel_v2.py` | the surf/vol x volume-ceiling sweep behind the 0.45 / 1500 choice |
 | `ligsize.py` | eDrug3D size/flexibility profile; the `rot>15 OR MW>900` dockability filter |
 | `boxeff.py` | docking-box volume per pocket (NOTE: its default PAD=4 is wrong -- dock.py pads nothing) |
 | `gpsbox.py` | cavity (`_gps_`) vs residue-envelope (`_res_`) box; shows cavity boxes are WORSE |

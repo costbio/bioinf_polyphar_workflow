@@ -7,14 +7,14 @@ from polyphar import panel
 from polyphar.stages.annotate import encode_residues
 
 
-def _row(acc="P1", pocket="P_1", fname=None, ds=0.9, vol=800.0):
+def _row(acc="P1", pocket="P_1", fname=None, ds=0.9, vol=800.0, sv=0.40):
     return {"UniProt ID": acc, "Gene Name": "G_HUMAN", "Protein": "AF-P1-F1",
             "Pocket": pocket, "Pocket Filename": fname or f"AF-P1-F1_res_{pocket}.pdb",
-            "drugScore": str(ds), "volume": str(vol)}
+            "drugScore": str(ds), "volume": str(vol), "surf/vol": str(sv)}
 
 
-def _ann(af=True, rg=6.0, plddt=90.0, size=(18.0, 18.0, 18.0), residues=(10, 11, 12)):
-    return {"AlphaFold": str(af), "radius_of_gyration": str(rg),
+def _ann(af=True, plddt=90.0, size=(18.0, 18.0, 18.0), residues=(10, 11, 12)):
+    return {"AlphaFold": str(af),
             "pocket_plddt_mean": "" if plddt is None else str(plddt),
             "box_size_x": str(size[0]), "box_size_y": str(size[1]),
             "box_size_z": str(size[2]),
@@ -30,9 +30,9 @@ OPTS = panel.Options()
     ({"ds": 0.4}, {}, "drugscore"),
     ({"vol": 250.0}, {}, "volume"),
     ({"vol": 2500.0}, {}, "volume"),
+    ({"sv": 0.80}, {}, "surfvol"),
     ({}, {"plddt": 60.0}, "plddt"),
     ({}, {"plddt": None}, "plddt"),
-    ({}, {"rg": 9.0}, "rg"),
     ({}, {"size": (50.0, 10.0, 10.0)}, "grid"),      # 134 points on one axis
 ])
 def test_each_filter_rejects_at_its_own_step(kw, ann_kw, expect):
@@ -50,11 +50,17 @@ def test_subpocket_of_an_oversized_parent_is_rejected():
     assert panel.classify(r, _ann(), [], 25840.0, OPTS) == "subpocket_parent"
 
 
-def test_rg_is_checked_before_the_grid_guard():
-    """Rg bounds the box, so a pocket failing both must be attributed to Rg — otherwise
-    the funnel would credit the grid guard with work Rg already did."""
-    assert panel.classify(_row(), _ann(rg=20.0, size=(60.0, 60.0, 60.0)),
-                          [], None, OPTS) == "rg"
+def test_enclosure_is_checked_before_the_tm_rule():
+    """Order matters for the funnel: a pocket failing both must be attributed to the
+    first step, or the counts stop forming a chain."""
+    assert panel.classify(_row(sv=0.9), _ann(), [(5, 25)], None, OPTS) == "surfvol"
+
+
+def test_volume_ceiling_is_what_rejects_oversized_cavities():
+    """surf/vol does not separate them (0.539 against 0.510 for all pockets); volume
+    does (~2,600 A^3 against ~270). The two filters do different jobs."""
+    oversized = _row(vol=2600.0, sv=0.539)
+    assert panel.classify(oversized, _ann(), [], None, OPTS) == "volume"
 
 
 class TestTMPolicies:
@@ -94,8 +100,6 @@ class TestTMPolicies:
 def test_funnel_is_a_chain_that_sums():
     rows = [_row(acc="A", ds=0.4), _row(acc="B", vol=99.0), _row(acc="C")]
     anns = {r["Pocket Filename"]: _ann() for r in rows}
-    for r in rows:
-        anns[r["Pocket Filename"]] = _ann()
     pan, elig, funnel, rej = panel.select_panel(rows, anns, {}, {}, OPTS)
     assert funnel[0] == ("selected", 3)
     assert [s for s, _ in funnel][1:] == panel.STEPS
@@ -148,9 +152,9 @@ def test_subpocket_parent_lookup_does_not_cross_structures():
     must not be judged against the large one's parent."""
     rows = [{"UniProt ID": "P1", "Gene Name": "G_HUMAN", "Protein": "1ABC_A",
              "Pocket": "P_1_1", "Pocket Filename": "1abc_A_res_P_1_1.pdb",
-             "drugScore": "0.9", "volume": "800"}]
+             "drugScore": "0.9", "volume": "800", "surf/vol": "0.40"}]
     anns = {"1abc_A_res_P_1_1.pdb": _ann(af=False, plddt=None)}
-    volumes = {("P1", "1ABC_A", "P_1"): 900.0,       # its real parent: fine
+    volumes = {("P1", "1ABC_A", "P_1"): 1200.0,      # its real parent: under the ceiling
                ("P1", "AF-P1-F1", "P_1"): 25840.0}   # another structure's: irrelevant
     pan, _, _, rej = panel.select_panel(rows, anns, {}, volumes, OPTS)
     assert len(pan) == 1 and not rej

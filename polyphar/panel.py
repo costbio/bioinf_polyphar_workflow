@@ -6,36 +6,46 @@ happened to be processed rather than of biology, and anchored everything on one 
 chosen by network topology. Pocket similarity is no longer used to select targets at
 all; it is applied post hoc to the docking results.
 
-The filters, in the order the funnel reports them:
+Choosing the filters
+--------------------
+An earlier version filtered on radius of gyration and on a count of sequence segments.
+Both were invented thresholds laid on top of DoGSiteScorer's trained druggability score,
+and neither was checked against anything. Calibrating them against pockets holding a
+co-crystallised drug-like ligand (687 of 8,005 experimental net1 pockets) showed
+`Rg <= 8.5` kept only **8%** of pockets known to bind a drug while keeping 69% of the
+rest — anti-enriching roughly eightfold, because the lining-residue envelope of a real
+binding site is large, not small. Both were removed, along with a separate box cap.
 
-  drugScore >= 0.5          DoGSiteScorer 2 selection, as in 2023
-  300 <= volume <= 2000     the UPPER bound is new. drugScore rewards large pockets and
-                            has no ceiling, so oversized interdomain clefts dominated the
-                            old network: the top-degree AlphaFold pockets averaged 90
-                            lining residues across 7 sequence segments at 2,809 A^3,
-                            against 16 / 3 / 363 for a typical one.
-  subpocket parent <= 2000  DoGSiteScorer emits P_n and P_n_m. Without this a 1,500 A^3
-                            subpocket of a 25,840 A^3 cleft passes the volume ceiling and
-                            becomes its protein's representative, defeating it entirely.
-  AF pocket pLDDT >= 70     a sanity floor only. pLDDT does NOT detect the oversized
-                            cavities (top-degree AF pockets average 84.8 against 83.3
-                            overall) because it is local per-residue confidence, not
-                            domain packing; PAE would be the right metric.
-  TM policy                 see tm_reject(). The artifact is multi-pass proteins, whose
-                            single extracted chains yield lipid-facing grooves and pore
-                            lumens.
-  radius of gyration <= 8.5 the compactness criterion, measured in SPACE. A
-                            sequence-segment count was tried first and is provenance-
-                            biased: pdbfixer renumbers experimental chains 1..N with
-                            missing loops modelled in, while AlphaFold pockets carry
-                            UniProt positions, so `segments <= 3` passed AF pockets at
-                            39.4% against 17.5% for experimental ones. Rg closes that
-                            21.9-point gap to 1.5, and bounds the docking box as a side
-                            effect, so no separate box cap is needed.
-  Uni-Dock grid legal       <=128 grid points per axis and <=531,441 in total at 0.375 A.
-                            The engine exits on a violation; versions before 1.2.0
-                            silently corrupted results instead. Removes nothing once Rg
-                            is applied, and is kept as a guard.
+The filters below are chosen on physical grounds and stated plainly, rather than tuned to
+net1, which is one subtype with a known-bad history.
+
+  drugScore          DoGSiteScorer's trained druggability SVM: the field-standard answer
+                     to this question. NOTE: DrugScore.csv's `Selected` column already
+                     means drugScore >= 0.5, so at the default this step is inherited
+                     from `pockets` and constrains nothing further. Raise it above 0.5
+                     for it to do work.
+  volume 300-1500    the cited druggable range is ~300-1000 A^3, with stricter criteria
+                     near 1000; 1500 is a deliberate allowance above it. The ceiling is
+                     what rejects the oversized interdomain cavities that dominated the
+                     old network — those run ~2,600 A^3 against ~270 for a typical
+                     pocket. At this setting 2 of the 100 worst survive.
+  subpocket parent   without it, a subpocket carved from a 25,840 A^3 cleft passes the
+                     ceiling and becomes its protein's representative.
+  AF pocket pLDDT    a sanity floor only. pLDDT does NOT detect the oversized cavities
+                     (the worst average 84.8 against 83.3 overall): it is local
+                     per-residue confidence, not domain packing. PAE would be the right
+                     metric.
+  surf/vol <= 0.45   enclosure. Low means enclosed, high splayed open. Pockets holding a
+                     co-crystal ligand sit at a median 0.410 against 0.510 for all
+                     pockets, so this enriches for binding-site-like shape. It does NOT
+                     reject the oversized cavities (those are 0.539, barely
+                     distinguishable) — volume does that. The two filters do different
+                     jobs. The threshold has no literature value; it is placed near the
+                     observed ligand-bound centre, and Methods should say so.
+  TM policy          see tm_reject(). The artifact is multi-pass proteins, whose single
+                     extracted chains yield lipid-facing grooves and pore lumens.
+  Uni-Dock grid      a guard, not a selector: the engine exits on a violation, and
+                     versions before 1.2.0 silently corrupted results instead.
 
 One row per protein: the eligible pocket with the highest drugScore, ties broken by the
 smallest pocket name so the result never depends on row order.
@@ -47,10 +57,10 @@ import math
 
 DRUGSCORE_MIN = 0.5
 VOLUME_MIN = 300.0
-VOLUME_MAX = 2000.0
-PARENT_VOLUME_MAX = 2000.0
+VOLUME_MAX = 1500.0
+PARENT_VOLUME_MAX = 1500.0
 PLDDT_MIN = 70.0
-RG_MAX = 8.5
+SURFVOL_MAX = 0.45
 TM_OVERLAP_MAX = 0.10
 SPACING = 0.375
 MAX_AXIS = 128
@@ -59,16 +69,14 @@ TM_POLICIES = ("A", "B", "C")
 
 # The funnel steps, in order. Each pocket is attributed to the FIRST step it fails, so
 # the counts form a chain and sum correctly.
-STEPS = [
-    "drugscore", "volume", "subpocket_parent", "plddt", "tm", "rg", "grid",
-]
+STEPS = ["drugscore", "volume", "subpocket_parent", "plddt", "surfvol", "tm", "grid"]
 STEP_REASON = {
     "drugscore": "drugScore below the cutoff",
     "volume": "pocket volume outside the allowed range",
     "subpocket_parent": "subpocket of a parent above the volume ceiling",
     "plddt": "AlphaFold pocket pLDDT below the floor",
     "tm": "rejected by the transmembrane policy",
-    "rg": "radius of gyration above the compactness cutoff",
+    "surfvol": "surface-to-volume ratio above the enclosure cutoff",
     "grid": "docking box exceeds Uni-Dock's grid limits",
 }
 
@@ -78,7 +86,7 @@ class Options:
 
     def __init__(self, drugscore_min=DRUGSCORE_MIN, volume_min=VOLUME_MIN,
                  volume_max=VOLUME_MAX, parent_volume_max=PARENT_VOLUME_MAX,
-                 plddt_min=PLDDT_MIN, rg_max=RG_MAX, tm_policy="C",
+                 plddt_min=PLDDT_MIN, surfvol_max=SURFVOL_MAX, tm_policy="C",
                  tm_overlap_max=TM_OVERLAP_MAX, spacing=SPACING):
         if tm_policy not in TM_POLICIES:
             raise ValueError(f"tm_policy must be one of {TM_POLICIES}, got {tm_policy!r}")
@@ -87,7 +95,7 @@ class Options:
         self.volume_max = float(volume_max)
         self.parent_volume_max = float(parent_volume_max)
         self.plddt_min = float(plddt_min)
-        self.rg_max = float(rg_max)
+        self.surfvol_max = float(surfvol_max)
         self.tm_policy = tm_policy
         self.tm_overlap_max = float(tm_overlap_max)
         self.spacing = float(spacing)
@@ -154,12 +162,12 @@ def classify(row, ann, tm_segments, parent_volume, opts) -> str | None:
         pl = _f(ann.get("pocket_plddt_mean"))
         if pl is None or pl < opts.plddt_min:
             return "plddt"
+    sv = _f(row.get("surf/vol"))
+    if sv is None or sv > opts.surfvol_max:
+        return "surfvol"
     residues = ann.get("_residues") or []
     if tm_reject(is_af, tm_segments, residues, opts):
         return "tm"
-    rg = _f(ann.get("radius_of_gyration"))
-    if rg is None or rg > opts.rg_max:
-        return "rg"
     size = [_f(ann.get(f"box_size_{k}"), 0.0) for k in "xyz"]
     if not grid_legal(size, opts.spacing):
         return "grid"
