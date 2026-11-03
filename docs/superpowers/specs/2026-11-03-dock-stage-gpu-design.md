@@ -106,7 +106,7 @@ reproducibility claim — and the design must not imply otherwise.
 Per target, keep both the raw draws and the summary:
 
 ```
-07_docking/<label>/replicates/r0.csv .. r4.csv    raw: ID, Ligand, best_score
+07_docking/<label>/replicates/r0.csv .. r2.csv    raw: ID, Ligand, best_score
 07_docking/<label>/chunks/r<i>.done               unit markers (job key)
 07_docking/df_results_<label>.csv                 merged summary
 ```

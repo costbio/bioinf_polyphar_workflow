@@ -223,6 +223,11 @@ power statement exists.
 
 ## Statistics (stage 6, open)
 
+**Designed in full in `2026-11-03-statistics-design.md`.** That document supersedes
+points 1-3 below: within-target rank normalisation replaces the residualise-or-match
+choice, mean percentile replaces the threshold count, and the cross-indication arm
+supplies the missing negative control. What follows is the problem statement it solves.
+
 The test is panel-wide. Three things must be right.
 
 **1. The positive set.** Currently an exact string match on one `indications` value plus
