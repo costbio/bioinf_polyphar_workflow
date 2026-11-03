@@ -40,6 +40,12 @@ grid_points_0375, grid_legal_0375
 parent_volume
     for a subpocket `P_n_m`, the volume of its parent `P_n`, so a subpocket carved out
     of an oversized cleft can be rejected. Empty for a top-level pocket.
+residues
+    the lining residue numbers, range-encoded (`10-15,30,45-50`). Carried so the TM
+    pocket-overlap rule can be evaluated in `select` without re-reading 11,599 pocket
+    files. For an AlphaFold model these are UniProt positions; for an experimental
+    chain they are pdbfixer numbering, which is why they are usable for the AF-only
+    overlap check but not for a cross-class comparison.
 pocket_plddt_mean, pocket_plddt_min
     mean and minimum pLDDT over lining residues, for AlphaFold models only, read back
     from the model in 02_structures because DoGSiteScorer zeroes the B-factor column in
@@ -71,7 +77,7 @@ COLUMNS = [
     "n_atoms", "n_residues", "radius_of_gyration", "segments", "span",
     "box_center_x", "box_center_y", "box_center_z",
     "box_size_x", "box_size_y", "box_size_z", "box_max_dim", "box_volume",
-    "grid_points_0375", "grid_legal_0375", "parent_volume",
+    "grid_points_0375", "grid_legal_0375", "parent_volume", "residues",
     "pocket_plddt_mean", "pocket_plddt_min",
 ]
 
@@ -148,6 +154,36 @@ def residue_plddt(model_pdb):
     return out
 
 
+def encode_residues(res) -> str:
+    """[10,11,12,30,45,46] -> '10-12,30,45-46'. Compact, and round-trips exactly."""
+    if not res:
+        return ""
+    out, start, prev = [], res[0], res[0]
+    for r in res[1:]:
+        if r == prev + 1:
+            prev = r
+            continue
+        out.append(f"{start}-{prev}" if start != prev else f"{start}")
+        start = prev = r
+    out.append(f"{start}-{prev}" if start != prev else f"{start}")
+    return ",".join(out)
+
+
+def decode_residues(text: str) -> list[int]:
+    """Inverse of encode_residues."""
+    out = []
+    for part in str(text).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part[1:]:
+            a, b = part.rsplit("-", 1)
+            out.extend(range(int(a), int(b) + 1))
+        else:
+            out.append(int(part))
+    return out
+
+
 def receptor_stem(pocket_filename: str) -> str:
     """`8vut_A_res_P_1.pdb` -> `8vut_A`; `AF-P1-F1_res_P_2.pdb` -> `AF-P1-F1`."""
     return pocket_filename.split("_res_P")[0]
@@ -201,6 +237,7 @@ def annotate_one(row: dict, pockets_dir: str, structures_dir: str,
         "grid_points_0375": total,
         "grid_legal_0375": legal,
         "parent_volume": "" if parent_volume is None else round(parent_volume, 2),
+        "residues": encode_residues(res),
         "pocket_plddt_mean": pl_mean,
         "pocket_plddt_min": pl_min,
     }
@@ -223,23 +260,27 @@ def _selected(layout) -> list[dict]:
 
 
 def _parent_volumes(layout) -> dict:
-    """{(accession, pocket id): volume} over every pocket, for the subpocket rule."""
+    """{(accession, protein, pocket id): volume} over every pocket, for the subpocket
+    rule. The key MUST include the structure: `P_1` exists for every structure of an
+    accession, so keying on (accession, pocket) alone silently returns some other
+    structure's pocket volume."""
     out = {}
     with open(layout.drugscore_csv, newline="", encoding="utf-8") as fh:
         for r in csv.DictReader(fh):
             try:
-                out[(r["UniProt ID"], r["Pocket"])] = float(r["volume"])
+                out[(r["UniProt ID"], r["Protein"], r["Pocket"])] = float(r["volume"])
             except (KeyError, TypeError, ValueError):
                 continue
     return out
 
 
-def parent_volume_of(acc: str, pocket: str, volumes: dict):
-    """Volume of `P_n` for a subpocket `P_n_m`; None for a top-level pocket."""
+def parent_volume_of(acc: str, protein: str, pocket: str, volumes: dict):
+    """Volume of `P_n` for a subpocket `P_n_m` of the SAME structure; None for a
+    top-level pocket."""
     parts = pocket.split("_")
     if len(parts) <= 2:
         return None
-    return volumes.get((acc, "_".join(parts[:-1])))
+    return volumes.get((acc, protein, "_".join(parts[:-1])))
 
 
 def _size(layout, row) -> float:
@@ -285,7 +326,8 @@ def run(layout, args, progress) -> dict:
     jobs = []
     for r in rows:
         item = f'{r["UniProt ID"]}/{r["Pocket Filename"]}'
-        pv = parent_volume_of(r["UniProt ID"], r.get("Pocket", ""), volumes)
+        pv = parent_volume_of(r["UniProt ID"], r.get("Protein", ""),
+                              r.get("Pocket", ""), volumes)
         jobs.append((item, _worker,
                      (dict(r), str(layout.pockets), str(layout.structures), pv, spacing)))
     try:

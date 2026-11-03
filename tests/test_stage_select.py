@@ -1,519 +1,229 @@
-import json
-import os
-import random
-from pathlib import Path
-from types import SimpleNamespace
+"""Tests for the panel-based select stage.
 
-import pandas as pd
+The hub-and-neighbours tests this file used to hold are gone with the mechanism. The
+filters themselves are tested in test_panel.py; here the concern is the stage: schema
+compatibility with `dock`, receptor path resolution, exclusions, the funnel, and the
+outputs.
+"""
+import csv
+import json
+import types
+from pathlib import Path
+
 import pytest
 
-from polyphar import cli
 from polyphar.common import RunLayout
-from polyphar.stages import select as sel
-
-FIX = Path(__file__).parent / "fixtures"
-SMALL = FIX / "pocketsim_small.csv"
-
-HUB1 = "P00001_HUB1_HUMAN_1AAA_A_P_1"
-HUB2 = "P00008_HUB2_HUMAN_1HHH_C_P_3"
-P73 = "O15350_P73_HUMAN_3VD2_A_P_1"
-N2 = "P00002_NEI2_HUMAN_1BBB_A_P_1"
-N3 = "P00003_2AAA_HUMAN_3CCC_B_P_1"
-N4 = "P00004_NEI4_HUMAN_AF-P00004-F1_P_12_1"
-N9 = "P00009_NEI9_HUMAN_1III_A_P_1"
-
-
-def small():
-    return sel.read_pocketsim(SMALL)
-
-
-def _graph(df=None, pmax=0.7):
-    pairs = sel.unique_protein_pairs(small() if df is None else df, pmax)
-    return pairs, sel.build_graph(pairs)
-
-
-def _protein_info(extra_missing=()):
-    """Protein_info.csv rows for every fixture protein (PDB rows and one AlphaFold row)."""
-    rows = []
-    for acc, entry, pdb, chain in [
-            ("P00001", "HUB1_HUMAN", "1AAA", "A"), ("P00002", "NEI2_HUMAN", "1BBB", "A"),
-            ("P00003", "2AAA_HUMAN", "3CCC", "B"), ("O15350", "P73_HUMAN", "3VD2", "A"),
-            ("P00005", "NEI5_HUMAN", "1EEE", "A"), ("P00006", "NEI6_HUMAN", "1FFF", "A"),
-            ("P00007", "NEI7_HUMAN", "1GGG", "A"), ("P00008", "HUB2_HUMAN", "1HHH", "C"),
-            ("P00009", "NEI9_HUMAN", "1III", "A"), ("P00010", "LOW10_HUMAN", "1JJJ", "A")]:
-        if acc in extra_missing:
-            continue
-        rows.append([acc, entry, pdb, chain, "False", "2.0", "X-ray", "0.9",
-                     f"02_structures/{acc}/{pdb.lower()}_{chain}.pdb"])
-    rows.append(["P00004", "NEI4_HUMAN", "-", "A", "True", "-", "-", "-",
-                 "02_structures/P00004/AF-P00004-F1.pdb"])
-    return pd.DataFrame(rows, columns=["UniProt ID", "Gene Name", "PDB", "Chain ID", "AlphaFold",
-                                       "Resolution", "Structure method", "SIFTS coverage", "File"])
-
-
-def _targets(tie_break, exclude=("O15350",), hub=None, info=True):
-    _, g = _graph()
-    ranking = sel.rank_hubs(g, tie_break)
-    return sel.select_targets(g, ranking, set(exclude), tie_break, hub=hub,
-                              protein_info=_protein_info() if info else None)
-
-
-# --- pairs and graph -----------------------------------------------------------------
-
-def test_reversed_pair_deduplicated():
-    pairs, g = _graph()
-    p1p2 = pairs[(pairs["UniProt ID"].isin(["P00001", "P00002"]))
-                 & (pairs["UniProt ID_2"].isin(["P00001", "P00002"]))]
-    assert len(p1p2) == 1                      # (A,B) and (B,A) give one row ...
-    assert g.has_edge(HUB1, N2)                # ... and one edge
-    assert g[HUB1][N2]["weight"] == pytest.approx(0.90)   # the max-Pmax pocket pair
-    assert not g.has_node("P00002_NEI2_HUMAN_1BBB_A_P_2")
-    keys = {frozenset(x) for x in zip(pairs["UniProt ID"], pairs["UniProt ID_2"])}
-    assert len(keys) == len(pairs)             # one row per unordered protein pair
-
-
-def test_pmax_filter_applies_after_the_dedup_and_keeps_threshold_rows():
-    pairs, g = _graph()
-    assert (pairs["Pmax"] >= 0.7).all()
-    assert not any(n.startswith("P00010_") for n in g.nodes)    # 0.65 pair dropped
-    assert sel.unique_protein_pairs(small(), 0.95)["Pmax"].tolist() == [0.95]
-
-
-def test_pair_tie_goes_to_smallest_node_pair():
-    # N4 - N9 (P_1) and N4 - N9b (P_3) tie at 0.72
-    pairs, g = _graph()
-    assert g.has_edge(N4, N9)
-    assert not g.has_node("P00009_NEI9_HUMAN_1III_A_P_3")
-
-
-def test_node_attributes_are_carried_not_parsed():
-    _, g = _graph()
-    a = g.nodes[N4]
-    assert a["uniprot"] == "P00004" and a["entry_name"] == "NEI4_HUMAN"
-    assert a["protein"] == "AF-P00004-F1" and a["pocket"] == "P_12_1"
-    assert a["pocket_path"] == "04_pockets/P00004/P00004_af-p00004-f1.pdb_res_P_12_1.pdb"
-    assert g.nodes[HUB2]["protein"] == "1HHH_C" and g.nodes[HUB2]["pocket"] == "P_3"
-
-
-# --- ranking and hub choice ----------------------------------------------------------
-
-def test_rank_hubs_columns_and_orders():
-    _, g = _graph()
-    w = sel.rank_hubs(g, "weighted")
-    assert list(w.columns) == ["Node", "UniProt_ID", "Gene_Name", "Degree", "Weighted_Degree",
-                               "Degree_Centrality", "Betweenness_Centrality",
-                               "Closeness_Centrality"]
-    assert w["Node"].iloc[0] == P73 and w["Degree"].iloc[0] == 5
-    assert w["Node"].tolist()[1:3] == [HUB1, HUB2]       # tie at 4, weighted 3.45 > 3.20
-    assert w["Weighted_Degree"].iloc[1] == pytest.approx(0.95 + 0.90 + 0.85 + 0.75)
-    b = sel.rank_hubs(g, "betweenness")
-    assert b["Degree"].is_monotonic_decreasing
-    u = sel.rank_hubs(g, "union")
-    assert u["Node"].tolist() == w["Node"].tolist()      # union ranks as weighted
-
-
-def test_tied_top_skips_excluded():
-    _, g = _graph()
-    ranking = sel.rank_hubs(g, "weighted")
-    assert sel.tied_top(ranking) == [P73]
-    assert sel.tied_top(ranking, {"O15350"}) == [HUB1, HUB2]
-
-
-def test_hub_skips_excluded_and_neighbours_exclude_it():
-    t = _targets("weighted")
-    hubs = t[t["Is_Hub"]]
-    assert hubs["Node"].tolist() == [HUB1]               # O15350 has the top degree, skipped
-    assert P73 not in set(t["Node"])                     # and it is a neighbour of the hub
-    assert hubs["Similarity"].iloc[0] == 1.0
-    sims = dict(zip(t["Node"], t["Similarity"]))
-    assert sims == {HUB1: 1.0, N2: pytest.approx(0.90), N3: pytest.approx(0.85),
-                    N4: pytest.approx(0.75)}
-
-
-def test_without_exclusion_the_top_node_is_the_hub():
-    t = _targets("weighted", exclude=())
-    assert t[t["Is_Hub"]]["Node"].tolist() == [P73]
-    assert HUB1 in set(t["Node"]) and len(t) == 6
-
-
-def test_union_of_tied_hubs():
-    t = _targets("union")
-    assert t["Node"].is_unique
-    assert set(t[t["Is_Hub"]]["Node"]) == {HUB1, HUB2}
-    assert (t[t["Is_Hub"]]["Similarity"] == 1.0).all()
-    sims = dict(zip(t["Node"], t["Similarity"]))
-    assert set(sims) == {HUB1, HUB2, N2, N3, N4, N9}     # P73 excluded
-    assert sims[N2] == pytest.approx(0.90)   # neighbour of both hubs: max(0.90, 0.78)
-    assert sims[N3] == pytest.approx(0.85)   # max(0.85, 0.82)
-    assert sims[N4] == pytest.approx(0.75)
-    assert sims[N9] == pytest.approx(0.71)
-    w = _targets("weighted")
-    assert w["Is_Hub"].sum() == 1
-
-
-def test_adjacent_tied_hubs_are_listed_once_as_hubs():
-    import networkx as nx
-    g = nx.Graph()
-    for n in "ABCD":
-        g.add_node(n, uniprot=n, entry_name=f"{n}_HUMAN", protein="1AAA_A", pocket="P_1",
-                   pocket_path="x", structure_id="1AAA", chain="A")
-    g.add_edge("A", "B", weight=0.8)
-    g.add_edge("B", "C", weight=0.9)
-    g.add_edge("A", "D", weight=0.75)
-    g.add_edge("C", "D", weight=0.71)
-    # A,B,C,D all degree 2 - make A and B the (adjacent) tied top by adding E
-    g.add_node("E", uniprot="E", entry_name="E_HUMAN", protein="1AAA_A", pocket="P_1",
-               pocket_path="x", structure_id="1AAA", chain="A")
-    g.add_edge("A", "E", weight=0.7)
-    g.add_edge("B", "E", weight=0.7)
-    ranking = sel.rank_hubs(g, "union")
-    assert sorted(sel.tied_top(ranking)) == ["A", "B"]
-    t = sel.select_targets(g, ranking, set(), "union")
-    assert t["Node"].is_unique
-    assert t.set_index("Node").loc["B", "Is_Hub"]
-    assert t.set_index("Node").loc["B", "Similarity"] == 1.0
-
-
-def test_tie_break_deterministic():
-    raw = small()
-    expect = None
-    for seed in range(10):
-        order = list(raw.index)
-        random.Random(seed).shuffle(order)
-        shuffled = raw.loc[order]
-        pairs, g = _graph(shuffled)
-        for tb in ("weighted", "betweenness", "union"):
-            ranking = sel.rank_hubs(g, tb)
-            t = sel.select_targets(g, ranking, {"O15350"}, tb)
-            got = (tb, tuple(sorted(t[t["Is_Hub"]]["Node"])), tuple(t["Node"]),
-                   tuple(ranking["Node"]), tuple(pairs["Node"]), tuple(pairs["Node_2"]))
-            if seed == 0:
-                expect = expect or {}
-                expect[tb] = got
-            assert got == expect[tb], (seed, tb)
-    assert expect["weighted"][1] == (HUB1,)
-
-
-def _toy(edges, proteins=None):
-    """Graph from (node, node, Pmax) edges; a node's protein is `proteins.get(node, node)`."""
-    import networkx as nx
-    g = nx.Graph()
-    for a, b, w in edges:
-        for n in (a, b):
-            if n not in g:
-                u = (proteins or {}).get(n, n)
-                g.add_node(n, uniprot=u, entry_name=f"{u}_HUMAN", protein="1AAA_A", pocket=n,
-                           pocket_path="x", structure_id="1AAA", chain="A")
-        g.add_edge(a, b, weight=w)
-    return g
-
-
-def _toy_targets(g, exclude=(), tie_break="union"):
-    ranking = sel.rank_hubs(g, tie_break)
-    return sel.select_targets(g, ranking, set(exclude), tie_break)
-
-
-def test_union_one_row_per_protein_neighbour_reached_twice():
-    # protein X has two pocket nodes, X1 next to hub A1 (0.9) and X2 next to hub B1 (0.8)
-    g = _toy([("A1", "X1", .9), ("A1", "C", .8), ("A1", "D", .75),
-              ("B1", "X2", .8), ("B1", "E", .75), ("B1", "F", .72)],
-             {"X1": "X", "X2": "X"})
-    t = _toy_targets(g)
-    assert set(t[t["Is_Hub"]]["Node"]) == {"A1", "B1"}
-    assert t["UniProt_ID"].is_unique
-    sims = dict(zip(t["Node"], t["Similarity"]))
-    assert "X2" not in sims and sims["X1"] == pytest.approx(0.9)   # max Similarity wins
-    assert len(t) == 7
-
-
-def test_union_one_row_per_protein_hub_protein_reappears_as_neighbour():
-    # protein A is a hub (A1) and another pocket of A (A2) is a neighbour of hub B1
-    g = _toy([("A1", "C", .8), ("A1", "D", .75), ("A1", "E", .72),
-              ("B1", "A2", .99), ("B1", "F", .75), ("B1", "G", .72)],
-             {"A1": "A", "A2": "A"})
-    t = _toy_targets(g)
-    assert t["UniProt_ID"].is_unique and "A2" not in set(t["Node"])
-    row = t.set_index("Node").loc["A1"]
-    assert row["Is_Hub"] and row["Similarity"] == 1.0     # the hub row wins over 0.99
-
-
-def test_union_two_hub_nodes_of_one_protein_keep_the_smallest_node():
-    g = _toy([("A1", "C", .8), ("A1", "D", .75), ("A2", "E", .8), ("A2", "F", .75)],
-             {"A1": "A", "A2": "A"})
-    t = _toy_targets(g)
-    assert t["UniProt_ID"].is_unique
-    assert t[t["Is_Hub"]]["Node"].tolist() == ["A1"]
-    assert set(t["Node"]) == {"A1", "C", "D", "E", "F"}
-
-
-def test_all_tied_two_node_network_gives_two_hubs():   # Cluster4 shape
-    g = _toy([("Q14318", "Q9NUI1", 0.8)])
-    t = _toy_targets(g)
-    assert set(t["Node"]) == {"Q14318", "Q9NUI1"} and t["Is_Hub"].all()
-    assert (t["Similarity"] == 1.0).all() and len(t) == 2
-
-
-def test_excluded_node_tied_at_top_degree_is_not_a_hub():
-    g = _toy([("O15350", "A", .9), ("O15350", "B", .8), ("Y", "C", .9), ("Y", "D", .8)])
-    ranking = sel.rank_hubs(g, "union")
-    assert set(ranking["Node"].iloc[:2]) == {"O15350", "Y"}
-    t = sel.select_targets(g, ranking, {"O15350"}, "union")
-    assert t[t["Is_Hub"]]["Node"].tolist() == ["Y"]
-    assert set(t["Node"]) == {"Y", "C", "D"}
-
-
-def test_no_non_excluded_node_raises():
-    _, g = _graph()
-    ranking = sel.rank_hubs(g, "weighted")
-    every = set(ranking["UniProt_ID"])
-    with pytest.raises(ValueError, match="no node"):
-        sel.select_targets(g, ranking, every, "weighted")
-
-
-# --- target table --------------------------------------------------------------------
-
-def test_entry_name_starting_with_digits():
-    t = _targets("union").set_index("Node")
-    row = t.loc[N3]
-    assert row["Gene_Name"] == "2AAA" and row["Organism"] == "HUMAN"
-    assert row["Structure_ID"] == "3CCC"       # the real PDB ID, not the digits of the entry name
-    assert row["Chain"] == "B" and row["Pocket"] == "P_1"
-    af = t.loc[N4]
-    assert af["Structure_ID"] == "AF-P00004-F1" and af["Pocket"] == "P_12_1"
-    assert af["Chain"] == "A"   # as in the AlphaFold rows of Protein_info.csv
-
-
-def test_final_targets_columns_and_receptor_paths():
-    t = _targets("union")
-    assert list(t.columns) == ["Node", "UniProt_ID", "Gene_Name", "Organism", "Structure_ID",
-                               "Similarity", "Protein", "Chain", "Pocket", "Pocket_Path",
-                               "Receptor_Path", "Is_Hub"]
-    t = t.set_index("Node")
-    assert t.loc[HUB1, "Receptor_Path"] == "03_pdbfixer/P00001/1aaa_A.pdb"
-    assert t.loc[HUB2, "Receptor_Path"] == "03_pdbfixer/P00008/1hhh_C.pdb"
-    assert t.loc[N3, "Receptor_Path"] == "03_pdbfixer/P00003/3ccc_B.pdb"
-    assert t.loc[N4, "Receptor_Path"] == "02_structures/P00004/AF-P00004-F1.pdb"
-    assert t.loc[HUB1, "Pocket_Path"] == "04_pockets/P00001/P00001_1aaa_a.pdb_res_P_1.pdb"
-    assert t["Similarity"].is_monotonic_decreasing
-
-
-def test_receptor_path_comes_from_protein_info_not_the_protein_name():
-    info = _protein_info()
-    info.loc[info["UniProt ID"] == "P00001", "File"] = "02_structures/P00001/odd_name.pdb"
-    _, g = _graph()
-    ranking = sel.rank_hubs(g, "weighted")
-    t = sel.select_targets(g, ranking, {"O15350"}, "weighted", protein_info=info)
-    assert t.set_index("Node").loc[HUB1, "Receptor_Path"] == "03_pdbfixer/P00001/odd_name.pdb"
-
-
-def test_missing_protein_info_row_is_a_clear_error():
-    _, g = _graph()
-    ranking = sel.rank_hubs(g, "weighted")
-    with pytest.raises(ValueError, match="P00003.*3CCC.*B"):
-        sel.select_targets(g, ranking, {"O15350"}, "weighted",
-                           protein_info=_protein_info(extra_missing=("P00003",)))
-
-
-def _lowercase_chain_info(*chains):
-    """Protein_info with P00003 / 3CCC on the given real (case-sensitive) chain IDs."""
-    info = _protein_info(extra_missing=("P00003",))
-    rows = [["P00003", "2AAA_HUMAN", "3CCC", c, "False", "2.0", "X-ray", "0.9",
-             f"02_structures/P00003/3ccc_{c}.pdb"] for c in chains]
-    return pd.concat([info, pd.DataFrame(rows, columns=info.columns)], ignore_index=True)
-
-
-def test_lowercase_author_chain_is_found_and_reported_with_its_real_case():
-    """Pocketsim's Protein field is upper-cased (3CCC_B); Protein_info keeps the real
-    author chain `b`: the receptor is found and Chain says `b`."""
-    _, g = _graph()
-    ranking = sel.rank_hubs(g, "weighted")
-    t = sel.select_targets(g, ranking, {"O15350"}, "weighted",
-                           protein_info=_lowercase_chain_info("b")).set_index("Node")
-    assert t.loc[N3, "Receptor_Path"] == "03_pdbfixer/P00003/3ccc_b.pdb"
-    assert t.loc[N3, "Chain"] == "b" and t.loc[N3, "Protein"] == "3CCC_B"
-
-
-def test_chains_differing_only_by_case_are_never_merged():
-    _, g = _graph()
-    ranking = sel.rank_hubs(g, "weighted")
-    with pytest.raises(ValueError, match="ambiguous.*P00003.*3CCC"):
-        sel.select_targets(g, ranking, {"O15350"}, "weighted",
-                           protein_info=_lowercase_chain_info("b", "B"))
-
-
-# --- stage ---------------------------------------------------------------------------
-
-def _run_folder(tmp_path, info=None):
-    layout = RunLayout(tmp_path)
-    layout.similarity.mkdir(parents=True)
-    layout.pocketsim_csv.write_bytes(SMALL.read_bytes())
-    layout.structures.mkdir(parents=True)
-    (_protein_info() if info is None else info).to_csv(layout.protein_info, index=False)
-    return layout
+from polyphar.stages import select
+from polyphar.stages.annotate import encode_residues
 
 
 def _args(**kw):
-    base = dict(pmax=0.7, exclude=["O15350"], hub_tie_break="union", nprocs=1, dry_run=False)
+    base = dict(rg_max=8.5, volume_min=300.0, volume_max=2000.0, drugscore_min=0.5,
+                plddt_min=70.0, tm_policy="C", tm_overlap=0.10, exclude=["O15350"],
+                no_fetch_tm=True)
     base.update(kw)
-    return SimpleNamespace(**base)
+    return types.SimpleNamespace(**base)
 
 
-class Prog:
-    def __init__(self):
-        self.messages = []
-
-    def advance(self, n=1, size=None):
+class _Progress:
+    def advance(self, n, size=0.0):
         pass
 
-    def notifier(self, title, message, priority=0):
-        self.messages.append((title, message))
+
+def _make_run(tmp_path, drugscore_rows, annotation_rows, protein_info_rows, tm=None):
+    """A realistic run folder. tm defaults to "no TM segments" for every accession the
+    DrugScore rows mention, as a real tm.tsv would have, so no test touches the network."""
+    if tm is None:
+        tm = "".join(f"{a}\t0\t\n"
+                     for a in sorted({r["UniProt ID"] for r in drugscore_rows}))
+    run = tmp_path / "run"
+    (run / "04_pockets" / "annotation").mkdir(parents=True)
+    (run / "02_structures").mkdir(parents=True)
+    (run / "01_uniprot").mkdir(parents=True)
+
+    def write(path, rows, cols):
+        with open(path, "w", newline="", encoding="utf-8") as fh:
+            w = csv.DictWriter(fh, fieldnames=cols)
+            w.writeheader()
+            w.writerows(rows)
+
+    write(run / "04_pockets" / "DrugScore.csv", drugscore_rows,
+          ["UniProt ID", "Gene Name", "Protein", "Pocket", "Pocket Filename",
+           "volume", "drugScore", "Selected"])
+    write(run / "04_pockets" / "annotation" / "pocket_annotation.csv", annotation_rows,
+          ["Pocket Filename", "AlphaFold", "radius_of_gyration", "pocket_plddt_mean",
+           "box_size_x", "box_size_y", "box_size_z", "residues"])
+    write(run / "02_structures" / "Protein_info.csv", protein_info_rows,
+          ["UniProt ID", "PDB", "Chain ID", "AlphaFold", "File"])
+    # pre-created so tmfetch never reaches the network during tests
+    (run / "01_uniprot" / "tm.tsv").write_text("accession\ttm_count\tsegments\n" + tm)
+    return RunLayout(run)
 
 
-def test_run_writes_outputs_manifest_and_names_the_tie(tmp_path, capsys):
-    layout = _run_folder(tmp_path)
-    prog = Prog()
-    counts = sel.run(layout, _args(), prog)
-    d = layout.targets
-    for name in ("final_targets.csv", "centrality.csv", "unique_pairs.csv", "manifest.json",
-                 "failed.tsv"):
-        assert (d / name).exists(), name
-    assert (d / "failed.tsv").read_text() == "item\tstage\treason\n"
-    final = pd.read_csv(layout.final_targets_csv)
-    assert set(final["Node"]) == {HUB1, HUB2, N2, N3, N4, N9}
-    assert final["Is_Hub"].sum() == 2
-    assert pd.read_csv(d / "centrality.csv")["Node"].iloc[0] == P73
-    assert len(pd.read_csv(d / "unique_pairs.csv")) == 12
-    assert counts["failed"] == 0 and counts["targets"] == 6 and counts["hubs"] == 2
-    m = json.loads((d / "manifest.json").read_text())
-    assert m["stage"] == "select"
-    assert m["args"]["exclude"] == {"O15350": "p73: problematic for docking (legacy decision)"}
-    assert m["args"]["hub_tie_break"] == "union" and m["args"]["pmax"] == 0.7
-    assert m["top_tie"] == [HUB1, HUB2] and m["hubs"] == [HUB1, HUB2]
-    out = capsys.readouterr().out
-    assert "tie" in out and HUB1 in out and HUB2 in out
-    assert prog.messages and HUB2 in prog.messages[0][1]
+def _ds(acc, protein, pocket, fname, vol=800.0, ds=0.9):
+    return {"UniProt ID": acc, "Gene Name": f"{acc}G_HUMAN", "Protein": protein,
+            "Pocket": pocket, "Pocket Filename": fname, "volume": str(vol),
+            "drugScore": str(ds), "Selected": "True"}
 
 
-def test_run_paths_are_relative_to_run_folder(tmp_path):
-    layout = _run_folder(tmp_path)
-    sel.run(layout, _args(), Prog())
-    final = pd.read_csv(layout.final_targets_csv)
-    for col in ("Pocket_Path", "Receptor_Path"):
-        assert not final[col].str.startswith("/").any()
+def _an(fname, af=True, rg=6.0, plddt=90.0, residues=(10, 11, 12)):
+    return {"Pocket Filename": fname, "AlphaFold": str(af),
+            "radius_of_gyration": str(rg),
+            "pocket_plddt_mean": "" if plddt is None else str(plddt),
+            "box_size_x": "18", "box_size_y": "18", "box_size_z": "18",
+            "residues": encode_residues(list(residues))}
 
 
-def test_rerun_on_same_inputs_is_skipped(tmp_path):
-    layout = _run_folder(tmp_path)
-    sel.run(layout, _args(), Prog())
-    first = layout.targets.joinpath("final_targets.csv").stat().st_mtime_ns
-    stamp = (layout.targets / "manifest.json").read_text()
-    assert sel.units(layout, _args()).count == 0
-    counts = sel.run(layout, _args(), Prog())
-    assert counts["targets"] == 6 and counts["failed"] == 0
-    assert layout.targets.joinpath("final_targets.csv").stat().st_mtime_ns == first
-    assert (layout.targets / "manifest.json").read_text() == stamp
-    # a different parameter is not skipped
-    assert sel.units(layout, _args(hub_tie_break="weighted")).count == 1
-    sel.run(layout, _args(hub_tie_break="weighted"), Prog())
-    assert pd.read_csv(layout.final_targets_csv)["Is_Hub"].sum() == 1
+# --- helpers that survived the rewrite ------------------------------------------------
+
+def test_split_protein_handles_alphafold_and_pdb_chains():
+    assert select.split_protein("2MJW_B") == ("2MJW", "B")
+    assert select.split_protein("AF-P06493-F1") == ("AF-P06493-F1", "A")
+    assert select.split_protein("1ABC") == ("1ABC", select.NO_CHAIN)
 
 
-def test_units_trivial_and_missing_input_clear_error(tmp_path):
-    layout = RunLayout(tmp_path)
-    with pytest.raises(FileNotFoundError, match="polyphar similarity"):
-        sel.units(layout, _args())
-    layout = _run_folder(tmp_path)
-    wu = sel.units(layout, _args())
-    assert wu.count == 1
+def test_split_entry_name_splits_at_the_last_underscore():
+    assert select.split_entry_name("S100P_HUMAN") == ("S100P", "HUMAN")
+    assert select.split_entry_name("NOUNDERSCORE") == ("NOUNDERSCORE", "")
 
 
-def test_run_with_inconsistent_run_folder_raises_and_writes_no_outputs(tmp_path):
-    layout = _run_folder(tmp_path, info=_protein_info(extra_missing=("P00003",)))
-    with pytest.raises(ValueError, match="P00003"):
-        sel.run(layout, _args(), Prog())
-    assert not layout.final_targets_csv.exists()
-    assert not (layout.targets / "manifest.json").exists()
+# --- receptor paths -------------------------------------------------------------------
+
+def test_receptor_path_for_alphafold_uses_the_model_file():
+    panel = {"P1": (_ds("P1", "AF-P1-F1", "P_1", "f.pdb"), _an("f.pdb"))}
+    info = [{"UniProt ID": "P1", "PDB": "", "Chain ID": "A", "AlphaFold": "True",
+             "File": "02_structures/P1/AF-P1-F1.pdb"}]
+    paths, chains = select._receptor_paths(panel, info)
+    assert paths["P1"] == "02_structures/P1/AF-P1-F1.pdb"
+    assert chains["P1"] == "A"
 
 
-def test_empty_network_after_pmax_filter_raises_and_writes_nothing(tmp_path):
-    layout = _run_folder(tmp_path)
-    with pytest.raises(ValueError, match="no protein pair has Pmax >= 0.99"):
-        sel.run(layout, _args(pmax=0.99), Prog())
-    assert not layout.targets.exists() or not any(layout.targets.iterdir())
+def test_receptor_path_for_a_pdb_chain_points_at_pdbfixer_and_keeps_the_real_chain():
+    """The Protein field upper-cases the chain, so the lookup must be case-insensitive
+    while Chain reports the real author chain."""
+    panel = {"P1": (_ds("P1", "2MJW_B", "P_1", "f.pdb"), _an("f.pdb", af=False))}
+    info = [{"UniProt ID": "P1", "PDB": "2MJW", "Chain ID": "b", "AlphaFold": "False",
+             "File": "02_structures/P1/2mjw_b.pdb"}]
+    paths, chains = select._receptor_paths(panel, info)
+    assert paths["P1"] == "03_pdbfixer/P1/2mjw_b.pdb"
+    assert chains["P1"] == "b"
 
 
-def test_exclude_is_normalised_and_recorded(tmp_path):
-    layout = _run_folder(tmp_path)
-    sel.run(layout, _args(exclude=[" o15350 ", "p00002,p00004"]), Prog())
-    m = json.loads((layout.targets / "manifest.json").read_text())
-    assert list(m["args"]["exclude"]) == ["O15350", "P00002", "P00004"]
-    final = pd.read_csv(layout.final_targets_csv)
-    assert not set(final["UniProt_ID"]) & {"O15350", "P00002", "P00004"}
-    assert sel._exclude(_args(exclude=["o15350"])) == sel._exclude(_args())
+def test_chains_differing_only_by_case_are_ambiguous_not_guessed():
+    panel = {"P1": (_ds("P1", "2MJW_B", "P_1", "f.pdb"), _an("f.pdb", af=False))}
+    info = [{"UniProt ID": "P1", "PDB": "2MJW", "Chain ID": "b", "AlphaFold": "False",
+             "File": "02_structures/P1/2mjw_b.pdb"},
+            {"UniProt ID": "P1", "PDB": "2MJW", "Chain ID": "B", "AlphaFold": "False",
+             "File": "02_structures/P1/2mjw_B.pdb"}]
+    with pytest.raises(ValueError, match="ambiguous"):
+        select._receptor_paths(panel, info)
 
 
-def test_cli_dry_run_and_defaults(tmp_path, capsys):
-    layout = _run_folder(tmp_path)
-    args = cli.build_parser().parse_args(["select", "--run-dir", str(tmp_path)])
-    assert args.pmax == 0.7 and args.exclude == ["O15350"] and args.hub_tie_break == "union"
-    rc = cli.main(["select", "--run-dir", str(tmp_path), "--dry-run"])
-    assert rc == 0 and "select: 1 units" in capsys.readouterr().out
-    assert not layout.targets.exists()
+def test_a_target_with_no_protein_info_row_is_an_error():
+    panel = {"P1": (_ds("P1", "9XYZ_A", "P_1", "f.pdb"), _an("f.pdb", af=False))}
+    with pytest.raises(ValueError, match="no row in Protein_info"):
+        select._receptor_paths(panel, [])
 
 
-def test_cli_end_to_end(tmp_path, monkeypatch):
-    monkeypatch.setenv("POLYPHAR_HOME", str(tmp_path / "home"))
-    layout = _run_folder(tmp_path / "run")
-    rc = cli.main(["select", "--run-dir", str(tmp_path / "run"), "--no-notify",
-                   "--hub-tie-break", "weighted", "--exclude", "O15350", "P00002"])
-    assert rc == 0
-    final = pd.read_csv(layout.final_targets_csv)
-    assert "P00002" not in set(final["UniProt_ID"])
-    assert final["Is_Hub"].sum() == 1
+# --- output schema ----------------------------------------------------------------------
+
+def test_target_rows_keep_the_columns_dock_consumes():
+    """dock reads Protein, Pocket, Receptor_Path and Pocket_Path; the schema must not
+    drift even though Similarity and Is_Hub are now meaningless."""
+    panel = {"P1": (_ds("P1", "AF-P1-F1", "P_2", "AF-P1-F1_res_P_2.pdb"), _an("x"))}
+    rows = select.target_rows(panel, {"P1": "02_structures/P1/AF-P1-F1.pdb"}, {"P1": "A"})
+    assert list(rows[0]) == select.TARGET_COLUMNS
+    r = rows[0]
+    assert r["Protein"] == "AF-P1-F1" and r["Pocket"] == "P_2"
+    assert r["Pocket_Path"] == "04_pockets/P1/AF-P1-F1_res_P_2.pdb"
+    assert r["Receptor_Path"] == "02_structures/P1/AF-P1-F1.pdb"
+    assert r["Gene_Name"] == "P1G" and r["Organism"] == "HUMAN"
+    assert r["Similarity"] == "" and r["Is_Hub"] is False
 
 
-# --- regression: 2023 target selection -----------------------------------------------
-
-REFERENCE = Path("/home/onur/repos/Gene_Disease_Association/target_selection_results")
-SUBTYPES = {   # reference stem -> path under $ADEP_DATA/disease_subtypes
-    "liver_cancer_net2": "Liver_cancer/net2/PM_net2/Pocketsim_net2.csv",
-    "liver_cancer_net3": "Liver_cancer/net3/PM_net3/Pocketsim_net3.csv",
-    "alzheimer_Cluster1": "Alzhemier/Cluster1/PM_Cluster1/Pocketsim.csv",
-    "alzheimer_Cluster3": "Alzhemier/Cluster3/PM_Cluster3/Pocketsim.csv",
-    "alzheimer_Cluster4": "Alzhemier/Cluster4/PM_Cluster4/Pocketsim.csv",
-}
+def test_target_rows_are_sorted_by_accession_not_input_order():
+    panel = {
+        "P2": (_ds("P2", "AF-P2-F1", "P_1", "b.pdb"), _an("b.pdb")),
+        "P1": (_ds("P1", "AF-P1-F1", "P_1", "a.pdb"), _an("a.pdb")),
+    }
+    rows = select.target_rows(panel, {"P1": "x", "P2": "y"}, {"P1": "A", "P2": "A"})
+    assert [r["UniProt_ID"] for r in rows] == ["P1", "P2"]
 
 
-def _legacy_hub(stem):
-    """The 2023 hub: first row of its centrality.csv, the second if that is O15350."""
-    c = pd.read_csv(REFERENCE / f"{stem}_centrality.csv")
-    return c["Node"].iloc[1 if c["UniProt_ID"].iloc[0] == "O15350" else 0]
+# --- the stage -----------------------------------------------------------------------
+
+def test_run_writes_the_panel_the_funnel_and_a_reason_per_rejection(tmp_path):
+    ds_rows = [
+        _ds("P1", "AF-P1-F1", "P_1", "a.pdb"),                 # kept
+        _ds("P2", "AF-P2-F1", "P_1", "b.pdb", vol=5000.0),     # rejected: volume
+        _ds("P3", "AF-P3-F1", "P_1", "c.pdb"),                 # rejected: rg
+    ]
+    anns = [_an("a.pdb"), _an("b.pdb"), _an("c.pdb", rg=20.0)]
+    info = [{"UniProt ID": a, "PDB": "", "Chain ID": "A", "AlphaFold": "True",
+             "File": f"02_structures/{a}/AF-{a}-F1.pdb"} for a in ("P1", "P2", "P3")]
+    layout = _make_run(tmp_path, ds_rows, anns, info)
+
+    counts = select.run(layout, _args(), _Progress())
+
+    assert counts["panel"] == 1 and counts["selected_pockets"] == 3
+    targets = list(csv.DictReader(open(layout.targets / "final_targets.csv")))
+    assert [t["UniProt_ID"] for t in targets] == ["P1"]
+
+    funnel = list(csv.DictReader(open(layout.targets / "panel_funnel.tsv")))
+    counts_seq = [int(f["pockets_remaining"]) for f in funnel]
+    assert counts_seq == sorted(counts_seq, reverse=True)      # monotone chain
+    assert counts_seq[0] == 3 and counts_seq[-1] == 1
+
+    failed = (layout.targets / "failed.tsv").read_text().strip().splitlines()
+    assert len(failed) == 3                                     # header + 2 rejections
+    assert any("volume" in l for l in failed) and any("gyration" in l for l in failed)
+
+    manifest = json.loads((layout.targets / "manifest.json").read_text())
+    assert manifest["counts"]["panel"] == 1
+    assert manifest["args"]["rg_max"] == 8.5
 
 
-def _select(df, hub, ordered=False):
-    pairs = sel.unique_protein_pairs(df, 0.7, ordered=ordered)
-    g = sel.build_graph(pairs)
-    ranking = sel.rank_hubs(g, "weighted")
-    return sel.select_targets(g, ranking, {"O15350"}, "weighted", hub=hub), g, ranking
+def test_excluded_accessions_are_dropped_and_recorded(tmp_path):
+    ds_rows = [_ds("O15350", "AF-O15350-F1", "P_1", "a.pdb"),
+               _ds("P1", "AF-P1-F1", "P_1", "b.pdb")]
+    anns = [_an("a.pdb"), _an("b.pdb")]
+    info = [{"UniProt ID": a, "PDB": "", "Chain ID": "A", "AlphaFold": "True",
+             "File": f"02_structures/{a}/AF-{a}-F1.pdb"} for a in ("O15350", "P1")]
+    layout = _make_run(tmp_path, ds_rows, anns, info)
+
+    counts = select.run(layout, _args(), _Progress())
+
+    assert counts["panel"] == 1 and counts["excluded"] == 1
+    targets = list(csv.DictReader(open(layout.targets / "final_targets.csv")))
+    assert [t["UniProt_ID"] for t in targets] == ["P1"]
+    assert "p73" in (layout.targets / "failed.tsv").read_text()
 
 
-@pytest.mark.regression
-@pytest.mark.parametrize("stem", list(SUBTYPES))
-def test_reproduces_2023_targets(stem):
-    path = Path(os.environ["ADEP_DATA"]) / "disease_subtypes" / SUBTYPES[stem]
-    df = sel.read_pocketsim(path)
-    ref = pd.read_csv(REFERENCE / f"{stem}_final_targets.csv")
-    hub = _legacy_hub(stem)
-    got, g, ranking = _select(df, hub)
-    want = dict(zip(ref["Node"], ref["Similarity"].round(6)))
-    have = dict(zip(got["Node"], got["Similarity"].round(6)))
-    if have != want:
-        only_ref, only_new = sorted(set(want) - set(have)), sorted(set(have) - set(want))
-        diff_sim = sorted(n for n in set(want) & set(have) if want[n] != have[n])
-        legacy, _, _ = _select(df, hub, ordered=True)
-        legacy_have = dict(zip(legacy["Node"], legacy["Similarity"].round(6)))
-        print(f"\n{stem}: hub {hub}\n  only in 2023 reference: {only_ref}\n"
-              f"  only in new result: {only_new}\n  similarity differs: {diff_sim}\n"
-              f"  ordered-pair dedup reproduces the reference: {legacy_have == want}\n"
-              f"  top degree tie: {sel.tied_top(ranking, {'O15350'})}")
-    assert have == want
+def test_missing_annotation_file_is_a_clear_error(tmp_path):
+    layout = _make_run(tmp_path, [_ds("P1", "AF-P1-F1", "P_1", "a.pdb")], [_an("a.pdb")],
+                       [{"UniProt ID": "P1", "PDB": "", "Chain ID": "A",
+                         "AlphaFold": "True", "File": "x.pdb"}])
+    (layout.pockets / "annotation" / "pocket_annotation.csv").unlink()
+    with pytest.raises(FileNotFoundError, match="annotate"):
+        select.run(layout, _args(), _Progress())
+
+
+def test_tm_policy_is_recorded_in_the_manifest(tmp_path):
+    """The policy changes which pockets are eligible, so a run is not interpretable
+    without it."""
+    layout = _make_run(tmp_path, [_ds("P1", "AF-P1-F1", "P_1", "a.pdb")], [_an("a.pdb")],
+                       [{"UniProt ID": "P1", "PDB": "", "Chain ID": "A",
+                         "AlphaFold": "True", "File": "02_structures/P1/AF-P1-F1.pdb"}])
+    select.run(layout, _args(tm_policy="B"), _Progress())
+    manifest = json.loads((layout.targets / "manifest.json").read_text())
+    assert manifest["args"]["tm_policy"] == "B"
+
+
+def test_offline_mode_fails_clearly_when_tm_data_is_missing(tmp_path):
+    """--no-fetch-tm must not silently skip the transmembrane filter."""
+    layout = _make_run(tmp_path, [_ds("P1", "AF-P1-F1", "P_1", "a.pdb")], [_an("a.pdb")],
+                       [{"UniProt ID": "P1", "PDB": "", "Chain ID": "A",
+                         "AlphaFold": "True", "File": "02_structures/P1/AF-P1-F1.pdb"}],
+                       tm="")        # tm.tsv exists but is empty
+    with pytest.raises(FileNotFoundError, match="no-fetch-tm"):
+        select.run(layout, _args(no_fetch_tm=True), _Progress())

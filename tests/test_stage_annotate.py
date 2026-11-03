@@ -79,10 +79,17 @@ def test_receptor_stem_handles_both_naming_schemes():
 
 
 def test_parent_volume_only_for_subpockets():
-    vols = {("P1", "P_1"): 5000.0, ("P1", "P_1_1"): 900.0}
-    assert annotate.parent_volume_of("P1", "P_1", vols) is None
-    assert annotate.parent_volume_of("P1", "P_1_1", vols) == 5000.0
-    assert annotate.parent_volume_of("P1", "P_9_9", vols) is None   # parent absent
+    vols = {("P1", "X_A", "P_1"): 5000.0, ("P1", "X_A", "P_1_1"): 900.0}
+    assert annotate.parent_volume_of("P1", "X_A", "P_1", vols) is None
+    assert annotate.parent_volume_of("P1", "X_A", "P_1_1", vols) == 5000.0
+    assert annotate.parent_volume_of("P1", "X_A", "P_9_9", vols) is None  # parent absent
+
+
+def test_parent_volume_lookup_is_per_structure():
+    """`P_1` exists for every structure of an accession; the lookup must not cross them."""
+    vols = {("P1", "1ABC_A", "P_1"): 900.0, ("P1", "AF-P1-F1", "P_1"): 25840.0}
+    assert annotate.parent_volume_of("P1", "1ABC_A", "P_1_1", vols) == 900.0
+    assert annotate.parent_volume_of("P1", "AF-P1-F1", "P_1_1", vols) == 25840.0
 
 
 def test_annotate_one_reads_plddt_back_from_the_model(tmp_path):
