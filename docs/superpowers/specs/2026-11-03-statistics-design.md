@@ -55,8 +55,12 @@ is why the old draft needed a power statement for threshold flipping and never h
 Use instead, for ligand *i*:
 
 ```
-M_i = mean over the 482 targets of percentile_t(i)
+M_i = mean over the 271 proteins of  max_t in protein  percentile_t(i)
 ```
+
+**Per protein, best of its pockets** (decided, user 2026-11-03) — not a mean over all 482
+targets, which would weight the proteins that contributed two pockets twice. The statistic
+is then "how much of the proteome does this molecule touch", which is the claim as stated.
 
 A molecule that scores moderately well on many targets has a high `M`. That is a literal
 transcription of "cumulative weak binding across a set of related pockets". It is
@@ -70,8 +74,9 @@ is just not the test.
 ### The test: permutation within size strata
 
 - Stratify the library on heavy-atom count (quintiles) crossed with rotatable-bond count
-  (tertiles), or nearest-neighbour matching on (HA, rotB) at ~5 controls per drug —
-  decide once on the real library, before looking at outcomes, and record the choice.
+  (tertiles) — **decided (user, 2026-11-03)**, over nearest-neighbour matching, because
+  strata are easier to describe in the paper and harder to tune after the fact. Bin edges
+  are computed on the library once and recorded before any outcome is looked at.
 - Statistic: mean `M` over the positive set minus mean `M` over matched controls.
 - Null: permute the drug/non-drug label **within strata**, 10,000 times.
 - p = proportion of permutations at least as extreme. One-sided; the claim is directional.
@@ -79,25 +84,75 @@ is just not the test.
 Exact, no distributional assumption, and the stratification is visible rather than buried
 in a model's functional form.
 
-## The negative control the old draft was missing
+## The negative control
 
-The audit's F2 noted there was no set of drugs expected *not* to be polypharmacological.
-There is one, and it costs nothing: **the Alzheimer's drugs, tested against the HCC
-panel, and the HCC drugs against the AD panel.**
+The audit's F2 noted there was no drug set expected *not* to be polypharmacological. Two
+controls are available, and they are not equally good.
 
-Both sets are approved small molecules, both skew large relative to library median, both
-get the same preparation and the same engine. If within-target ranking and size matching
-work, the cross-indication arm should come out null. If the HCC drugs light up the AD
-panel as brightly as their own, the statistic is measuring "approved drug" or "big
-molecule", not disease-specific polypharmacology — and that is the single most
-informative number the study can produce.
+### The control that is already built in
 
-This should be stated as a **pre-registered prediction with a direction**, not computed
-and then interpreted: HCC-on-HCC > HCC-on-AD, and AD-on-AD > AD-on-HCC.
+**The library is e-Drug3D** — approved and withdrawn small-molecule drugs, not a generic
+screening set. So the size-matched comparison set is *already* "other approved drugs of
+the same size". Nothing extra is needed to rule out "approved drugs just score well", and
+it is the contrast a reviewer asks for first. State this explicitly where the matching is
+described; it is easy to miss and it is load-bearing.
 
-A caveat to record rather than hide: the two panels are not independent samples of
-protein space, and some targets may be shared. Report the panel overlap (accession-level)
-alongside the result.
+### Panel specificity: HCC drugs against the AD panel
+
+The remaining question the matched control cannot answer is whether the signal is about
+*this panel* or about any panel. That needs the same drugs run against a different one:
+
+| arm | status |
+|---|---|
+| HCC drugs on HCC panel | primary |
+| **HCC drugs on AD panel** | **negative control — the one that matters** |
+| AD drugs on AD panel | exploratory, see below |
+| AD drugs on HCC panel | exploratory, see below |
+
+Arm 2 holds the drug set fixed and changes only the panel, so nothing about the AD drugs'
+own properties can contaminate it. Pre-registered prediction, with direction:
+**HCC-on-HCC > HCC-on-AD.**
+
+Report the accession-level overlap between the two panels alongside the result: the panels
+are not independent samples of protein space and may share targets, which would compress
+the difference.
+
+### Why the AD-drug arms are exploratory, not primary
+
+Three problems, in order of severity.
+
+**1. The set is tiny.** Guideline AD therapy intersected with dockable e-Drug3D is roughly
+donepezil, rivastigmine, galantamine, memantine, tacrine, possibly brexpiprazole — **n of
+about 4 to 6**. The antibodies (lecanemab, donanemab) are excluded by dockability.
+Benzgalantamine (2024) and the dextromethorphan-bupropion combination approved for AD
+agitation on 2026-04-30 post-date e-Drug3D, though both components of the latter are in
+it. A null from five molecules is weak evidence, and it is a null the design *predicts*,
+which makes it close to unfalsifiable.
+
+**2. The drugs are known multi-target, by design.** Donepezil binds sigma-1 at low
+nanomolar affinity as an agonist, and its memory effect in mice is blocked by a sigma-1
+antagonist, so sigma-1 is plausibly mechanism rather than an incidental off-target.
+Galantamine is an allosteric nicotinic modulator in addition to AChE. The multi-target-
+directed-ligand literature is anchored specifically on AD, where broad target coverage is
+a deliberate design goal. These are close to the worst available choice for a
+"monogamous drug" control.
+
+**3. The size bias runs the opposite way.** Memantine is 12 heavy atoms, rivastigmine 18,
+galantamine 21, donepezil 28, against a library median of 25 and HCC targeted agents at
+31. The two drug sets occupy different strata, so AD-on-AD and HCC-on-HCC are not matched
+on matching quality.
+
+Problems 2 and 3 both push the AD arms toward *false positives*, so a null there would
+still be informative. But with n about 5 there is not enough power to rely on it. Report
+the arms with n stated and label them exploratory.
+
+### An optional strengthening, if more power is wanted
+
+A larger negative drug set can be built from e-Drug3D itself: approved drugs with **no
+oncology indication at all** (n in the hundreds), size-matched the same way, run against
+the HCC panel. No new pipeline run, no new docking beyond what the full library already
+gets. Many non-oncology drugs do hit kinases, so this is conservative — which is the safe
+direction. Worth doing if the primary result is marginal; not needed if it is clean.
 
 ## Positive control: does the score mean anything at all?
 
@@ -131,7 +186,9 @@ Replace the current exact string match on one `indications` value plus four hand
 names (one of which, ramucirumab, is an antibody and cannot be docked) with:
 
 - current clinical-guideline systemic therapies (EASL / NCCN / ESMO) for HCC, and the
-  corresponding guideline set for Alzheimer's;
+  corresponding guideline set for Alzheimer's (the latter feeds the exploratory arms
+  only, and its expected n of about 5 should be confirmed against e-Drug3D early, since
+  it is small enough to change whether those arms are worth running);
 - intersected with **dockable** small molecules present in e-Drug3D after the stage-4
   filter (rotatable bonds <= 15, MW <= 900);
 - no approval-date cut;
@@ -166,12 +223,12 @@ evaporates:
 | test | what it is |
 |---|---|
 | HCC drugs on HCC panel | primary |
-| AD drugs on AD panel | primary |
-| HCC drugs on AD panel | negative control |
-| AD drugs on HCC panel | negative control |
-| targeted / cytotoxic split | pre-planned subgroup, reported, Holm within family |
+| HCC drugs on AD panel | primary (negative control) |
+| targeted / cytotoxic split | pre-planned subgroup, Holm within family |
+| AD drugs on either panel | exploratory, n about 5, reported with n |
 
-Four primary-family tests, Holm-corrected. Per-drug results (which drugs individually
+**Two primary tests**, Holm-corrected. The AD-drug arms carry no correction because they
+make no primary claim; their n is reported wherever they appear. Per-drug results (which drugs individually
 show elevation) are **exploratory with Benjamini-Hochberg FDR**, labelled as such.
 
 The `threshold x min_targets` surface carries no p-values at all, so it contributes no
@@ -192,8 +249,8 @@ these down, commit them, and date the commit **before `dock` runs**:
 1. the statistic (`M` = mean within-target percentile);
 2. the matching scheme (strata definition or k-NN on (HA, rotB));
 3. the permutation count and the one-sided direction;
-4. the four primary tests and the Holm correction;
-5. the two negative-control predictions, with direction;
+4. the two primary tests and the Holm correction;
+5. the negative-control prediction, with direction (HCC-on-HCC > HCC-on-AD);
 6. the positive-control thresholds that would count as a pass (set them *now* — e.g.
    median self-rank in the top 5%, pose-in-pocket >= 70% — and if the controls fail,
    the primary result is reported as uninterpretable rather than quietly reinterpreted).
@@ -201,18 +258,13 @@ these down, commit them, and date the commit **before `dock` runs**:
 Point 6 is the one most likely to be skipped and the one that most determines whether
 the paper is believable.
 
-## Open choices for the user
+## Decisions taken (user, 2026-11-03)
 
-1. **Strata or k-NN matching?** Strata are simpler to describe and to defend; k-NN
-   matches more tightly but needs a distance choice. Recommendation: **quintile x tertile
-   strata**, for describability.
-2. **Does `M` average over all 482 targets, or over the 271 proteins (best pocket each)?**
-   Averaging over targets weights proteins that contributed 2 pockets twice.
-   Recommendation: **per protein, best of its pockets**, so the statistic is
-   "how much of the proteome does this drug touch", which is the claim as stated.
-3. **Are the AD drugs really a fair negative control**, given that some AD drugs are
-   known promiscuous (donepezil, galantamine)? If so, the negative control is
-   conservative, which is the safe direction — but it should be said.
+1. **Matching: quintile x tertile strata**, not k-NN.
+2. **`M` is per protein, best of its pockets**, not a mean over all 482 targets.
+3. **The AD-drug arms are exploratory, not primary.** The panel-specificity control is
+   HCC drugs against the AD panel, which holds the drugs fixed. See "The negative
+   control" above for the three reasons.
 
 ## Implementation order
 
