@@ -33,6 +33,8 @@ STAGES = {
     "fix": ("polyphar.stages.fix", "repair structures with pdbfixer"),
     "pockets": ("polyphar.stages.pockets",
                 "detect pockets (DoGSite3 or DoGSiteScorer 2, host only)"),
+    "annotate": ("polyphar.stages.annotate",
+                 "per-pocket geometry from existing outputs (no DoGSiteScorer)"),
     "similarity": ("polyphar.stages.similarity", "PocketMatch pocket similarity"),
     "select": ("polyphar.stages.select", "select polypharmacology targets"),
     "dock": ("polyphar.stages.dock", "dock the ligand library with smina"),
