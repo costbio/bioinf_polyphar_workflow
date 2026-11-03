@@ -150,3 +150,18 @@ def test_rg_is_insensitive_to_residue_numbering_but_segments_are_not():
         annotate.radius_of_gyration(xyz_g))
     assert annotate.count_segments(sorted(r for r, *_ in contiguous)) == 1
     assert annotate.count_segments(sorted(r for r, *_ in gapped)) == 8
+
+
+def test_annotate_is_in_the_pipeline_order_before_select():
+    """It produces the annotations `select` filters on, so it must run first — and it
+    must be in ORDER at all, or `polyphar run` skips it silently."""
+    from polyphar.benchmark import ORDER, STAGE_DIRS
+    assert "annotate" in ORDER
+    assert ORDER.index("annotate") < ORDER.index("select")
+    assert STAGE_DIRS["annotate"] == "04_pockets/annotation"
+
+
+def test_similarity_runs_after_select():
+    """similarity no longer feeds selection; it runs on the panel's eligible pockets."""
+    from polyphar.benchmark import ORDER
+    assert ORDER.index("select") < ORDER.index("similarity")

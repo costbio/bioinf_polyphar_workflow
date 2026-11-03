@@ -80,6 +80,9 @@ PRIORS_SOURCE = "2023 HCC net2 run"
 KEPT_POCKETS_PRIOR = {"dogsite2": PRIORS["kept_pockets_per_model"], "dogsite3": 11 / 50}
 
 BENCH_STAGES = ("uniprot", "structures", "fix", "pockets", "similarity", "dock")
+# share of selected pockets that survive the panel filters, for the pre-run estimate
+# only (measured on net1: 599 of 11,599). The real count comes from `select`.
+ELIGIBLE_FRACTION = 0.052
 HOST_CALIBRATED = ("host-calibrated: DoGSite3 / DoGSiteScorer runs on the host only; calibrate "
                    "with bin/polyphar-dogsite-worker --benchmark --tool <tool> "
                    "(bin/polyphar-docker does it)")
@@ -271,10 +274,17 @@ def run_benchmark(stages, calib, log=print) -> dict:
 
 # --- run state: observed values for the projection ---------------------------------------
 
-ORDER = ("ids", "uniprot", "structures", "fix", "pockets", "similarity", "select", "dock")
+# `similarity` runs AFTER `select`: it no longer feeds target selection (which is now
+# panel filters alone) and is only needed for the post hoc similarity test, so it runs on
+# the panel's eligible pockets. On net1 that is ~179k pairs against 67.2M, three orders
+# of magnitude cheaper. The stage directory numbers are left as they are — renaming them
+# would invalidate every existing run folder for no gain.
+ORDER = ("ids", "uniprot", "structures", "fix", "pockets", "annotate", "select",
+         "similarity", "dock")
 STAGE_DIRS = {"ids": "00_ids", "uniprot": "01_uniprot", "structures": "02_structures",
-              "fix": "03_pdbfixer", "pockets": "04_pockets", "similarity": "05_similarity",
-              "select": "06_targets", "dock": "07_docking"}
+              "fix": "03_pdbfixer", "pockets": "04_pockets",
+              "annotate": "04_pockets/annotation", "select": "06_targets",
+              "similarity": "05_similarity", "dock": "07_docking"}
 
 
 def completed(layout) -> list[str]:
@@ -405,8 +415,13 @@ def projected_units(stage: str, s: dict) -> WorkUnits | None:
     if stage == "pockets":
         sizes = [float(s["fixed_chain_bytes"])] * n_pdb + [float(s["af_model_bytes"])] * n_af
         return WorkUnits(len(sizes), "bytes", sizes)
+    if stage == "annotate":
+        return WorkUnits(round((n_pdb + n_af) * s["kept_pockets_per_model"]), "pockets")
     if stage == "similarity":
-        pockets = round((n_pdb + n_af) * s["kept_pockets_per_model"])
+        # pairs among the PANEL's eligible pockets, not every selected pocket: the stage
+        # now runs after `select`. On net1 that is ~179k pairs rather than 67.2M.
+        pockets = round((n_pdb + n_af) * s["kept_pockets_per_model"]
+                        * s.get("eligible_fraction", ELIGIBLE_FRACTION))
         return WorkUnits(pockets * (pockets - 1) // 2, "pairs")
     if stage == "dock":
         return WorkUnits(round(s["targets"] * s["ligands"]), "ligands")

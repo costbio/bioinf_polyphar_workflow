@@ -227,3 +227,35 @@ def test_offline_mode_fails_clearly_when_tm_data_is_missing(tmp_path):
                        tm="")        # tm.tsv exists but is empty
     with pytest.raises(FileNotFoundError, match="no-fetch-tm"):
         select.run(layout, _args(no_fetch_tm=True), _Progress())
+
+
+def test_eligible_pockets_csv_lists_every_passing_pocket(tmp_path):
+    """similarity consumes this file, so it must carry all eligible pockets, not the
+    one-per-protein panel."""
+    ds_rows = [_ds("P1", "AF-P1-F1", "P_1", "a.pdb", ds=0.9),
+               _ds("P1", "AF-P1-F1", "P_2", "b.pdb", ds=0.8),
+               _ds("P2", "AF-P2-F1", "P_1", "c.pdb", ds=0.7)]
+    anns = [_an("a.pdb"), _an("b.pdb"), _an("c.pdb")]
+    info = [{"UniProt ID": a, "PDB": "", "Chain ID": "A", "AlphaFold": "True",
+             "File": f"02_structures/{a}/AF-{a}-F1.pdb"} for a in ("P1", "P2")]
+    layout = _make_run(tmp_path, ds_rows, anns, info)
+
+    counts = select.run(layout, _args(), _Progress())
+    assert counts["panel"] == 2 and counts["eligible_pockets"] == 3
+
+    elig = list(csv.DictReader(open(layout.targets / "eligible_pockets.csv")))
+    assert len(elig) == 3
+    assert [e["Pocket_Path"] for e in elig] == [
+        "04_pockets/P1/a.pdb", "04_pockets/P1/b.pdb", "04_pockets/P2/c.pdb"]
+
+
+def test_excluded_accessions_are_absent_from_eligible_pockets_too(tmp_path):
+    ds_rows = [_ds("O15350", "AF-O15350-F1", "P_1", "a.pdb"),
+               _ds("P1", "AF-P1-F1", "P_1", "b.pdb")]
+    anns = [_an("a.pdb"), _an("b.pdb")]
+    info = [{"UniProt ID": a, "PDB": "", "Chain ID": "A", "AlphaFold": "True",
+             "File": f"02_structures/{a}/AF-{a}-F1.pdb"} for a in ("O15350", "P1")]
+    layout = _make_run(tmp_path, ds_rows, anns, info)
+    select.run(layout, _args(), _Progress())
+    elig = list(csv.DictReader(open(layout.targets / "eligible_pockets.csv")))
+    assert [e["UniProt_ID"] for e in elig] == ["P1"]

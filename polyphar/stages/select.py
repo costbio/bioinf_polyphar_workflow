@@ -41,7 +41,10 @@ from polyphar.common import WorkUnits, write_manifest
 STAGE = "select"
 DEFAULT_EXCLUDE = ("O15350",)
 EXCLUDE_REASONS = {"O15350": "p73: problematic for docking (legacy decision)"}
-OUTPUTS = ("final_targets.csv", "panel_funnel.tsv", "failed.tsv")
+OUTPUTS = ("final_targets.csv", "eligible_pockets.csv", "panel_funnel.tsv",
+           "failed.tsv")
+ELIGIBLE_COLUMNS = ["UniProt_ID", "Gene_Name", "Protein", "Pocket", "Pocket Filename",
+                    "Pocket_Path", "AlphaFold", "drugScore", "radius_of_gyration"]
 TARGET_COLUMNS = ["Node", "UniProt_ID", "Gene_Name", "Organism", "Structure_ID",
                   "Similarity", "Protein", "Chain", "Pocket", "Pocket_Path",
                   "Receptor_Path", "Is_Hub"]
@@ -252,6 +255,27 @@ def target_rows(panel, paths, chains) -> list[dict]:
     return out
 
 
+def eligible_rows(eligible, excluded) -> list[dict]:
+    """Every eligible pocket, not just the panel's one-per-protein pick. `similarity`
+    runs on these: the post hoc test needs pairwise similarity among panel pockets,
+    and this wider set also leaves a descriptive network. Sorted for reproducibility."""
+    out = []
+    for row, ann in eligible:
+        acc = row["UniProt ID"]
+        if acc in excluded:
+            continue
+        gene, _organism = split_entry_name(str(row.get("Gene Name", "")))
+        fname = row.get("Pocket Filename", "")
+        out.append({"UniProt_ID": acc, "Gene_Name": gene,
+                    "Protein": row.get("Protein", ""), "Pocket": row.get("Pocket", ""),
+                    "Pocket Filename": fname,
+                    "Pocket_Path": f"04_pockets/{acc}/{fname}",
+                    "AlphaFold": ann.get("AlphaFold", ""),
+                    "drugScore": row.get("drugScore", ""),
+                    "radius_of_gyration": ann.get("radius_of_gyration", "")})
+    return sorted(out, key=lambda r: (r["UniProt_ID"], r["Pocket Filename"]))
+
+
 def _atomic_rows(path: Path, columns, rows) -> None:
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
     try:
@@ -282,7 +306,7 @@ def run(layout, args, progress) -> dict:
     accessions = sorted({r["UniProt ID"] for r in rows})
     tm = _transmembrane(layout, accessions, getattr(args, "no_fetch_tm", False))
 
-    pan, funnel, rejections = panel_mod.select_panel(
+    pan, eligible, funnel, rejections = panel_mod.select_panel(
         rows, annotations, tm, parent_volumes, opts)
 
     dropped = {a: excluded[a] for a in list(pan) if a in excluded}
@@ -293,6 +317,8 @@ def run(layout, args, progress) -> dict:
     paths, chains = _receptor_paths(pan, protein_info)
     _atomic_rows(d / "final_targets.csv", TARGET_COLUMNS,
                  target_rows(pan, paths, chains))
+    _atomic_rows(d / "eligible_pockets.csv", ELIGIBLE_COLUMNS,
+                 eligible_rows(eligible, excluded))
     _atomic_rows(d / "panel_funnel.tsv", ["step", "pockets_remaining"],
                  [{"step": s, "pockets_remaining": n} for s, n in funnel])
 
@@ -305,7 +331,7 @@ def run(layout, args, progress) -> dict:
 
     af = sum(1 for _r, a in pan.values()
              if str(a.get("AlphaFold", "")).strip().lower() == "true")
-    counts = {"selected_pockets": len(rows), "eligible_pockets": funnel[-1][1],
+    counts = {"selected_pockets": len(rows), "eligible_pockets": len(eligible),
               "panel": len(pan), "alphafold": af, "experimental": len(pan) - af,
               "excluded": len(dropped), "rejected_pockets": len(rejections)}
     # The manifest is written last: its presence marks the stage as finished.

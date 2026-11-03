@@ -740,8 +740,33 @@ def parse_scores(score_file, pockets, protein_info):
 
 # --- stage ---------------------------------------------------------------------------
 
+def eligible_csv(layout):
+    return layout.targets / "eligible_pockets.csv"
+
+
 def _inputs(layout):
+    """The pockets to compare: the panel's eligible set, written by `select`.
+
+    This stage used to run over every selected pocket, because the old hub-and-neighbours
+    selection was computed from the resulting network. Selection is now panel filters
+    alone, and similarity is only used post hoc (are a drug's hit targets more mutually
+    similar than a random same-size panel set?), so comparing anything beyond the
+    eligible pockets is wasted work: on net1, ~179k pairs instead of 67.2M.
+    """
+    import csv as _csv
+
+    # pocket_table first, so a run folder missing BOTH inputs is told to run the
+    # earlier stage rather than sent to `select` for want of a file `select` cannot
+    # produce either.
     table, missing = pocket_table(layout.pockets)
+    path = eligible_csv(layout)
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"{path} not found: run `select` first (similarity now runs on the panel's "
+            f"eligible pockets, after selection, not before it)")
+    with open(path, newline="", encoding="utf-8") as fh:
+        keep = {r["Pocket Filename"] for r in _csv.DictReader(fh)}
+    table = table[table["Pocket Filename"].isin(keep)].reset_index(drop=True)
     return table, _paths(layout.pockets, table), missing
 
 

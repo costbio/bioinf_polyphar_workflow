@@ -178,10 +178,14 @@ def parent_key(row):
 
 
 def select_panel(rows, annotations, tm, parent_volumes, opts):
-    """(panel, funnel, rejections).
+    """(panel, eligible, funnel, rejections).
 
     panel      {accession: (DrugScore row, annotation row)} — one pocket per protein,
                highest drugScore, ties to the smallest pocket name.
+    eligible   [(DrugScore row, annotation row)] — every pocket that passed the filters,
+               not just the one per protein. This is what `similarity` runs on: the
+               post hoc test needs pairwise similarity among panel pockets, and the
+               wider eligible set also leaves a descriptive network for the paper.
     funnel     [(step, pockets remaining after it)], a chain that sums correctly.
     rejections [(item, step)] for every rejected pocket, for failed.tsv.
     """
@@ -214,4 +218,4 @@ def select_panel(rows, annotations, tm, parent_volumes, opts):
                            key=lambda ra: (-_f(ra[0].get("drugScore"), 0.0),
                                            str(ra[0].get("Pocket", "")))):
         panel.setdefault(row["UniProt ID"], (row, ann))
-    return panel, funnel, rejections
+    return panel, eligible, funnel, rejections

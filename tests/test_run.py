@@ -13,9 +13,11 @@ from polyphar.common import WorkUnits
 from polyphar.eta import Calibration
 from polyphar.stages import run as run_mod
 
-ORDER = ("ids", "uniprot", "structures", "fix", "pockets", "similarity", "select", "dock")
-DIRS = dict(zip(ORDER, ("00_ids", "01_uniprot", "02_structures", "03_pdbfixer", "04_pockets",
-                        "05_similarity", "06_targets", "07_docking")))
+# imported, not duplicated: a local copy silently stops stubbing a stage the moment a
+# new one is added to the pipeline
+from polyphar.benchmark import ORDER, STAGE_DIRS as DIRS  # noqa: E402
+# the single source of truth: zipping ORDER against a hardcoded tuple silently
+# shifts every mapping when a stage is added
 
 
 @pytest.fixture
@@ -89,7 +91,8 @@ def fake(monkeypatch, tmp_path):
 
 def _calibrate_all(home):
     c = Calibration.load(home)
-    for s in ("uniprot", "structures", "fix", "pockets", "similarity", "dock"):
+    for s in ("uniprot", "structures", "fix", "pockets", "annotate",
+              "similarity", "dock"):
         c.update(s, 1.0)
     c.save()
 
@@ -130,7 +133,7 @@ def test_runs_all_stages_in_order_through_the_gate(fake, capsys):
 def test_from_to_select_a_contiguous_range(fake):
     _calibrate_all(fake.home)
     assert _main(fake, "--from", "fix", "--to", "select") == 0
-    assert _runs(fake.events) == ["fix", "pockets", "similarity", "select"]
+    assert _runs(fake.events) == ["fix", "pockets", "annotate", "select"]
 
 
 def test_from_after_to_is_a_usage_error(fake, capsys):
@@ -280,12 +283,14 @@ def test_resume_skips_finished_stages_and_estimates_only_remaining_units(fake, c
     fake.state["fail"] = None
 
     assert _main(fake) == 0     # no ids options: 00_ids/ids.txt exists
-    assert _runs(fake.events) == ["fix", "pockets", "similarity", "select", "dock"]
+    assert _runs(fake.events) == ["fix", "pockets", "annotate", "select",
+                                  "similarity", "dock"]
     out = capsys.readouterr().out
     # ETA only for the remaining work: fix has 1 unit left
     assert "fix: 1 units (things) - ETA" in out
     starts = [t for t, _, _ in fake.notes if t.endswith(" starting")]
-    assert starts == [f"{s} starting" for s in ("fix", "pockets", "similarity", "select",
+    assert starts == [f"{s} starting" for s in ("fix", "pockets", "annotate", "select",
+                                                       "similarity",
                                                  "dock")]
     summary = fake.notes[-1][1]
     for s in ("ids", "uniprot", "structures"):
@@ -483,7 +488,8 @@ def test_keep_going_overrides_the_failed_fraction(fake):
     _calibrate_all(fake.home)
     fake.state["counts"]["pockets"] = {"failed": 3, "models": 10}
     assert _main(fake, "--from", "pockets", "--keep-going") == 3
-    assert _runs(fake.events) == ["pockets", "similarity", "select", "dock"]
+    assert _runs(fake.events) == ["pockets", "annotate", "select", "similarity",
+                                  "dock"]
 
 
 def test_failed_fraction_at_the_limit_continues(fake):

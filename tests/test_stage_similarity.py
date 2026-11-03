@@ -48,7 +48,22 @@ def _run_folder(tmp_path, files):
     pd.DataFrame({"UniProt ID": sorted(set(accs)),
                   "Gene Name": [f"G{a}_HUMAN" for a in sorted(set(accs))]}
                  ).to_csv(layout.protein_info, index=False)
+    # similarity now runs on the panel's eligible pockets, written by `select`, rather
+    # than on every selected pocket. These fixtures predate that, so every pocket here
+    # is eligible.
+    write_eligible(layout, [(acc, name) for (acc, name) in files])
     return layout
+
+
+def write_eligible(layout, pockets):
+    """06_targets/eligible_pockets.csv, as `select` writes it."""
+    layout.targets.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame([{"UniProt_ID": acc, "Gene_Name": f"G{acc}", "Protein": "X",
+                   "Pocket": "P_1", "Pocket Filename": name,
+                   "Pocket_Path": f"04_pockets/{acc}/{name}", "AlphaFold": "False",
+                   "drugScore": 0.9, "radius_of_gyration": 6.0}
+                  for acc, name in pockets]
+                 ).to_csv(layout.targets / "eligible_pockets.csv", index=False)
 
 
 # --- name guard (Review Focus 4) -----------------------------------------------------

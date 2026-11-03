@@ -116,8 +116,8 @@ def test_estimate_table_marks_projection(tmp_path, monkeypatch):
     calib = _calib(tmp_path, structures=1.5, fix=2e-5, similarity=0.002, dock=70.0)
     rows, observed = benchmark.estimate_rows(layout, 4, calib)
     by = {r["stage"]: r for r in rows}
-    assert [r["stage"] for r in rows] == ["structures", "fix", "pockets", "similarity",
-                                          "select", "dock"]
+    assert [r["stage"] for r in rows] == ["structures", "fix", "pockets", "annotate",
+                                          "select", "similarity", "dock"]
     assert by["structures"]["kind"] == "exact" and by["structures"]["seconds"] > 0
     assert by["dock"]["kind"] == "projected" and by["fix"]["kind"] == "projected"
     assert by["select"]["kind"] == "trivial"
@@ -195,6 +195,14 @@ def _write_pockets(layout, names):
         rows.append({"UniProt ID": "P12345", "Gene Name": "G", "Protein": "1abc_A",
                      "Pocket": "P_1", "drugScore": 0.9, "Pocket Filename": name})
     pd.DataFrame(rows).to_csv(layout.drugscore_csv)
+    # similarity now runs on the panel's eligible pockets, written by `select`. Every
+    # pocket here is eligible, so the name guard is still what trips.
+    layout.targets.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame([{"UniProt_ID": "P12345", "Gene_Name": "G", "Protein": "1abc_A",
+                   "Pocket": "P_1", "Pocket Filename": n,
+                   "Pocket_Path": f"04_pockets/P12345/{n}", "AlphaFold": "False",
+                   "drugScore": 0.9, "radius_of_gyration": 6.0} for n in names]
+                 ).to_csv(layout.targets / "eligible_pockets.csv", index=False)
 
 
 def test_estimate_is_read_only_even_when_the_name_guard_trips(tmp_path, monkeypatch):
@@ -203,13 +211,16 @@ def test_estimate_is_read_only_even_when_the_name_guard_trips(tmp_path, monkeypa
     monkeypatch.setenv("POLYPHAR_HOME", str(tmp_path / "home"))
     layout, _ = _run_with_uniprot_done(tmp_path)
     layout.structures.mkdir(parents=True, exist_ok=True)
-    for stage in ("structures", "fix", "pockets"):
+    # annotate and select are done too, so `similarity` is the NEXT stage and estimate
+    # asks it for exact units — which is what makes it reach the name guard at all.
+    for stage in ("structures", "fix", "pockets", "annotate", "select"):
         write_manifest(layout.run_dir / benchmark.STAGE_DIRS[stage], stage, {}, [], {}, {}, {})
     _write_pockets(layout, ["P12345_" + "x" * 40 + ".pdb"])   # > 32 characters
     before = _snapshot(layout.run_dir)
     rows, _ = benchmark.estimate_rows(layout, 4, _calib(tmp_path, similarity=0.002))
-    assert rows[0]["stage"] == "similarity" and rows[0]["kind"] == "projected"
-    assert "exact units unavailable" in rows[0]["note"]   # the guard raised ...
+    sim_row = next(r for r in rows if r["stage"] == "similarity")
+    assert sim_row["kind"] == "projected"
+    assert "exact units unavailable" in sim_row["note"]   # the guard raised ...
     assert _snapshot(layout.run_dir) == before            # ... and recorded nothing
     assert benchmark._stage_args("similarity", layout, 4).dry_run is True
     assert not (layout.similarity / "failed.tsv").exists()

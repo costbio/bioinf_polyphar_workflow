@@ -96,7 +96,7 @@ def test_funnel_is_a_chain_that_sums():
     anns = {r["Pocket Filename"]: _ann() for r in rows}
     for r in rows:
         anns[r["Pocket Filename"]] = _ann()
-    pan, funnel, rej = panel.select_panel(rows, anns, {}, {}, OPTS)
+    pan, elig, funnel, rej = panel.select_panel(rows, anns, {}, {}, OPTS)
     assert funnel[0] == ("selected", 3)
     assert [s for s, _ in funnel][1:] == panel.STEPS
     counts = [n for _, n in funnel]
@@ -108,7 +108,7 @@ def test_funnel_is_a_chain_that_sums():
 def test_one_row_per_protein_takes_the_highest_drugscore():
     rows = [_row(acc="P1", pocket="P_1", ds=0.6), _row(acc="P1", pocket="P_2", ds=0.95)]
     anns = {r["Pocket Filename"]: _ann() for r in rows}
-    pan, _, _ = panel.select_panel(rows, anns, {}, {}, OPTS)
+    pan, _, _, _ = panel.select_panel(rows, anns, {}, {}, OPTS)
     assert len(pan) == 1
     assert pan["P1"][0]["Pocket"] == "P_2"
 
@@ -117,14 +117,14 @@ def test_tie_on_drugscore_breaks_on_pocket_name_not_row_order():
     a = _row(acc="P1", pocket="P_1", ds=0.8)
     b = _row(acc="P1", pocket="P_2", ds=0.8)
     anns = {r["Pocket Filename"]: _ann() for r in (a, b)}
-    first, _, _ = panel.select_panel([a, b], anns, {}, {}, OPTS)
-    second, _, _ = panel.select_panel([b, a], anns, {}, {}, OPTS)
+    first, _, _, _ = panel.select_panel([a, b], anns, {}, {}, OPTS)
+    second, _, _, _ = panel.select_panel([b, a], anns, {}, {}, OPTS)
     assert first["P1"][0]["Pocket"] == second["P1"][0]["Pocket"] == "P_1"
 
 
 def test_a_pocket_without_an_annotation_is_reported_not_silently_dropped():
     rows = [_row(acc="P1")]
-    pan, funnel, rej = panel.select_panel(rows, {}, {}, {}, OPTS)
+    pan, elig, funnel, rej = panel.select_panel(rows, {}, {}, {}, OPTS)
     assert pan == {}
     assert rej == [("P1/AF-P1-F1_res_P_1.pdb", "missing annotation")]
 
@@ -152,5 +152,14 @@ def test_subpocket_parent_lookup_does_not_cross_structures():
     anns = {"1abc_A_res_P_1_1.pdb": _ann(af=False, plddt=None)}
     volumes = {("P1", "1ABC_A", "P_1"): 900.0,       # its real parent: fine
                ("P1", "AF-P1-F1", "P_1"): 25840.0}   # another structure's: irrelevant
-    pan, _, rej = panel.select_panel(rows, anns, {}, volumes, OPTS)
+    pan, _, _, rej = panel.select_panel(rows, anns, {}, volumes, OPTS)
     assert len(pan) == 1 and not rej
+
+
+def test_eligible_returns_every_passing_pocket_not_one_per_protein():
+    """`similarity` runs on the eligible set, so it must not be collapsed to the panel."""
+    rows = [_row(acc="P1", pocket="P_1", ds=0.9), _row(acc="P1", pocket="P_2", ds=0.8),
+            _row(acc="P2", pocket="P_1", ds=0.7)]
+    anns = {r["Pocket Filename"]: _ann() for r in rows}
+    pan, elig, _, _ = panel.select_panel(rows, anns, {}, {}, OPTS)
+    assert len(pan) == 2 and len(elig) == 3
