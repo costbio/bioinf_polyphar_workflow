@@ -20,7 +20,7 @@ from polyphar.stages.annotate import encode_residues
 
 def _args(**kw):
     # taken from the module, so the suite cannot stay green past a default change
-    base = dict(surf_vol_max=panel.SURFVOL_MAX, volume_min=panel.VOLUME_MIN,
+    base = dict(volume_min=panel.VOLUME_MIN,
                 volume_max=panel.VOLUME_MAX, drugscore_min=panel.DRUGSCORE_MIN,
                 plddt_min=panel.PLDDT_MIN, tm_policy="C",
                 tm_overlap=panel.TM_OVERLAP_MAX, per_protein=panel.PER_PROTEIN,
@@ -164,7 +164,7 @@ def test_run_writes_the_panel_the_funnel_and_a_reason_per_rejection(tmp_path):
     ds_rows = [
         _ds("P1", "AF-P1-F1", "P_1", "a.pdb"),                 # kept
         _ds("P2", "AF-P2-F1", "P_1", "b.pdb", vol=5000.0),     # rejected: volume
-        _ds("P3", "AF-P3-F1", "P_1", "c.pdb", sv=0.90),        # rejected: enclosure
+        _ds("P3", "AF-P3-F1", "P_1", "c.pdb", vol=9000.0),     # rejected: volume
     ]
     anns = [_an("a.pdb"), _an("b.pdb"), _an("c.pdb")]
     info = [{"UniProt ID": a, "PDB": "", "Chain ID": "A", "AlphaFold": "True",
@@ -184,12 +184,11 @@ def test_run_writes_the_panel_the_funnel_and_a_reason_per_rejection(tmp_path):
 
     failed = (layout.targets / "failed.tsv").read_text().strip().splitlines()
     assert len(failed) == 3                                     # header + 2 rejections
-    assert any("volume" in l for l in failed)
-    assert any("surface-to-volume" in l for l in failed)
+    assert sum(1 for l in failed if "volume" in l) == 2
 
     manifest = json.loads((layout.targets / "manifest.json").read_text())
     assert manifest["counts"]["panel"] == 1
-    assert manifest["args"]["surfvol_max"] == panel.SURFVOL_MAX
+    assert manifest["args"]["volume_max"] == panel.VOLUME_MAX
 
 
 def test_excluded_accessions_are_dropped_and_recorded(tmp_path):

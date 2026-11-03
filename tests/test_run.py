@@ -226,10 +226,10 @@ def test_dry_run_prints_the_estimate_table_and_runs_nothing(fake, capsys, monkey
 def test_run_accepts_the_stage_options():
     args = cli.build_parser().parse_args(
         ["run", "--txt", "inputs/ids.txt", "--ph", "7.0", "--worker-timeout", "60",
-         "--pm-bin-dir", "/opt/pm", "--surf-vol-max", "0.4", "--exclude",
+         "--pm-bin-dir", "/opt/pm", "--per-protein", "3", "--exclude",
          "--library", "inputs/x.sdf", "--seed", "7", "--chunk-size", "5",
          "--threads-per-job", "2", "--chunk-timeout", "100"])
-    assert args.txt == "inputs/ids.txt" and args.surf_vol_max == 0.4 and args.exclude == []
+    assert args.txt == "inputs/ids.txt" and args.per_protein == 3 and args.exclude == []
     assert args.library == "inputs/x.sdf" and args.chunk_size == 5 and args.seed == 7
     assert args.from_stage == "ids" and args.to_stage == "dock"
     # ids' source options stay mutually exclusive
@@ -342,11 +342,11 @@ def test_sigterm_during_auto_benchmark_ends_in_run_failed_summary(fake):
 
 def test_options_of_stages_outside_the_range_are_warned(fake, capsys):
     _calibrate_all(fake.home)
-    assert _main(fake, "--from", "uniprot", "--to", "uniprot", "--surf-vol-max", "0.4",
+    assert _main(fake, "--from", "uniprot", "--to", "uniprot", "--per-protein", "3",
                  "--library", "inputs/x.sdf", "--threads-per-job", "1") == 0
     err = capsys.readouterr().err.splitlines()
     warned = [l for l in err if "warning" in l]
-    assert any("--surf-vol-max" in l and "select" in l for l in warned)
+    assert any("--per-protein" in l and "select" in l for l in warned)
     assert any("--library" in l and "dock" in l for l in warned)
     assert not any("--threads-per-job" in l for l in warned)   # default value: not "given"
     assert len(warned) == 2

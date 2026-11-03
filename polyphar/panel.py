@@ -35,13 +35,15 @@ net1, which is one subtype with a known-bad history.
                      (the worst average 84.8 against 83.3 overall): it is local
                      per-residue confidence, not domain packing. PAE would be the right
                      metric.
-  surf/vol <= 0.45   enclosure. Low means enclosed, high splayed open. Pockets holding a
-                     co-crystal ligand sit at a median 0.410 against 0.510 for all
-                     pockets, so this enriches for binding-site-like shape. It does NOT
-                     reject the oversized cavities (those are 0.539, barely
-                     distinguishable) — volume does that. The two filters do different
-                     jobs. The threshold has no literature value; it is placed near the
-                     observed ligand-bound centre, and Methods should say so.
+  (surf/vol)         REMOVED. It was added as an enclosure criterion, then measured to
+                     have a 25.9-point AlphaFold-versus-experimental pass-rate gap
+                     (12.2% against 38.1%) — worse than the 21.9 that got
+                     `segments <= 3` rejected. The AlphaFold share falling 53% -> 32%
+                     under it was that bias, not an improvement. Its enrichment claim
+                     was also confounded: surface-to-volume falls with volume by
+                     geometry, so "ligand-bound pockets have lower surf/vol" may simply
+                     restate "ligand-bound pockets are bigger". Third filter in a row to
+                     fail the same class-bias check; removed (user, 2026-11-03).
   TM policy          see tm_reject(). The artifact is multi-pass proteins, whose single
                      extracted chains yield lipid-facing grooves and pore lumens.
   Uni-Dock grid      a guard, not a selector: the engine exits on a violation, and
@@ -60,7 +62,6 @@ VOLUME_MIN = 300.0
 VOLUME_MAX = 1500.0
 PARENT_VOLUME_MAX = 1500.0
 PLDDT_MIN = 70.0
-SURFVOL_MAX = 0.45
 TM_OVERLAP_MAX = 0.10
 SPACING = 0.375
 MAX_AXIS = 128
@@ -70,14 +71,13 @@ PER_PROTEIN = 2   # pockets docked per protein, best drugScore first
 
 # The funnel steps, in order. Each pocket is attributed to the FIRST step it fails, so
 # the counts form a chain and sum correctly.
-STEPS = ["drugscore", "volume", "subpocket_parent", "plddt", "surfvol", "tm", "grid"]
+STEPS = ["drugscore", "volume", "subpocket_parent", "plddt", "tm", "grid"]
 STEP_REASON = {
     "drugscore": "drugScore below the cutoff",
     "volume": "pocket volume outside the allowed range",
     "subpocket_parent": "subpocket of a parent above the volume ceiling",
     "plddt": "AlphaFold pocket pLDDT below the floor",
     "tm": "rejected by the transmembrane policy",
-    "surfvol": "surface-to-volume ratio above the enclosure cutoff",
     "grid": "docking box exceeds Uni-Dock's grid limits",
 }
 
@@ -87,7 +87,7 @@ class Options:
 
     def __init__(self, drugscore_min=DRUGSCORE_MIN, volume_min=VOLUME_MIN,
                  volume_max=VOLUME_MAX, parent_volume_max=PARENT_VOLUME_MAX,
-                 plddt_min=PLDDT_MIN, surfvol_max=SURFVOL_MAX, tm_policy="C",
+                 plddt_min=PLDDT_MIN, tm_policy="C",
                  tm_overlap_max=TM_OVERLAP_MAX, spacing=SPACING,
                  per_protein=PER_PROTEIN):
         if tm_policy not in TM_POLICIES:
@@ -97,7 +97,6 @@ class Options:
         self.volume_max = float(volume_max)
         self.parent_volume_max = float(parent_volume_max)
         self.plddt_min = float(plddt_min)
-        self.surfvol_max = float(surfvol_max)
         self.tm_policy = tm_policy
         self.tm_overlap_max = float(tm_overlap_max)
         self.spacing = float(spacing)
@@ -170,9 +169,6 @@ def classify(row, ann, tm_segments, parent_volume, opts) -> str | None:
         pl = _f(ann.get("pocket_plddt_mean"))
         if pl is None or pl < opts.plddt_min:
             return "plddt"
-    sv = _f(row.get("surf/vol"))
-    if sv is None or sv > opts.surfvol_max:
-        return "surfvol"
     residues = ann.get("_residues") or []
     if tm_reject(is_af, tm_segments, residues, opts):
         return "tm"

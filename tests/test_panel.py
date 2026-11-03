@@ -31,7 +31,6 @@ ONE = panel.Options(per_protein=1)
     ({"ds": 0.4}, {}, "drugscore"),
     ({"vol": 250.0}, {}, "volume"),
     ({"vol": 2500.0}, {}, "volume"),
-    ({"sv": 0.80}, {}, "surfvol"),
     ({}, {"plddt": 60.0}, "plddt"),
     ({}, {"plddt": None}, "plddt"),
     ({}, {"size": (50.0, 10.0, 10.0)}, "grid"),      # 134 points on one axis
@@ -51,16 +50,16 @@ def test_subpocket_of_an_oversized_parent_is_rejected():
     assert panel.classify(r, _ann(), [], 25840.0, OPTS) == "subpocket_parent"
 
 
-def test_enclosure_is_checked_before_the_tm_rule():
+def test_volume_is_checked_before_the_tm_rule():
     """Order matters for the funnel: a pocket failing both must be attributed to the
     first step, or the counts stop forming a chain."""
-    assert panel.classify(_row(sv=0.9), _ann(), [(5, 25)], None, OPTS) == "surfvol"
+    assert panel.classify(_row(vol=9000.0), _ann(), [(5, 25)], None, OPTS) == "volume" 
 
 
 def test_volume_ceiling_is_what_rejects_oversized_cavities():
-    """surf/vol does not separate them (0.539 against 0.510 for all pockets); volume
-    does (~2,600 A^3 against ~270). The two filters do different jobs."""
-    oversized = _row(vol=2600.0, sv=0.539)
+    """The oversized interdomain cavities run ~2,600 A^3 against ~270 for a typical
+    pocket. surf/vol could not separate them (0.539 against 0.510) and was removed."""
+    oversized = _row(vol=2600.0)
     assert panel.classify(oversized, _ann(), [], None, OPTS) == "volume"
 
 
@@ -209,6 +208,5 @@ def test_defaults_come_from_the_module_not_from_test_literals():
     """A test that hardcodes thresholds stays green when the production default moves —
     the failure mode that has already bitten this repo twice."""
     o = panel.Options()
-    assert (o.surfvol_max, o.volume_min, o.volume_max, o.plddt_min, o.per_protein) == (
-        panel.SURFVOL_MAX, panel.VOLUME_MIN, panel.VOLUME_MAX, panel.PLDDT_MIN,
-        panel.PER_PROTEIN)
+    assert (o.volume_min, o.volume_max, o.plddt_min, o.per_protein) == (
+        panel.VOLUME_MIN, panel.VOLUME_MAX, panel.PLDDT_MIN, panel.PER_PROTEIN)

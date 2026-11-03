@@ -79,22 +79,30 @@ plainly, rather than tuned to net1 — one subtype with a known-bad history.
 | `300 <= volume <= 1500 A^3` | the cited druggable range is ~300-1000, stricter criteria near 1000; 1500 is a deliberate allowance. **The ceiling is what rejects the oversized interdomain cavities** (~2,600 A^3 against ~270 typical); 2 of the 100 worst survive |
 | subpocket parent `<= 1500 A^3` | without it, a subpocket carved from a 25,840 A^3 cleft passes the ceiling and becomes its protein's representative |
 | AF pocket `pLDDT >= 70` | a sanity floor only — pLDDT does **not** detect the oversized cavities (the worst average 84.8 against 83.3 overall). It is local per-residue confidence, not domain packing; PAE would be the right metric |
-| `surf/vol <= 0.45` | enclosure. Ligand-bound pockets sit at a median 0.410 against 0.510 for all pockets. It does **not** reject the oversized cavities (0.539, barely distinguishable) |
 | TM policy C | drop multi-pass TM proteins; drop AF pockets overlapping a TM segment by > 10% |
 | Uni-Dock grid legality | a guard, not a selector: <=128 points per axis and <=531,441 total at 0.375 A |
 
-**Volume and `surf/vol` are both kept because they do different jobs** — volume rejects
-oversized cavities and cannot judge shape; `surf/vol` judges shape and cannot separate the
-oversized ones.
+**`surf/vol <= 0.45` was added, then removed** (user, 2026-11-03). It was measured to have
+a **25.9-point AlphaFold-versus-experimental pass-rate gap** (12.2% against 38.1%) — worse
+than the 21.9 that got `segments <= 3` rejected. The AlphaFold share falling 53% -> 32%
+under it was that bias, not an improvement. Its enrichment claim was also confounded:
+surface-to-volume falls with volume by geometry, so "ligand-bound pockets have lower
+surf/vol" may simply restate "ligand-bound pockets are bigger". It was the third filter in
+a row to fail the same class-bias check, and that check had not been run on it.
 
-### Two honest caveats
+### Honest caveats
 
 - **`drugScore >= 0.5` does no work.** `DrugScore.csv`'s `Selected` column already means
   exactly that, so the step is inherited from `pockets` and constrains nothing further.
   Raise it above 0.5 for it to filter.
-- **`surf/vol <= 0.45` has no literature value.** It is placed near the observed
-  ligand-bound centre. Unlike Rg the direction is physically unambiguous, but it is still
-  a descriptive choice and Methods must say so.
+- **The volume range is the only real selector**, alongside the TM rule. Three attempts
+  at a shape criterion (`segments`, `Rg`, `surf/vol`) were each measured and each
+  rejected. That is the honest state: this panel is "pockets DoGSiteScorer scored as
+  druggable, in a drug-sized volume range, not in a membrane".
+- **An earlier comparison demoting drugScore was invalid** and is withdrawn:
+  `discriminate.py` built its set from `Selected` rows, which *is* drugScore >= 0.5, so
+  drugScore's AUC 0.684 came from a truncated range while volume's 0.851 used the full
+  one.
 
 ### The funnel
 
@@ -104,17 +112,29 @@ oversized ones.
 | volume 300-1500 | 4,705 |
 | subpocket parent | 3,621 |
 | AF pLDDT >= 70 | 3,458 |
-| surf/vol <= 0.45 | 1,647 |
-| TM policy C | 1,435 |
-| Uni-Dock grid legal | 1,367 |
+| TM policy C | 2,591 |
+| Uni-Dock grid legal | 2,388 |
 
-**Panel: 158 proteins, 1,367 eligible pockets, 32% AlphaFold** (50 AF, 108 experimental).
-One row per protein, the eligible pocket with the highest drugScore, ties to the smallest
-pocket name. Every rejected pocket carries a reason in `failed.tsv`, and rejections plus
-eligible equals selected.
+**Panel: 271 proteins, 482 docking targets, 2,388 eligible pockets, 63% AlphaFold.**
+Every rejected pocket carries a reason in `failed.tsv`, and rejections plus eligible
+equals selected.
 
-The AlphaFold share falling from 53-68% to **32%** materially reduces the interface-pocket
-exposure below, which remains the panel's main uncontrolled risk.
+### Up to two pockets per protein
+
+Picking one pocket per protein by drugScore is close to a coin flip. Against the 29
+experimental panel proteins that have a pocket with a co-crystallised drug-like ligand,
+the highest-drugScore pick was that pocket in **17 (59%)** — so roughly 40% of the time
+the docking would be into the wrong cavity. That is the same failure that killed the
+cluster layer.
+
+**Up to 2 pockets per protein are docked** (user, 2026-11-03), best drugScore first,
+taking only pockets that pass every filter — a protein with one eligible pocket
+contributes one. Replicates drop from 5 to 3 to pay for it. This removes the choice rather
+than trying to make it correctly, and a drug hitting *any* pocket of a protein is closer
+to what the claim means anyway.
+
+**At 63% AlphaFold, interface-pocket exposure is the panel's main uncontrolled risk** and
+must be stated in Methods.
 
 ### The docking box is unchanged
 
@@ -168,15 +188,18 @@ PDBQTs, ligands and boxes.
 
 | scope | GPU-hours | units (L4 @ 1.94/hr measured) |
 |---|---|---|
-| 158-protein panel, 1,960 ligands, 1 replicate | 15.1 | 29 |
-| all 7 subtypes, 1 replicate | 106 | 206 |
-| **all 7 subtypes, 5 replicates** | 530 | **1,028** |
+| net1: 482 targets x 1,960 ligands, 1 replicate | 46.2 | 90 |
+| all 7 subtypes at 7.0x net1, 3 replicates | 970 | **1,881** |
+| all 7 at a size-weighted ~2.5x net1, 3 replicates | 341 | **661** |
 
-Against a 1,600-unit balance (~64%), units expiring after 90 days. The 7.0x subtype
-multiplier is an overestimate — AD subtypes have 78/88/132/21 input accessions against
-net1's 461 — so this errs safe.
+**The budget depends on which multiplier is right, and we do not yet know.** 7.0x net1
+exceeds the 1,600-unit balance; but net1 has 461 input accessions against 156/197 for
+net2/net3 and 78/88/132/21 for the AD clusters, so a size-weighted estimate is ~2.5x and
+comfortable. The real figure needs the other subtypes' pockets, which do not exist yet.
+Treat 1,881 as the worst case and re-estimate after the second subtype.
 
-**Scores are means over 5 replicates with a reported standard error** (user, 2026-11-03).
+**Scores are means over 3 replicates with a reported standard error** (user,
+2026-11-03).
 
 **Unresolved, and blocking the statistic.** The SE must be derived from a proper standard
 deviation, not from mean |delta| / sqrt(N) (for a normal, E|X-Y| ~ 1.13 sigma). Replicate
@@ -230,17 +253,32 @@ subtypes is thousands of tests and its best p-value is not a p-value. Either pre
 one combination **before** looking at new results, or correct across the grid and report
 the whole surface.
 
-### The post hoc similarity test
+### The post hoc similarity test — DEFERRED
 
-For each drug, take its hit set and summarise pairwise pocket similarity within it from
-`Pocketsim.csv`. Compare against permutation: random same-size target sets drawn from the
-panel, optionally matched on pocket volume. This needs no new docking.
+**Not part of the current scope** (user, 2026-11-03). Recorded here so the reasons are
+not lost if it is picked up again.
 
-One inherited filter must be examined first: `parse_scores` (`similarity.py:714`) drops
-pairs with `Pmax == 1.0` as a "legacy filter". Since same-accession pairs are excluded
-separately, this discards *cross-protein* pairs with perfect similarity — the strongest
-possible evidence for the claim. Count them among the 1,367 eligible pockets before
-inheriting the rule.
+The intended test was: for each drug, is its hit set more mutually similar than a random
+same-size set from the panel? **As designed it would have produced a positive result from
+pocket size alone.** A drug's hit set is not a random draw — it is the pockets whose
+docking score passed a cutoff, and docking score rises with pocket size, while PocketMatch
+Pmax is itself size-driven. So the hit set is size-enriched and size-similar pockets are
+mutually similar, while a null drawn uniformly over the panel contains no such
+enrichment.
+
+Fixing it would need the null to preserve the thresholding mechanism — permuting *drugs*
+against the fixed score matrix rather than sampling pockets — plus volume matching made
+mandatory, FDR across drugs, a defined summary statistic, and stratification by
+AlphaFold/experimental.
+
+Two input problems would also need settling: `parse_scores` (`similarity.py:714`) drops
+pairs with `Pmax == 1.0` **and** `Pmin == 1.0`, discarding cross-protein pairs with
+perfect similarity — the strongest possible evidence for the claim; and `Pocketsim.csv` is
+a filtered edge list, not a matrix, so the test needs the complete pairwise set among the
+docked pockets including zeros.
+
+`similarity` still runs and still produces `Pocketsim.csv`; it is descriptive output for
+now.
 
 ### Positive control — a prerequisite
 

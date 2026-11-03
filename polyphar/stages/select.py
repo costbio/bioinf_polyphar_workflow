@@ -40,7 +40,7 @@ from polyphar.common import WorkUnits, write_manifest
 
 STAGE = "select"
 # bumped whenever the filter SET changes, so a run folder records which rules made it
-PANEL_VERSION = 3
+PANEL_VERSION = 4
 DEFAULT_EXCLUDE = ("O15350",)
 EXCLUDE_REASONS = {"O15350": "p73: problematic for docking (legacy decision)"}
 OUTPUTS = ("final_targets.csv", "eligible_pockets.csv", "panel_funnel.tsv",
@@ -56,10 +56,6 @@ NO_CHAIN = "-"   # a PDB-style Protein field without a chain
 
 def add_arguments(parser) -> None:
     p = panel_mod
-    parser.add_argument("--surf-vol-max", type=float, default=p.SURFVOL_MAX,
-                        metavar="R",
-                        help=f"pocket surface-to-volume cutoff, the enclosure criterion "
-                             f"(default: {p.SURFVOL_MAX}); lower is more enclosed")
     parser.add_argument("--volume-min", type=float, default=p.VOLUME_MIN, metavar="V")
     parser.add_argument("--volume-max", type=float, default=p.VOLUME_MAX, metavar="V")
     parser.add_argument("--drugscore-min", type=float, default=p.DRUGSCORE_MIN, metavar="S")
@@ -92,7 +88,6 @@ def _options(args) -> panel_mod.Options:
         volume_min=getattr(args, "volume_min", panel_mod.VOLUME_MIN),
         volume_max=getattr(args, "volume_max", panel_mod.VOLUME_MAX),
         plddt_min=getattr(args, "plddt_min", panel_mod.PLDDT_MIN),
-        surfvol_max=getattr(args, "surf_vol_max", panel_mod.SURFVOL_MAX),
         tm_policy=getattr(args, "tm_policy", "C"),
         tm_overlap_max=getattr(args, "tm_overlap", panel_mod.TM_OVERLAP_MAX),
         per_protein=getattr(args, "per_protein", panel_mod.PER_PROTEIN),
@@ -354,7 +349,7 @@ def run(layout, args, progress) -> dict:
                    args={**opts.as_dict(), "exclude": sorted(excluded)},
                    inputs=[layout.drugscore_csv, annotation_path(layout),
                            layout.protein_info],
-                   versions={"panel": "surfvol-volume", "per_protein": PANEL_VERSION}, counts=counts, timing={},
+                   versions={"panel": "volume-drugscore", "panel_version": PANEL_VERSION}, counts=counts, timing={},
                    extra={"funnel": dict(funnel),
                           "outputs": {n: (d / n).stat().st_size for n in OUTPUTS}})
     return counts
