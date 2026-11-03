@@ -16,7 +16,7 @@ execution model, not a parameter change.
 |---|---|---|
 | engine | smina 2020.12.10 (Vina 1.1.2), CPU | Uni-Dock 1.2.0, CUDA |
 | determinism | guaranteed; a test pins it | **impossible**; 95-98% of ligands move between identical runs |
-| a score | one number | mean over 5 replicates, with SE |
+| a score | one number | mean over 3 replicates, with SE |
 | where it runs | in-container, same host as the run folder | a different machine with a GPU |
 | work unit | target x 50-ligand chunk | **target x replicate**, whole library |
 
@@ -29,9 +29,9 @@ invocation, and overhead dominates below a few hundred.
 
 So one unit = **one target, one replicate, the whole prepared library**. For a subtype:
 
-- 164 targets x 5 replicates = **820 units**
+- 482 docking targets x 3 replicates = **1,446 units**
 - each unit: 1,960 ligands x 0.176 s = **~345 s (~6 minutes)**
-- per subtype: ~78.6 GPU-hours; all seven: ~550
+- per subtype: ~138 GPU-hours; all seven at the worst-case 7.0x: ~970
 
 Six minutes is a good granularity for a resumable remote job: short enough that losing
 one to a dropped session is cheap, long enough that per-unit overhead is negligible.
@@ -97,7 +97,7 @@ the main hazard in this rewrite. The consequences:
   and that is the one case where a repeat is legitimate. It must be logged, because the
   discarded sample was a real draw and dropping it is a (small) selection effect.
 
-Seeds: replicate `i` uses `base_seed + i` (42..46 by default), recorded per unit. The
+Seeds: replicate `i` uses `base_seed + i` (42..44 by default), recorded per unit. The
 engine's seeding is known broken upstream (issue #133), so this is provenance, not a
 reproducibility claim — and the design must not imply otherwise.
 
@@ -124,7 +124,7 @@ batch composition) was never settled.
 
 ### Poses
 
-Five replicates x 164 targets x 1,960 ligands of poses is far more than is useful. **Keep
+Three replicates x 482 targets x 1,960 ligands of poses is far more than is useful. **Keep
 poses for replicate 0 only**, and make even that optional (`--poses none|first|all`).
 
 Replicate 0's poses are what the **pose-in-pocket validation** consumes — the outstanding
@@ -183,13 +183,24 @@ Determinism tests become **statistical**: with a stubbed engine returning fixed 
 the summary must be exact; with one returning jittered values, the SE must track the
 input distribution. Do not assert exact scores against the real engine anywhere.
 
+## Compute is no longer the binding constraint
+
+Worth stating plainly, because it changes what the design has to optimise for. On CPU
+smina one subtype at one replicate was ~34 days; on one L4 it is ~46 hours. The full
+seven-subtype, three-replicate run is ~970 GPU-hours worst case, which is **free on TRUBA
+and $155-330 on RunPod at $0.16-0.34/hr**. Only the Colab unit balance is tight (1,446
+against 1,600), and that is a subscription quirk rather than a real limit.
+
+So the panel size no longer has to be constrained to make the problem tractable, and no
+design decision here should be justified by compute cost.
+
 ## Open questions
 
 1. **How are replicates distributed across sessions?** All 5 replicates of one target
    together (same GPU, cheaper to merge, but a lost session loses a whole target), or
    replicate-major across targets (spreads device variation, more round trips)? The GPU
    model warning above argues for target-major; resilience argues the other way.
-2. **Is 5 replicates enough?** Chosen by decision, not measurement. The SE-against-N curve
+2. **Is 3 replicates enough?** Chosen by decision, not measurement. The SE-against-N curve
    is an outstanding test, and the threshold-flipping problem — `min_targets` counts
    targets below a cutoff, so jitter near the cutoff flips classifications in a way
    averaging the score does not fix — has no power statement yet.
@@ -197,7 +208,7 @@ input distribution. Do not assert exact scores against the real engine anywhere.
    smina-to-Uni-Dock offset was measured on *unprepared* ligands. Stage 4 changes them.
 4. **TRUBA has never been sized** — no partition, no queue wait, no validated Apptainer
    build. It is the named fallback for when attended Colab sessions become impractical,
-   and at ~26 attended session-days for the full production run, that is likely.
+   and at ~40 attended session-days on Colab for the full production run, that is likely.
 
 ## Implementation order
 

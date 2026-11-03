@@ -2,14 +2,14 @@
 
 `polyphar` takes a list of UniProt accessions (one disease subtype) and runs:
 
-    ids -> uniprot -> structures -> fix -> pockets -> similarity -> select -> dock
+    ids -> uniprot -> structures -> fix -> pockets -> annotate -> select -> similarity -> dock
 
 1. reviewed human UniProt records,
 2. PDB chains (SIFTS-mapped) and AlphaFold models,
 3. pdbfixer repair,
 4. DoGSite3 pockets (DoGSiteScorer 2 as an alternative),
 5. [PocketMatch 2.0](https://github.com/1337deepesh/PocketMatch_v2.0) pocket-pair similarities,
-6. target selection on the similarity network (hub + neighbours),
+6. per-pocket geometric annotation, then target selection by explicit pocket filters,
 7. smina docking of a ligand library (e-Drug3D) into the selected targets.
 
 Everything runs through one CLI, `polyphar <stage>`, in a Docker image. Pocket detection is the
@@ -162,8 +162,9 @@ pocket worker, and stops it when the container exits.
 
 `run [--from STAGE] [--to STAGE]` runs the stages in order, or the contiguous range you give.
 It accepts every stage's own options (`--xlsx/--txt/--sheet/--id-column/--reviewed-column/--gene-column`,
-`--ph`, `--worker-timeout`, `--worker-dead-after`, `--pm-bin-dir`, `--pmax`, `--exclude`,
-`--hub-tie-break`, `--library`, `--seed`, `--chunk-size`, `--threads-per-job`,
+`--ph`, `--worker-timeout`, `--worker-dead-after`, `--pm-bin-dir`, `--volume-min`,
+`--volume-max`, `--plddt-min`, `--tm-policy`, `--per-protein`, `--exclude`,
+`--library`, `--seed`, `--chunk-size`, `--threads-per-job`,
 `--chunk-timeout`), plus `--max-failed-fraction` and `--keep-going`.
 
 - Each stage goes through the same gate as its own subcommand. The gate computes the exact
@@ -254,8 +255,10 @@ All stages take `--run-dir` (default `/work` in the container, else the current 
     polyphar pockets [--pocket-tool dogsite2] [--drugscore-cutoff 0.5] [--min-volume 120] \
                      [--worker-timeout 600] [--worker-dead-after 21600]
                                                       # host worker runs DoGSiteScorer 2 / DoGSite3
-    polyphar similarity [--pm-bin-dir /opt/pocketmatch]
-    polyphar select [--pmax 0.7] [--exclude O15350] [--hub-tie-break union]
+    polyphar annotate                                 # per-pocket geometry, no DoGSiteScorer
+    polyphar select [--volume-min 300] [--volume-max 1500] [--plddt-min 70] \
+                    [--tm-policy C] [--per-protein 2] [--exclude O15350]
+    polyphar similarity [--pm-bin-dir /opt/pocketmatch]   # AFTER select, on the panel
     polyphar dock --library inputs/e-Drug3D_2083.sdf [--seed 42] [--chunk-size 50] \
                   [--threads-per-job 1] [--chunk-timeout 43200]
     polyphar run [--from STAGE] [--to STAGE] [stage options...]
@@ -351,10 +354,15 @@ exits 3, like `run`, and sends its `done` notification at priority 1.
   (`SIFTS segments source` = `seqres`, else `pdb`; counts `segments_from_seqres`). Only
   when that fails too (source empty, `segments_unverified`) are the chain's pockets kept
   and counted as `segment_unverified`.
-- **Target selection**: Pmax ≥ 0.7, top-degree hub + neighbours, O15350 excluded, as in 2023.
-  Two changes: protein pairs are de-duplicated as **unordered** pairs, and a tie at the top
-  degree takes the **union of the tied hubs** (`--hub-tie-break union`, the default), with one
-  row per protein. In 2023 the hub was tied in 5 of 6 subtypes, so row order decided it.
+- **Target selection**: no longer uses the similarity network at all. The 2023 rule took the
+  top-degree node of the Pmax ≥ 0.7 graph plus its neighbours, which made the target count a
+  property of how many structures were processed rather than of biology. The panel is now
+  defined by explicit pocket filters — DoGSiteScorer's `drugScore`, volume 300–1500 Å³, a
+  subpocket-parent rule, an AlphaFold pocket-pLDDT floor and a transmembrane policy — with
+  **up to 2 pockets per protein** (picking one was measured to be the known ligand site only
+  59% of the time). `similarity` now runs **after** `select`, on the panel's eligible pockets,
+  and its output is descriptive: pocket similarity is applied post hoc to docking results, not
+  used to choose targets. See `docs/superpowers/specs/2026-11-03-panel-selection-redesign-design.md`.
 
 ## Docking parallelism
 

@@ -8,6 +8,12 @@ from types import SimpleNamespace
 import pandas as pd
 import pytest
 
+openbabel = pytest.importorskip(
+    "openbabel",
+    reason="dock needs openbabel for receptor PDBQT preparation; without it "
+           "these tests FAILED rather than skipped, which hid real regressions "
+           "behind a missing dependency")
+
 from polyphar.stages import dock
 
 FIX = Path(__file__).parent / "fixtures"

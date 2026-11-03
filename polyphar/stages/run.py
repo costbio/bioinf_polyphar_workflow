@@ -1,5 +1,5 @@
-"""`polyphar run`: the stages ids -> uniprot -> structures -> fix -> pockets -> similarity ->
-select -> dock in order (or the contiguous range --from .. --to), each through the same ETA
+"""`polyphar run`: the stages ids -> uniprot -> structures -> fix -> pockets -> annotate ->
+select -> similarity -> dock in order (or the contiguous range --from .. --to), each through the same ETA
 gate as its single-stage subcommand (cli.gate): exact units, ETA printed and notified before
 the first unit, milestone progress, done / FAILED.
 
