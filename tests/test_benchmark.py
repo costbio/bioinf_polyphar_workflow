@@ -117,7 +117,7 @@ def test_estimate_table_marks_projection(tmp_path, monkeypatch):
     rows, observed = benchmark.estimate_rows(layout, 4, calib)
     by = {r["stage"]: r for r in rows}
     assert [r["stage"] for r in rows] == ["structures", "fix", "pockets", "annotate",
-                                          "select", "similarity", "dock"]
+                                          "select", "similarity", "ligands", "dock"]
     assert by["structures"]["kind"] == "exact" and by["structures"]["seconds"] > 0
     assert by["dock"]["kind"] == "projected" and by["fix"]["kind"] == "projected"
     assert by["select"]["kind"] == "trivial"
@@ -139,8 +139,21 @@ def test_estimate_uses_observed_values_over_priors(tmp_path):
     layout.final_targets_csv.write_text("Protein\nA\nB\nC\n")
     state, observed = benchmark.run_state(layout, ["ids", "uniprot", "select"])
     assert state["targets"] == 3 and "targets" in observed
+    # dock docks the ligands `ligands` KEPT, not the source library's records: the
+    # dockability filter drops ~6% of e-Drug3D_2083, so the raw count over-projects dock.
     dock_units = benchmark.projected_units("dock", state)
-    assert dock_units.count == 3 * benchmark.PRIORS["ligands"]
+    assert benchmark.PRIORS["ligands_kept"] < benchmark.PRIORS["ligands"]
+    assert dock_units.count == 3 * benchmark.PRIORS["ligands_kept"]
+    assert benchmark.projected_units("ligands", state).count == benchmark.PRIORS["ligands"]
+
+    # a finished ligands stage makes the kept count exact
+    (layout.docking / "library").mkdir(parents=True)
+    (layout.docking / "library" / "manifest.json").write_text(
+        '{"stage": "ligands", "counts": {"records": 2083, "kept": 7}}')
+    state, observed = benchmark.run_state(
+        layout, ["ids", "uniprot", "select", "ligands"])
+    assert state["ligands_kept"] == 7 and "ligands_kept" in observed
+    assert benchmark.projected_units("dock", state).count == 3 * 7
 
 
 def test_cli_estimate_is_fast_and_offline(tmp_path, monkeypatch, capsys):

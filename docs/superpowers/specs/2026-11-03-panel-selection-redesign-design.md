@@ -1,7 +1,7 @@
 # Panel selection and GPU docking redesign
 
 **Date:** 2026-11-03 (third rewrite; see git history for superseded versions)
-**Status:** design — stages 1-3 implemented, stage 5 designed, stages 4 and 6 open
+**Status:** design — stages 1-4 implemented, stage 5 designed, stage 6 open
 **Supersedes:** hub-and-neighbours target selection in `polyphar/stages/select.py`
 
 This file is rewritten rather than amended whenever the numbers change. An audit found
@@ -170,6 +170,55 @@ least one Z coordinate is not zero" for every record.
 Regenerate with ETKDG only for records that fail sanitisation, and log each one. One
 conformer per ligand suffices. Preparation is deterministic, done once, and the prepared
 library is hashed into the dock fingerprint.
+
+**Correction, measured while implementing this (2026-11-03).** The ETKDG fallback as
+written would have lost 23 approved drugs. All 23 sanitisation failures in e-Drug3D_2083
+(metronidazole, nifedipine, clonazepam, chloramphenicol, ...) are one thing: a nitro group
+whose anionic oxygen carries `M  CHG` while the nitrogen is left neutral, so RDKit sees a
+four-valent neutral N and rejects the record. ETKDG cannot embed any of them — it raises
+`AtomValenceException` on all 23. `polyphar ligands` therefore repairs the valence model
+first (set the nitrogen to +1; no atom moves, so the deposited conformer and stereochemistry
+survive), which fixes all 23, and keeps ETKDG as the fallback for anything still failing.
+Measured on the real library: 2,083 records -> 123 excluded / 1,960 kept, 1,953 MMFF94
+minimised, 23 repaired, 6 without MMFF94 parameters (geometry kept), 1 stereo inversion
+(minimised conformer discarded, deposited geometry kept), 1 implausible formal charge
+flagged, 0 failed, 0 ETKDG.
+
+The 6 records without MMFF94 parameters are the **boron-containing** drugs BORTEZOMIB,
+TAVABOROLE, IXAZOMIB, IXAZOMIB CITRATE, CRISABOROLE and VABORBACTAM — **not** metal
+complexes: e-Drug3D_2083 contains no metal-containing record at all (verified 2026-11-04).
+
+**Two further corrections, measured 2026-11-04.** (i) MMFF94 inverts one stereocentre:
+TRABECTEDIN (ID 1808) goes S -> R at atom 18 (signed chirality volume +1.861 -> -0.643)
+because its deposited geometry is strained (647.5 -> 405.6 kcal/mol) and that bridged
+centre is near-planar; MMFF94 carries no chirality restraint. `polyphar ligands` now
+measures the signed chirality volume at every tetrahedral stereocentre before and after
+minimisation and discards the minimised conformer if any flips sign, counting it as
+`stereo_inversions`. (ii) ISOSORBIDE DINITRATE (ID 271) has a malformed charge line,
+`M  CHG  5   1  15  13   1  14   1  17  -1  18  -1`, which declares five entries while
+only the four trailing ones are real, so atom 1 (a carbon) reads as formal charge +15.
+RDKit sanitises it and MMFF94 parameterises it, and the prepared record would carry
+`[C@H+15]` into docking. Such records (|formal charge| > 2 on a C/N/O atom) are now
+passed through **flagged and counted** (`implausible_formal_charge`), not dropped.
+
+**Of the two pinned size definitions, only the rotatable-bond one changes the result.**
+RDKit's `CalcNumRotatableBonds` differs from the spike's for 1,316 of 2,083 records and
+crosses the 15 boundary for 46 (SAQUINAVIR 16 -> 13, DIPYRIDAMOLE 12 -> 16, VANCOMYCIN
+14 -> 23). Swapping RDKit's `MolWt` for the spike's element sum crosses the 900 boundary
+for **0 of 2,083** (largest difference 3.02 Da, a deuterium isotope), so the MW table is
+pinned for reproducibility only and must not be described as result-changing.
+
+**"Minimise in place" is not a small perturbation.** The bond graph is preserved in all
+1,960 kept records, but the largest per-atom displacement has median 1.61 A, p99 8.27 A
+and maximum 12.63 A. It means same molecule, same stereochemistry, same starting point --
+not small movement.
+
+**Protonation asymmetry (Methods).** Ligands keep their deposited protonation: in the
+prepared library 430 of the 1,960 kept records carry a non-zero net formal charge (-4: 24,
+-3: 3, -2: 63, -1: 276, +1: 55, +2: 8, plus the one flagged +15). On the SOURCE molfiles
+the count is 453: the 23 half-written nitro groups read as net -1 there and the repair
+restores them to neutral, so 430 is the figure that describes what is docked. Receptors
+are protonated at pH 7.0 by pdbfixer. This is deliberate and must be stated.
 
 This changes results relative to the smina baseline, so the agreement figures below
 **must be re-measured after it**.
@@ -359,7 +408,7 @@ pocket geometry. Silently dropping proteins.
 
 ### Stage ownership and order
 
-`ids -> uniprot -> structures -> fix -> pockets -> annotate -> select -> similarity -> dock`
+`ids -> uniprot -> structures -> fix -> pockets -> annotate -> select -> similarity -> ligands -> dock`
 
 | stage | change |
 |---|---|
@@ -367,6 +416,7 @@ pocket geometry. Silently dropping proteins.
 | **`annotate`** (new) | `04_pockets/annotation/pocket_annotation.csv`: lining residues (range-encoded), box dimensions, parent volume, AF pocket pLDDT, plus Rg/segments/span kept as descriptive columns only. Derivable from existing outputs, so DoGSiteScorer is never re-run |
 | `select` | panel filters; `final_targets.csv` (schema unchanged, so `dock` is unaffected), `eligible_pockets.csv`, `panel_funnel.tsv` |
 | `similarity` | **runs after `select`**, on the panel's eligible pockets |
+| **`ligands`** (new) | `07_docking/library/library_prepared.sdf` + `ligands.csv`: the dockability filter and MMFF94 conformers, prepared once and hashed. `dock` picks the prepared file up automatically, so its `library_md5` fingerprint covers preparation |
 | `dock` | Uni-Dock, replicates, remote GPU — see `2026-11-03-dock-stage-gpu-design.md` |
 
 **`similarity` moved after `select`** because it no longer feeds selection. On net1 that
@@ -438,7 +488,7 @@ Apptainer build.
 | 1. annotate | **done** — `polyphar/stages/annotate.py`, verified on real data |
 | 2. panel in select | **done** — `polyphar/panel.py` + rewritten `select.py` |
 | 3. similarity after select | **done** — runs on `eligible_pockets.csv` |
-| 4. ligand preparation | open, small |
+| 4. ligand preparation | **done** — `polyphar/stages/ligands.py`, `07_docking/library/`, verified on the real library |
 | 5. dock rework | **designed** (`2026-11-03-dock-stage-gpu-design.md`), not built; the large one |
 | 6. statistics | open, blocked on the decisions above |
 

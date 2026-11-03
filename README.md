@@ -2,7 +2,7 @@
 
 `polyphar` takes a list of UniProt accessions (one disease subtype) and runs:
 
-    ids -> uniprot -> structures -> fix -> pockets -> annotate -> select -> similarity -> dock
+    ids -> uniprot -> structures -> fix -> pockets -> annotate -> select -> similarity -> ligands -> dock
 
 1. reviewed human UniProt records,
 2. PDB chains (SIFTS-mapped) and AlphaFold models,
@@ -232,6 +232,7 @@ modified or deleted.
     <run>/04_pockets/<UniProt>/...  DrugScore.csv  queue/
     <run>/05_similarity/Pocketsim.csv  PocketMatch_score.txt  cabbage/
     <run>/06_targets/final_targets.csv  centrality.csv  unique_pairs.csv
+    <run>/07_docking/library/library_prepared.sdf  ligands.csv
     <run>/07_docking/<label>/poses.sdf  df_results_<label>_fixed.csv  obsolete/
     <run>/logs/<stage>.log  run.log  notifications.log
 
@@ -259,6 +260,7 @@ All stages take `--run-dir` (default `/work` in the container, else the current 
     polyphar select [--volume-min 300] [--volume-max 1500] [--plddt-min 70] \
                     [--tm-policy C] [--per-protein 2] [--exclude O15350]
     polyphar similarity [--pm-bin-dir /opt/pocketmatch]   # AFTER select, on the panel
+    polyphar ligands --library inputs/e-Drug3D_2083.sdf   # filter + MMFF94 conformers
     polyphar dock --library inputs/e-Drug3D_2083.sdf [--seed 42] [--chunk-size 50] \
                   [--threads-per-job 1] [--chunk-timeout 43200]
     polyphar run [--from STAGE] [--to STAGE] [stage options...]
@@ -289,9 +291,38 @@ exits 3, like `run`, and sends its `done` notification at priority 1.
 | `get_pockets.py` | `polyphar pockets` (+ host `bin/polyphar-dogsite-worker`) |
 | `get_pocketsimilarity.py` (README: `get_PMsimilarities.py`) | `polyphar similarity` |
 | `Gene_Disease_Association/target_selection_analysis.py` | `polyphar select` |
+| (none: the 2023 runs docked the raw library) | `polyphar ligands` |
 | per-folder smina scripts (`smina_screen_*.py`) | `polyphar dock` |
 
 ### Methods-relevant changes vs 2023
+
+- **Ligand preparation (`polyphar ligands`, new).** The library is filtered and minimised
+  once, before docking. **Dockability filter: `rotatable bonds > 15` OR `MW > 900` are
+  excluded** — 123 of e-Drug3D's 2,083 records (5.9%), keeping 1,960; the library's limit
+  is MW <= 2000, so it holds peptides outside Vina's domain (bacitracin, 1,421 Da, 35
+  rotatable bonds). **The rotatable-bond definition is non-standard and must be reported as
+  such:** single, non-ring (bridge-detected), non-terminal heavy-atom bonds, **amide C-N
+  bonds included**, and the MW is a plain element-mass sum over the molfile. RDKit's and
+  Open Babel's conventional (Lipinski) definitions exclude amides and would select a
+  different library. Conformers are **minimised in place with MMFF94**, keeping the
+  deposited geometry and stereochemistry, because Vina-family docking samples torsions but
+  not ring pucker or stereo centres ("in place" means same molecule and same starting
+  point, not small movement: the largest per-atom displacement has median 1.61 A and
+  maximum 12.63 A). 23 records (metronidazole, nifedipine, chloramphenicol, ...) carry a
+  nitro group whose nitrogen is left neutral in the molfile; their valence model is
+  repaired (`[N+](=O)[O-]`) without moving an atom. 6 records — the boron-containing drugs
+  (bortezomib, tavaborole, ixazomib, ixazomib citrate, crisaborole, vaborbactam), not metal
+  complexes — have no MMFF94 parameters and keep their input geometry. MMFF94 has no
+  chirality restraint, so every tetrahedral stereocentre's signed chirality volume is
+  compared before and after minimisation and the minimised conformer is discarded if any
+  flips: 1 record does (trabectedin, ID 1808). A C/N/O atom with |formal charge| > 2 is a
+  malformed `M  CHG` line rather than chemistry (isosorbide dinitrate, ID 271, reads as a
+  carbon at +15); such records are passed through flagged and counted, never silently.
+  **Ligands keep their deposited protonation** (430 of the 1,960 prepared records carry a
+  non-zero net formal charge) while receptors are protonated at pH 7.0 by pdbfixer — a
+  deliberate asymmetry that has to be stated.
+  `dock` then docks this prepared library and fingerprints it, so re-preparing re-docks,
+  and records `library_prepared` in its manifest.
 
 - **Pocket-pair filtering.** The 2023 script dropped every pair with `Pmin == 1` or
   `Pmax == 1`. Since PocketMatch normalises Pmin by the smaller pocket and Pmax by the

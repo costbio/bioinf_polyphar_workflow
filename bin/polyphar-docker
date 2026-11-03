@@ -82,11 +82,27 @@ image="polyphar:${POLYPHAR_VERSION:-latest}"
 # `benchmark`, and for `run` (including pockets) when calibration.json has no pockets
 # entry for this pocket tool yet (an entry without a tool is dogsite2's).
 worker="$(dirname "$(realpath "$0")")/polyphar-dogsite-worker"
+# Must stay in step with polyphar.benchmark.ORDER. A name missing here used to yield an
+# empty string, which `${from:-0}` / `${to:-N}` then replaced with the full range -- so
+# `--from ligands` became 0..N and demanded $DOGSITE_BIN for a stage that touches neither
+# DoGSiteScorer nor pockets. set_stage() now leaves the bound alone for an unknown name
+# (polyphar's own argparse rejects it anyway).
 stage_index() {
     case "$1" in
         ids) echo 0 ;; uniprot) echo 1 ;; structures) echo 2 ;; fix) echo 3 ;;
-        pockets) echo 4 ;; similarity) echo 5 ;; select) echo 6 ;; dock) echo 7 ;;
+        pockets) echo 4 ;; annotate) echo 5 ;; select) echo 6 ;; similarity) echo 7 ;;
+        ligands) echo 8 ;; dock) echo 9 ;;
         *) echo "" ;;
+    esac
+}
+pockets_index=4
+last_index=9
+set_stage() {   # $1 = from|to, $2 = stage name
+    _i="$(stage_index "$2")"
+    [ -n "$_i" ] || return 0
+    case "$1" in
+        from) from="$_i" ;;
+        to) to="$_i" ;;
     esac
 }
 preflight_timeout="${POLYPHAR_PREFLIGHT_TIMEOUT:-600}"
@@ -118,19 +134,19 @@ case "${1:-}" in
     pockets) want_worker=1 ;;
     benchmark) want_bench=1 ;;
     run)
-        from=0 to=7 prev=""
+        from=0 to="$last_index" prev=""
         for a in "${@:2}"; do
             case "$prev" in
-                --from) from="$(stage_index "$a")" ;;
-                --to) to="$(stage_index "$a")" ;;
+                --from) set_stage from "$a" ;;
+                --to) set_stage to "$a" ;;
             esac
             case "$a" in
-                --from=*) from="$(stage_index "${a#--from=}")" ;;
-                --to=*) to="$(stage_index "${a#--to=}")" ;;
+                --from=*) set_stage from "${a#--from=}" ;;
+                --to=*) set_stage to "${a#--to=}" ;;
             esac
             prev="$a"
         done
-        if [ "${from:-0}" -le 4 ] && [ "${to:-7}" -ge 4 ]; then
+        if [ "$from" -le "$pockets_index" ] && [ "$to" -ge "$pockets_index" ]; then
             want_worker=1
             if ! python3 - "$home_dir/calibration.json" "$pocket_tool" <<'PY' 2>/dev/null
 import json, sys

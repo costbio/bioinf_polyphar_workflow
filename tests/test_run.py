@@ -284,13 +284,13 @@ def test_resume_skips_finished_stages_and_estimates_only_remaining_units(fake, c
 
     assert _main(fake) == 0     # no ids options: 00_ids/ids.txt exists
     assert _runs(fake.events) == ["fix", "pockets", "annotate", "select",
-                                  "similarity", "dock"]
+                                  "similarity", "ligands", "dock"]
     out = capsys.readouterr().out
     # ETA only for the remaining work: fix has 1 unit left
     assert "fix: 1 units (things) - ETA" in out
     starts = [t for t, _, _ in fake.notes if t.endswith(" starting")]
     assert starts == [f"{s} starting" for s in ("fix", "pockets", "annotate", "select",
-                                                       "similarity",
+                                                       "similarity", "ligands",
                                                  "dock")]
     summary = fake.notes[-1][1]
     for s in ("ids", "uniprot", "structures"):
@@ -489,7 +489,7 @@ def test_keep_going_overrides_the_failed_fraction(fake):
     fake.state["counts"]["pockets"] = {"failed": 3, "models": 10}
     assert _main(fake, "--from", "pockets", "--keep-going") == 3
     assert _runs(fake.events) == ["pockets", "annotate", "select", "similarity",
-                                  "dock"]
+                                  "ligands", "dock"]
 
 
 def test_failed_fraction_at_the_limit_continues(fake):

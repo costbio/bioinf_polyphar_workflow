@@ -67,9 +67,11 @@ Start with **HCC net1**. Then the other subtypes, in whatever order suits you.
     $POLYPHAR structures
     $POLYPHAR fix
     $POLYPHAR pockets          # starts the host DoGSiteScorer worker itself
-    $POLYPHAR similarity
+    $POLYPHAR annotate
     $POLYPHAR select
-    $POLYPHAR dock             # inputs/e-Drug3D_2083.sdf, 2083 ligands
+    $POLYPHAR similarity       # AFTER select: it runs on the panel's eligible pockets
+    $POLYPHAR ligands          # prepares inputs/e-Drug3D_2083.sdf once, for every target
+    $POLYPHAR dock             # 1960 prepared ligands (2083 source records, 123 excluded)
 
 Each stage can be rerun safely: it skips what is already done. Add `--dry-run` to any stage
 to see its units and ETA first.
@@ -90,9 +92,11 @@ are also printed and pushed to Pushover.
 | `structures` | `02_structures/` | `Protein_info.csv` rows; `failed.tsv` for proteins with no structure; `versions` in the manifest |
 | `fix` | `03_pdbfixer/` | one PDB per extracted chain; `failed.tsv` for pdbfixer failures |
 | `pockets` | `04_pockets/` | `DrugScore.csv`: `counts.selected` (`drugScore >= 0.5`), `outside_segment` drops, `TOOL` = `dogsite2` |
-| `similarity` | `05_similarity/` | `Pocketsim.csv` pair count; `PocketMatch_score.txt` |
+| `annotate` | `04_pockets/annotation/` | per-pocket geometric annotation of the selected pockets |
 | `select` | `06_targets/` | the target table; which protein(s) became the hub, and whether the top degree was tied |
-| `dock` | `07_docking/` | per-target results; `incomplete_targets` must be 0 |
+| `similarity` | `05_similarity/` | `Pocketsim.csv` pair count; `PocketMatch_score.txt` |
+| `ligands` | `07_docking/library/` | `counts.kept` / `excluded`; `stereo_inversions` and `implausible_formal_charge` must be explainable; `ligands.csv` |
+| `dock` | `07_docking/` | per-target results; `incomplete_targets` must be 0; `library_prepared` must be `true` |
 
 ### Expected numbers at `ids` / `uniprot`
 

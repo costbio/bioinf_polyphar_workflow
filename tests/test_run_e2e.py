@@ -20,13 +20,19 @@ import pytest
 REPO = Path(__file__).resolve().parent.parent
 WRAPPER = REPO / "bin" / "polyphar-docker"
 LIBRARY = REPO / "polyphar" / "data" / "bench" / "edrug3d_bench3.sdf"
-ORDER = ("ids", "uniprot", "structures", "fix", "pockets", "similarity", "select", "dock")
+# benchmark.ORDER, paired with DIRS below (benchmark.STAGE_DIRS).
+ORDER = ("ids", "uniprot", "structures", "fix", "pockets", "annotate", "select",
+         "similarity", "ligands", "dock")
 # File mtimes come from the kernel's coarse clock (one tick, <= 10 ms behind the clock that
 # stamped the notification), so a file written right after the notification can carry an
 # mtime a few ms before it.
 MTIME_SLACK = timedelta(milliseconds=20)
-DIRS = ("00_ids", "01_uniprot", "02_structures", "03_pdbfixer", "04_pockets", "05_similarity",
-        "06_targets", "07_docking")
+DIRS = ("00_ids", "01_uniprot", "02_structures", "03_pdbfixer", "04_pockets",
+        "04_pockets/annotation", "06_targets", "05_similarity", "07_docking/library",
+        "07_docking")
+# Subdirectories a stage dir contains that belong to ANOTHER stage (or to a queue), so the
+# "no output before the ETA" check does not see the earlier stage's files.
+NESTED = {"04_pockets": ("queue", "annotation"), "07_docking": ("library",)}
 
 
 def _notifications(run_dir):
@@ -83,7 +89,7 @@ def test_e2e_two_proteins(tmp_path):
         assert msg.startswith(f"{stage}: ") and " - ETA " in msg, msg
         later = [n for n in notes if n[2].startswith(f"{stage} ") and n is not starts[0]]
         assert later and all(n[0] > t_start for n in later), f"{stage}: notification order"
-        first_out = _first_output_mtime(run_dir / d, skip=("queue",))
+        first_out = _first_output_mtime(run_dir / d, skip=NESTED.get(d, ("queue",)))
         assert first_out is not None and first_out >= t_start - MTIME_SLACK, \
             f"{stage}: output at {first_out} before the ETA at {t_start}"
         assert f"{stage}: " in r.stdout

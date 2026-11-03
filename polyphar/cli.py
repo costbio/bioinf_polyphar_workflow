@@ -37,6 +37,8 @@ STAGES = {
                  "per-pocket geometry from existing outputs (no DoGSiteScorer)"),
     "similarity": ("polyphar.stages.similarity", "PocketMatch pocket similarity"),
     "select": ("polyphar.stages.select", "select polypharmacology targets"),
+    "ligands": ("polyphar.stages.ligands",
+                "prepare the docking ligand library (filter + MMFF94 conformers)"),
     "dock": ("polyphar.stages.dock", "dock the ligand library with smina"),
     "run": ("polyphar.stages.run", "run all stages in order"),
     "estimate": ("polyphar.stages.estimate", "print ETA for the next and later stages"),

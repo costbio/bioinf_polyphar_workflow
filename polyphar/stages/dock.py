@@ -56,6 +56,7 @@ import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from polyphar.stages import ligands
 from polyphar.stages.fix import H_SEED, reference_platform, seeded_placement, strip_date_remark
 
 STAGE = "dock"
@@ -402,8 +403,57 @@ def read_targets(layout) -> list[Target]:
     return out
 
 
-def _library_path(layout, args, copy: bool = True) -> Path:
-    """The library inside <run>/inputs; one given elsewhere is copied there (never
+def _library_path(layout, args, copy: bool = True, progress=None) -> Path:
+    """The library to dock: the prepared one from the `ligands` stage when that stage has
+    finished on this source library, else the source library itself (see
+    _raw_library_path). The prepared file's md5 then goes into the stage fingerprint like
+    any other library, so a re-preparation re-docks.
+
+    Falling back to the raw library is never silent once a `ligands` manifest exists:
+    `progress` (passed by `run`) gets a stderr warning and a priority-1 notification. The
+    fallback changes library_md5, so every target is re-docked and its existing results
+    replaced — by scores from an unprepared library, which are not comparable with the
+    prepared ones."""
+    from polyphar.stages.ligands import prepared_state
+
+    raw = _raw_library_path(layout, args, copy=copy)
+    prepared, why = prepared_state(layout, raw)
+    if prepared is not None:
+        return prepared
+    if why:
+        _warn_raw_library(progress, why, raw)
+    return raw
+
+
+def _warn_raw_library(progress, why: str, raw: Path) -> None:
+    import sys
+
+    message = (f"a `ligands` stage has run here but its prepared library cannot be used: "
+               f"{why}. Docking the RAW library {raw.name} instead: every target will be "
+               f"re-docked and its existing results REPLACED, and the new scores will NOT "
+               f"be comparable with scores from the prepared library. Rerun "
+               f"`polyphar ligands` (or restore 07_docking/library/) first if that matters.")
+    print(f"{STAGE}: WARNING: {message}", file=sys.stderr, flush=True)
+    notifier = getattr(progress, "notifier", None)
+    if notifier is None:
+        return
+    try:
+        notifier(f"{STAGE}: docking the UNPREPARED library", message, priority=1)
+    except Exception:
+        pass
+
+
+def _library_is_prepared(layout, args, lib: Path) -> bool:
+    """Whether `lib` is the `ligands` stage's prepared library (for dock's manifest, so
+    Methods can say which library produced the scores without path archaeology)."""
+    from polyphar.stages.ligands import prepared_library
+
+    prepared = prepared_library(layout, _raw_library_path(layout, args, copy=False))
+    return prepared is not None and Path(prepared) == Path(lib)
+
+
+def _raw_library_path(layout, args, copy: bool = True) -> Path:
+    """The source library inside <run>/inputs; one given elsewhere is copied there (never
     modified; with copy=False, as for the ETA, it is only located). Raises when it does
     not exist."""
     import shutil
@@ -653,7 +703,11 @@ def _outputs(layout, plan: _Plan) -> dict:
     return {p.relative_to(d).as_posix(): p.stat().st_size for p in sorted(files)}
 
 
-RESERVED_DIRS = ("ligands", "obsolete")
+# Subdirectories of 07_docking that are NOT target labels and must never be swept into
+# obsolete/. The two names look swapped and are not: "ligands" is THIS stage's chunk
+# directory (07_docking/ligands/*.sdf), while ligands.DIRNAME == "library" is the
+# `ligands` STAGE's own directory (07_docking/library/library_prepared.sdf).
+RESERVED_DIRS = ("ligands", "obsolete", ligands.DIRNAME)   # chunks, archive, prepared lib
 _DF_RE = re.compile(r"^df_results_(.+)_fixed\.csv$")
 
 
@@ -728,7 +782,7 @@ def run(layout, args, progress) -> dict:
     from polyphar.common import append_failure, sha256_file, write_manifest
     from polyphar.pool import run_pool as _run_pool
 
-    lib = _library_path(layout, args)
+    lib = _library_path(layout, args, progress=progress)
     smina = smina_version()
     if smina == "unavailable":
         raise FileNotFoundError(f"smina ({smina_bin()}) not runnable")
@@ -835,7 +889,11 @@ def run(layout, args, progress) -> dict:
                    inputs=[layout.final_targets_csv, lib], versions=_versions(smina),
                    counts=counts, timing={},
                    extra={"fingerprint": fingerprint, "outputs": _outputs(layout, plan),
-                          "library_md5": lib_md5, "seed": opts["seed"], "smina": smina,
+                          "library_md5": lib_md5,
+                          # True: the scores come from the `ligands` stage's prepared
+                          # library; False: from the raw SDF (Methods needs to say which).
+                          "library_prepared": _library_is_prepared(layout, args, lib),
+                          "seed": opts["seed"], "smina": smina,
                           "receptors": receptors, "obsoleted": obsoleted})
     return counts
 

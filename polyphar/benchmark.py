@@ -70,7 +70,8 @@ PRIORS = {
     "fixed_chain_bytes": 333660,
     "kept_pockets_per_model": 1191 / (1145 + 156),
     "targets": 316,
-    "ligands": 1960,   # e-Drug3D_2083
+    "ligands": 2083,         # e-Drug3D_2083 source records (what `ligands` processes)
+    "ligands_kept": 1960,    # what the dockability filter keeps (what `dock` docks)
 }
 PRIORS_SOURCE = "2023 HCC net2 run"
 # kept (selected) pockets per submitted model, by pocket tool. dogsite2: the PRIORS value
@@ -281,11 +282,12 @@ def run_benchmark(stages, calib, log=print) -> dict:
 # of magnitude cheaper. The stage directory numbers are left as they are — renaming them
 # would invalidate every existing run folder for no gain.
 ORDER = ("ids", "uniprot", "structures", "fix", "pockets", "annotate", "select",
-         "similarity", "dock")
+         "similarity", "ligands", "dock")
 STAGE_DIRS = {"ids": "00_ids", "uniprot": "01_uniprot", "structures": "02_structures",
               "fix": "03_pdbfixer", "pockets": "04_pockets",
               "annotate": "04_pockets/annotation", "select": "06_targets",
-              "similarity": "05_similarity", "dock": "07_docking"}
+              "similarity": "05_similarity", "ligands": "07_docking/library",
+              "dock": "07_docking"}
 
 
 def completed(layout) -> list[str]:
@@ -387,6 +389,8 @@ def run_state(layout, done: list[str], tool: str | None = None) -> tuple[dict, l
     if "select" in done:
         put("targets", len(_csv_rows(layout.final_targets_csv)) or None)
     put("ligands", _count_records(layout.inputs / "e-Drug3D_2083.sdf"))
+    if "ligands" in done:   # exact: the records the stage kept are the ones dock docks
+        put("ligands_kept", _manifest_counts(layout, "ligands").get("kept"))
     return s, observed
 
 
@@ -424,8 +428,17 @@ def projected_units(stage: str, s: dict) -> WorkUnits | None:
         pockets = round((n_pdb + n_af) * s["kept_pockets_per_model"]
                         * s.get("eligible_fraction", ELIGIBLE_FRACTION))
         return WorkUnits(pockets * (pockets - 1) // 2, "pairs")
+    if stage == "ligands":
+        # the source library's records; s["ligands"] is the record count of the library in
+        # <run>/inputs when it is there, else the prior (the kept count, close enough for
+        # a stage that is seconds of work).
+        return WorkUnits(round(s["ligands"]), "ligands")
     if stage == "dock":
-        return WorkUnits(round(s["targets"] * s["ligands"]), "ligands")
+        # the ligands actually docked are the ones `ligands` KEPT, not the source
+        # library's records: the dockability filter drops ~6% of e-Drug3D_2083, so using
+        # the raw count over-projects dock by that much.
+        return WorkUnits(round(s["targets"] * s.get("ligands_kept", s["ligands"])),
+                         "ligands")
     raise KeyError(stage)
 
 

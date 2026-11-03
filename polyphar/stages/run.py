@@ -1,15 +1,17 @@
 """`polyphar run`: the stages ids -> uniprot -> structures -> fix -> pockets -> annotate ->
-select -> similarity -> dock in order (or the contiguous range --from .. --to), each through the same ETA
-gate as its single-stage subcommand (cli.gate): exact units, ETA printed and notified before
-the first unit, milestone progress, done / FAILED.
+select -> similarity -> ligands -> dock in order (or the contiguous range --from .. --to;
+benchmark.ORDER is the authority), each through the same ETA gate as its single-stage
+subcommand (cli.gate): exact units, ETA printed and notified before the first unit,
+milestone progress, done / FAILED.
 
 * `run` accepts the union of the stages' own options (built from each stage's
   add_arguments(); two stages defining one option differently is an error).
 * ids: runs when --txt / --xlsx is given; without them an existing 00_ids/ids.txt counts
   as done (skipped), and a missing one is an error before anything starts.
-* Before the first stage, a preflight checks what later stages need: with dock in range the
-  ligand library exists and `smina --version` works; with similarity in range the
-  PocketMatch binaries are there. A problem exits 2 before anything starts.
+* Before the first stage, a preflight checks what later stages need: with ligands or dock
+  in range the ligand library exists (and, for ligands with work left, RDKit imports);
+  with dock in range `smina --version` works; with similarity in range the PocketMatch
+  binaries are there. A problem exits 2 before anything starts.
 * Every stage's units() is computed first. A stage with 0 units and a manifest.json whose
   recorded inputs all still have their recorded sha256 is "skipped (done)": not
   benchmarked, not run, no notifications (its manifest counts still feed the failure
@@ -349,15 +351,30 @@ def failed_fraction(stage: str, counts) -> tuple[int, int] | None:
 
 def preflight_problems(layout, args, stages) -> list[str]:
     """What the stages in range need from outside the run folder's earlier stages: the
-    ligand library and a working smina (dock), the PocketMatch binaries (similarity)."""
+    ligand library (ligands and dock), a working smina (dock), RDKit (ligands), the
+    PocketMatch binaries (similarity)."""
     problems = []
+    wants_library = {"dock", "ligands"} & set(stages)
+    if wants_library:
+        from polyphar.stages import dock, ligands
+
+        who = "/".join(s for s in ("ligands", "dock") if s in wants_library)
+        try:
+            # the RAW library: whether a prepared one exists is dock's business, not the
+            # preflight's, and `ligands` needs the source either way.
+            source = dock._raw_library_path(layout, args, copy=False)
+        except (OSError, ValueError) as exc:
+            source = None
+            problems.append(f"{who}: {exc}")
+        if "ligands" in stages:
+            # a missing RDKit is one missing dependency; caught per record it would make
+            # the stage write an unprepared library and report success.
+            rdkit = ligands.rdkit_problem()
+            if rdkit and (source is None or ligands._finished(layout, source) is None):
+                problems.append(f"ligands: {rdkit}")
     if "dock" in stages:
         from polyphar.stages import dock
 
-        try:
-            dock._library_path(layout, args, copy=False)
-        except (OSError, ValueError) as exc:
-            problems.append(f"dock: {exc}")
         if dock.smina_version() == "unavailable":
             problems.append(f"dock: smina ({dock.smina_bin()}) not runnable "
                             "(`smina --version` failed)")

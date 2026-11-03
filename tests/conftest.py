@@ -5,6 +5,14 @@ import subprocess
 import pytest
 
 
+def _rdkit_ok() -> bool:
+    try:
+        import rdkit  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
 def _docker_ok() -> bool:
     if shutil.which("docker") is None:
         return False
@@ -21,6 +29,7 @@ _REQUIREMENTS = {
     "pocketmatch": (lambda: bool(os.environ.get("PM_BIN_DIR")), "env PM_BIN_DIR not set"),
     "docking": (lambda: shutil.which("smina") is not None, "smina not on PATH"),
     "docker": (_docker_ok, "docker CLI not available"),
+    "rdkit": (_rdkit_ok, "rdkit not importable"),
     "pushover": (
         lambda: bool(os.environ.get("PUSHOVER_APP_TOKEN") and os.environ.get("PUSHOVER_USER_KEY")),
         "PUSHOVER_APP_TOKEN / PUSHOVER_USER_KEY not set",
