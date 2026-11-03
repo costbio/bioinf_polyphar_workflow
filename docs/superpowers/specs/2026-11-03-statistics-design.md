@@ -234,12 +234,50 @@ show elevation) are **exploratory with Benjamini-Hochberg FDR**, labelled as suc
 The `threshold x min_targets` surface carries no p-values at all, so it contributes no
 tests.
 
-## What must be fixed in `parse_scores` before any of this
+## The `parse_scores` filter — done, and what I got wrong about it
 
-`similarity.py:714` drops pairs with `Pmax == 1.0` **and** `Pmin == 1.0`. Those are
-cross-protein pairs with perfect pocket similarity — the strongest possible evidence for
-the claim, silently discarded. Even though the similarity test is deferred, the
-descriptive output is wrong until this is fixed.
+**Fixed in `08d6e67`.** Recorded here because the justification in the first draft of this
+document was wrong on two counts, and the corrected version changes what stage 6 must do.
+
+What the first draft said: the filter "drops pairs with `Pmax == 1.0` **and**
+`Pmin == 1.0` ... cross-protein pairs with perfect pocket similarity -- the strongest
+possible evidence for the claim, silently discarded."
+
+Both halves were wrong:
+
+- The mask was `(pmin != 1) & (pmax != 1)`, which drops on **either** condition. And
+  because PocketMatch normalises Pmin by the smaller pocket and Pmax by the larger,
+  `Pmin >= Pmax` always, so `Pmax == 1` implies `Pmin == 1` and the filter was effectively
+  just `Pmin != 1`. It discarded every **containment** pair.
+- Measured over every 2023 `PocketMatch_score.txt` on the drive: **no cross-protein
+  `Pmax == 1` pair exists in any subtype.** The evidence it was supposedly hiding was
+  never there.
+
+The real justification is narrower. Removing the filter re-admits about 49,600 rows across
+the six subtypes (~1% each), of which **two** matter: CDC25C `P30307_3bzi_a` P_4 inside
+PLK1 `P53350_5j19_a`, 210 of 276 elements matched at **Pmax 0.76**, in net1 and net2. The
+`Pmax >= 0.7` network is otherwise unchanged. The rest are degenerate -- the extreme case
+is a 3-element pocket inside a 682,696-element AlphaFold whole-surface blob at Pmax 4e-06.
+
+Removing it also reopened a self-comparison hole, now closed in the same commit. A
+chimeric chain that SIFTS maps to two accessions is extracted into **both** accession
+folders, so the same physical atoms appear under two accessions and scored
+`Pmin == Pmax == 1` as a cross-protein perfect match -- the most misleading possible
+artifact for this study. `parse_scores` now drops pairs sharing a chain stem alongside
+same-accession pairs.
+
+### What this obliges stage 6 to decide
+
+`Pmin == 1` is now a near-meaningless similarity signal: containment dominates it, and
+about 49,600 artificial `1.0` rows sit at the top of any distribution built on it. So:
+
+- **Any percentile or ranking in `polyphar stats` must be computed on Pmax, not Pmin**, or
+  carry an explicit minimum-size / size-ratio guard. State which, in code, with a comment
+  pointing here.
+- A "perfect cross-protein match" must never be reported from `Pmin` alone.
+
+The chimeric-chain artifact may also exist anywhere else cross-protein pairs are formed
+from the pocket table. Only `parse_scores` was audited.
 
 ## Pre-registration
 

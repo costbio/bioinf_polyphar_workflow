@@ -35,7 +35,8 @@ order a serial run emits pairs ((index(name1), index(name2)) in the ordered list
 merged PocketMatch_score.txt is byte-identical for every nprocs. jobs/ is deleted once
 PocketMatch_score.txt and Pocketsim.csv are written.
 
-Outputs: 05_similarity/PocketMatch_score.txt, Pocketsim.csv (legacy columns and filters;
+Outputs: 05_similarity/PocketMatch_score.txt, Pocketsim.csv (legacy columns, current
+filters -- see parse_scores;
 Pocket_Path relative to the run folder), failed.tsv, manifest.json (written last). The
 manifest records a stage fingerprint (surviving pockets and their sha256, PocketMatch
 binaries, cutoff, DrugScore.csv, Protein_info.csv; not nprocs) and the output sizes; a

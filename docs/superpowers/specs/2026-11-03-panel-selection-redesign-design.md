@@ -276,9 +276,10 @@ against the fixed score matrix rather than sampling pockets — plus volume matc
 mandatory, FDR across drugs, a defined summary statistic, and stratification by
 AlphaFold/experimental.
 
-Two input problems would also need settling: `parse_scores` (`similarity.py:714`) drops
-pairs with `Pmax == 1.0` **and** `Pmin == 1.0`, discarding cross-protein pairs with
-perfect similarity — the strongest possible evidence for the claim; and `Pocketsim.csv` is
+One input problem would also need settling: `Pocketsim.csv` is a filtered edge list, not a
+matrix. (The `Pmin`/`Pmax == 1` filter was the other; it is fixed in `08d6e67`, and the
+reasoning in `2026-11-03-statistics-design.md` corrects what this paragraph originally
+claimed about it — no cross-protein `Pmax == 1` pair ever existed in the data.) and `Pocketsim.csv` is
 a filtered edge list, not a matrix, so the test needs the complete pairwise set among the
 docked pockets including zeros.
 
@@ -421,7 +422,9 @@ Apptainer build.
    conditions.
 2. **The SE derivation and a power statement** for threshold flipping near the
    `min_targets` cutoff.
-3. **The `Pmax == 1.0` legacy filter** — count what it discards before inheriting it.
+3. ~~**The `Pmax == 1.0` legacy filter**~~ — done (`08d6e67`). It discarded ~1% of rows
+   per subtype, of which two mattered (CDC25C/PLK1 at Pmax 0.76). A chain-stem guard
+   replaces the self-comparison coverage it incidentally provided.
 4. **Positive-set source**, if a curated list exists.
 5. **Interface-pocket exposure** at 32% AlphaFold.
 6. **Thresholds validated on net1 only.** `surf/vol <= 0.45` and the volume range have not

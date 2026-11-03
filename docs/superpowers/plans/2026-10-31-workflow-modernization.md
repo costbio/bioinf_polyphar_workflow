@@ -115,7 +115,10 @@ Then rerun HCC subtype 1 (net1) on its real gene list, and after it every other 
   - DoGSiteScorer flags `-s -i -y -d -w 4`; `drugScore >= 0.5`
   - AlphaFold `F1` models only, and **not** passed through pdbfixer
   - pdbfixer at pH 7.0, adding missing residues, atoms and hydrogens, and removing heterogens including water
-  - PocketMatch filters: drop `NULL____`, drop Pmin or Pmax == 1, drop same-UniProt pairs
+  - PocketMatch filters: drop `NULL____`, drop same-UniProt pairs. **The 2023 `Pmin or
+    Pmax == 1` drop was NOT kept** (commit `08d6e67`): it discarded cross-protein
+    containment hits above the selection threshold. A chain-stem guard replaces the
+    self-comparison coverage it incidentally provided.
   - target selection with `Pmax >= 0.7`, top-degree hub + neighbours, exclude `O15350`
   - docking with `--exhaustiveness 12 --num_modes 12`, receptor pH 7.4, unpadded pocket box, ligand SDF as supplied
 - **New fixed choices:**
@@ -429,7 +432,7 @@ Then rerun HCC subtype 1 (net1) on its real gene list, and after it every other 
 ### Task 10: `polyphar similarity` — PocketMatch, serial and block-pair parallel
 
 **Files:**
-- Create: `polyphar/stages/similarity.py`, `tests/test_stage_similarity.py`, `tests/fixtures/pm_scores_sample.txt` (8 real net2 lines: an AF–PDB pair, a same-UniProt pair, a `NULL____` row and a Pmax==1 row) with matching small `DrugScore.csv` / `Protein_info.csv`
+- Create: `polyphar/stages/similarity.py`, `tests/test_stage_similarity.py`, `tests/fixtures/pm_scores_sample.txt` (8 real net2 lines: an AF–PDB pair, a same-UniProt pair, a `NULL____` row, a cross-protein Pmin==1 row and a same-UniProt Pmin==Pmax==1 row) with matching small `DrugScore.csv` / `Protein_info.csv`
 - Delete: `get_pocketsimilarity.py`
 
 **Interfaces:**
@@ -439,7 +442,7 @@ Then rerun HCC subtype 1 (net1) on its real gene list, and after it every other 
   - `run_pocketmatch(pockets, pm_bin_dir, work_dir) -> Path`. Runs `Step0-cabbage-core <abs path>` per pocket into `outfile.cabbage`, then `Step0-END-FILE`, then `Step3-PM_serial outfile.cabbage`, checking every exit code.
   - `plan_blocks(n, nprocs) -> list[(start, end)]`: the smallest `k` with `k(k-1)/2 >= nprocs`, and `k=1` for `nprocs=1`.
   - `run_pocketmatch_parallel(pockets, pm_bin_dir, work_dir, nprocs) -> Path`. Each block pair `i<j` runs all-vs-all on `B_i ++ B_j` and keeps the cross pairs. Within-block pairs come from exactly one job. The merged lines are ordered as the serial run would emit them.
-  - `parse_scores(score_file, pockets, protein_info) -> DataFrame`: the Pocketsim contract, with the legacy filters.
+  - `parse_scores(score_file, pockets, protein_info) -> DataFrame`: the Pocketsim contract. Filters NULL, same-UniProt and same-chain-stem pairs; the 2023 `== 1` drop is not kept (`08d6e67`).
   - `units() = WorkUnits(count = n*(n-1)//2, cost_basis="pair")`. A completed block-pair job leaves a `.done` marker and is skipped on rerun.
   - Outputs in `05_similarity/`: `Pocketsim.csv`, `PocketMatch_score.txt` and `manifest.json` (PocketMatch commit).
 
@@ -448,7 +451,7 @@ Then rerun HCC subtype 1 (net1) on its real gene list, and after it every other 
   - `test_parse_scores_schema_and_filters`.
   - `test_plan_blocks_cover_all`.
   - `@pocketmatch test_parallel_equals_serial_on_sample`: `nprocs=4` is byte-identical to `nprocs=1`.
-  - `@pocketmatch @regression test_reproduces_net2_2023`: on `Liver_cancer/net2/pockets`, every pair's Pmin/Pmax matches `net2/PM_net2/PocketMatch_score.txt` (names compared case-insensitively, trailing `_` stripped). The rows keyed on `(UniProt ID, Protein, Pocket, UniProt ID_2, Protein_2, Pocket_2, Pmin, Pmax)` must equal `Pocketsim_net2.csv` as a multiset, for both `nprocs=1` and `nprocs=16`. Report both wall-clock times.
+  - `@pocketmatch @regression test_reproduces_net2_2023`: on `Liver_cancer/net2/pockets`, every pair's Pmin/Pmax matches `net2/PM_net2/PocketMatch_score.txt` (names compared case-insensitively, trailing `_` stripped). The rows keyed on `(UniProt ID, Protein, Pocket, UniProt ID_2, Protein_2, Pocket_2, Pmin, Pmax)` must be a **superset** of `Pocketsim_net2.csv` (every 2023 row still present; the extra rows all cross-protein with Pmin == 1 -- 5,678 of them on net2), for both `nprocs=1` and `nprocs=16`. Equality no longer holds since `08d6e67`. Report both wall-clock times.
 - [ ] **Step 2:** Run. Expected: FAIL. **Step 3:** Implement. **Step 4:** Run `PM_BIN_DIR=… ADEP_DATA=… pytest tests/test_stage_similarity.py -v`, inside the image. Expected: PASS.
 - [ ] **Step 5:** Commit: `fix(similarity): upstream PocketMatch in temp dirs, block-pair parallel, name guard`
 

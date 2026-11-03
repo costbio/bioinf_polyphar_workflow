@@ -293,6 +293,18 @@ exits 3, like `run`, and sends its `done` notification at priority 1.
 
 ### Methods-relevant changes vs 2023
 
+- **Pocket-pair filtering.** The 2023 script dropped every pair with `Pmin == 1` or
+  `Pmax == 1`. Since PocketMatch normalises Pmin by the smaller pocket and Pmax by the
+  larger, `Pmin >= Pmax` always, so that was effectively `Pmin != 1` and it discarded every
+  *containment* pair. It is not kept: it cost two real hits above the `Pmax >= 0.7`
+  threshold (CDC25C inside PLK1, 210 of 276 elements, Pmax 0.76, in net1 and net2), and no
+  cross-protein `Pmax == 1` pair exists in any 2023 subtype. Row counts rise about 1% per
+  subtype; the `Pmax >= 0.7` network is unchanged. Pairs sharing a **chain stem** are now
+  dropped alongside same-accession pairs, because a chimeric chain SIFTS maps to two
+  accessions is extracted into both accession folders and would otherwise self-compare at
+  `Pmin == Pmax == 1`. Judge pairs on Pmax: `Pmin == 1` alone means containment, not
+  identity.
+
 - **Chain selection by SIFTS.** For each (accession, PDB entry), the chain is the one SIFTS
   maps to that accession (`SP_PRIMARY == accession`, strict, no ortholog fallback). Among
   matching chains, the one with the largest UniProt coverage wins, and ties go to the smallest
