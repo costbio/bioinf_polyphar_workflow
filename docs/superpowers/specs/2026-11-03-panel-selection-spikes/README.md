@@ -23,5 +23,8 @@ Run order (each needs the previous one's cached JSON in `~/scratch_clust`):
 | `mw_check.py` | eDrug3D heavy-atom distribution; HCC drugs at the 64th-88th percentile |
 | `build_calib.py` | builds the 48-pocket / 250-ligand calibration run folder |
 | `ligsize.py` | eDrug3D size/flexibility profile; the `rot>15 OR MW>900` dockability filter |
+| `boxeff.py` | docking-box volume per pocket (NOTE: its default PAD=4 is wrong -- dock.py pads nothing) |
+| `gpsbox.py` | cavity (`_gps_`) vs residue-envelope (`_res_`) box; shows cavity boxes are WORSE |
+| `build_calib2.py` | representative, box-stratified calibration target sample (supersedes build_calib.py) |
 
-`build_calib.py` is the only one that writes anything outside `~/scratch_clust`.
+`build_calib.py` and `build_calib2.py` are the only ones that writes anything outside `~/scratch_clust`.

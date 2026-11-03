@@ -83,12 +83,30 @@ p99.9 0.663, max 0.851. At **Pmax >= 0.7**, 7 clusters of >= 3 proteins:
 | 3 | 3 | 0.67 | 0.725 | PKH4B, SPC24, TNNC1 |
 | 3 | 3 | 0.67 | 0.708 | BRDT, CENPI, EFHC2 |
 
-These are structurally coherent in a way the unfiltered communities never were. CDC6 and
-ORC1 are both AAA+ ATPases of the pre-replication complex with homologous
-nucleotide-binding folds, and CDT1 sits in the adjacent cluster. The fourth cluster holds
-NDC80, SPC24 and SPC25 — three components of the same Ndc80 kinetochore complex with
-related RWD domains. The homeobox proteins cluster separately, as DNA-binding grooves
-should.
+**Two claims previously made here were wrong and are withdrawn** (audit, 2026-11-03):
+
+- It said NDC80, SPC24 and SPC25 share "related RWD domains". SPC24 and SPC25 have RWD
+  domains; **NDC80/HEC1 does not** (N-terminal calponin-homology domain plus coiled coil).
+- It said "the homeobox proteins cluster separately, as DNA-binding grooves should". They
+  do not: HXC9, PAX6 and SIX1 sit in cluster 4 **together with** MMP1, TOP2A, TNNI3,
+  SPC24, SPC25, SOLH1, PKHG4 and TFDP3, and PAX6 is also in cluster 2. Cluster 4 is the
+  least coherent group in the table (density 0.20, lowest internal Pmax 0.716).
+
+What survives: CDC6 and ORC1 are both AAA+ ATPases of the pre-replication complex with
+homologous nucleotide-binding folds, and CDT1 sits in the adjacent cluster.
+
+**And the coherence that remains may be an artifact, not a validation.** The AlphaFold
+controls here target only *oversized* pockets (segments, volume ceiling, subpocket rule).
+There is **no control for interface pockets** — grooves that exist only because an AF
+model is a monomer with its obligate partner subunit absent. The clusters are dominated by
+exactly that class: NDC80, SPC24, SPC25, SKA1, CENPI, CENPK, BUB1B (kinetochore), CDC6,
+CDT1, ORC1, ORC6 (pre-replication complex), mostly coiled-coil or protein-interaction
+subunits with no small-molecule pharmacology. For a monomeric model of an obligate complex
+subunit, the largest compact high-drugScore groove is plausibly the missing partner's
+binding surface. Subunits of one complex sharing exposed interface geometry is what the
+artifact predicts, so **citing their co-clustering as evidence of validity inverts the
+inference.** This must be resolved before any cluster is presented as biologically
+meaningful.
 
 Coverage is the limitation: clusters of >= 3 proteins cover **31/209 panel proteins
 (15%)** at Pmax >= 0.7, or 73/209 (35%) at >= 0.65. Pmax >= 0.7 is the decided threshold
@@ -217,6 +235,20 @@ By the user, 2026-11-03:
   approval-date cut.
 - **Library-level dockability filter: exclude ligands with `rotatable bonds > 15` OR
   `MW > 900`.** Applies to the real analysis, not only the calibration.
+- **The docking engine changes from smina to Uni-Dock 1.2.0 on GPU** (validated
+  2026-11-03; see "Docking engine" below). The 2023-continuity requirement is dropped and
+  a change of ligand protonation is accepted, which is what made this possible.
+- **Scores are means over 5 replicates with a reported standard error** (user, 2026-11-03;
+  raised from 3), replacing the old "`--nprocs` does not change results" invariant.
+- **Box-size constraints stay in place** (user, 2026-11-03): a pocket must have its
+  longest box side <= 30 A *and* be grid-legal for Uni-Dock at 0.375 A spacing. Losing
+  proteins to this is accepted. **The panel is therefore 183 proteins, not 209.**
+- **Ligand conformers are prepared before docking** (user, 2026-11-03). See "Ligand
+  conformer preparation" below.
+- **The pose-in-pocket validation is run before the production screen.** It is the one
+  test that can still overturn a design decision.
+- **Colab Pro+ is the GPU host** for now, driven from POSEIDON. TRUBA (Apptainer +
+  SLURM) is the fallback if attended sessions become impractical.
 
 Earlier, still binding (see `CLAUDE.md` and the modernization plan): DS2 is the primary
 pocket tool; DoGSiteScorer runs on the host only; stages run manually per subtype.
@@ -327,15 +359,36 @@ through SIFTS before measuring segments and span.** This also makes the TM pocke
 check available for experimental chains, so the soluble-construct assumption can be
 dropped.
 
-**This is the largest implementation risk in the design.** pdbfixer renumbers 1..N *and
-inserts modelled-in residues*, so there is no constant offset from pdbfixer numbering back
-to author numbering, let alone to UniProt. `Protein_info.csv`'s `SIFTS segments` gives
-ranges (e.g. `30:175`), not a residue-level map. The annotation pass must therefore
-reconstruct the mapping by aligning the pdbfixer output back to its input chain and then
-through SIFTS — which may require retaining the raw SIFTS residue mapping at the
-`structures` stage, or re-fetching it. Note that re-fetching must not disturb
-`uniprot.csv` or `Protein_info.csv`, for the reasons in Constraints. Plan this task
-first; the rest of the annotation pass depends on it.
+**This section was mis-scoped and is rewritten** (audit, 2026-11-03). The task is more
+tractable than claimed, and the real blocker is different from the one stated.
+
+Already done, and not to be rebuilt:
+- **pdbfixer → author numbering exists.** `pockets.py` has `_coord_key()` and
+  `_author_atoms()` (L550-592): a heavy-atom coordinate-key map from the pdbfixer output
+  back to author residue numbers in the `02_structures` extracted chain, with 0.001 A
+  tolerance. `filter_segments` already uses it for the fusion-chain rule.
+- **SIFTS does not need re-fetching.** The flat file is cached in the run folder at
+  `02_structures/sifts/pdb_chain_uniprot.tsv.gz` (`structures.py:47-52`). Reading it in
+  the annotation pass touches neither `uniprot.csv` nor `Protein_info.csv`, so the
+  re-fetch hazard described earlier is moot.
+
+**The actual blocker:** `Protein_info.csv`'s `SIFTS segments` stores **author bounds
+only** (`PDB_BEG:PDB_END`). `SP_BEG`/`SP_END` are read in `structures.py:182-191` to
+compute coverage and then discarded, so the author→UniProt offset is not recoverable from
+`Protein_info.csv`. Either read it from the cached flat file, or add `SP_BEG`/`SP_END` to
+`INFO_COLUMNS`.
+
+Two correctness caveats:
+- The flat file is **segment-range-level**. Within a segment the mapping is affine only
+  with no insertion codes, no microheterogeneity and monotonic author numbering.
+  Residue-level fidelity needs the per-entry SIFTS XML, a different download. The builder
+  must state which is used.
+- `author_segments()` falls back to a **seqres**-derived range when PDB bounds are
+  unusable (`SIFTS segments source = seqres`), and `filter_segments` already counts those
+  chains as `segment_unverified`. For them the UniProt offset is unrecoverable by any
+  route. **Measure that fraction for net1 first** — `segments <= 3` gates both panel and
+  cluster membership, so an unmappable fraction is a silent hole in the cross-class bias
+  fix this section exists to deliver.
 
 ### Panel algorithm
 
@@ -377,17 +430,226 @@ Two hazards the builder must handle:
   cluster 1's results out of the active set and the manifest. Out-of-scope labels must be
   treated as "not mine", not "obsolete", and pruning must consider only the selected
   scope.
-- **The selector must enter `_stage_fingerprint`'s `opts`** (`dock.py:625`). It currently
-  hashes `final_targets_sha256`, which does not change between selections, so resume
-  would otherwise treat a different selection as already done.
+- ~~The selector must enter `_stage_fingerprint`'s `opts`.~~ **Withdrawn — this was a
+  misdiagnosis** (audit, 2026-11-03). `_stage_fingerprint` (`dock.py:625-643`) hashes
+  `{"final_targets_sha256", "targets": rows, "library_md5", **opts}`, where `rows`
+  iterates `plan.targets`. A selector that reduces `plan.targets` **already changes the
+  fingerprint**, so the stated failure mode does not exist.
 
-### Docking cost
+  **The real hazard is the inverse and is worse:** because the fingerprint *does* change,
+  resume will not short-circuit, and `_orphans()` (`dock.py:657-673`) will classify the
+  previous selection's `df_results_<label>_fixed.csv` and `<label>/` directories as
+  orphans for `_obsolete()` to move. That is the same additive-pruning problem below,
+  reached from the other direction.
 
-| scope | proteins | per subtype |
+### The docking box: leave `pocket_box` alone, clamp the tail
+
+Investigated 2026-11-03 after the first calibration run ran ~3.7x slower than the
+benchmark predicted. Conclusions, in order of importance:
+
+**The current box derivation is sound and should not change.** `pocket_box`
+(`dock.py`) takes the **unpadded** bounding box of all atoms in the `_res_P_*.pdb` file,
+which holds the complete lining residues. Over the 631 eligible net1 pockets that gives a
+median box of **9,550 A^3** with a median longest side of **24.6 A** — squarely inside
+normal Vina practice.
+
+**Deriving the box from the cavity would be worse.** DoGSiteScorer writes three files per
+pocket: `_res_` (complete lining residues), `_atms_` (lining atoms) and `_gps_` (cavity
+grid points). The cavity spans 18.1 A (median, unpadded), but Vina needs the whole ligand
+inside the box, so a cavity box needs 4-8 A of padding per side:
+
+| box source | median | p90 | max | median longest side |
+|---|---|---|---|---|
+| current `_res_` envelope, unpadded | **9,550 A^3** | 24,691 | 57,067 | 24.6 A |
+| cavity `_gps_`, unpadded | 2,970 A^3 | 13,166 | 38,970 | 18.1 A |
+| cavity + 4 A per side | 11,391 A^3 | 31,777 | 74,168 | 26.1 A |
+| cavity + 6 A per side | 18,653 A^3 | 45,814 | 97,700 | 30.1 A |
+
+Cavity + 4 A is already *larger* than the current box, and cavity + 6 A is double it. The
+lining-residue envelope is effectively "cavity + ~3 A": side chains extend past the cavity
+by about the margin a ligand needs. Switching to `_gps_` costs 0.8x-0.5x throughput for no
+gain in validity.
+
+**Worth doing: clamp the tail.** 18% of cavities exceed 25 A in their longest dimension
+and 9% exceed 30 A; those drive the p90 of 24,691 A^3 and carry a real validity risk — a
+box with a 45 A side can swallow a neighbouring groove, so a good score need not involve
+the selected pocket at all, which would sever the link between pocket similarity and
+binding. Clamp any box dimension at ~30 A about the pocket centroid and **flag** pockets
+whose true extent exceeds the clamp rather than silently truncating them.
+
+**Worth doing: give the ETA model a box-volume term.** `benchmark` produces a single
+seconds-per-ligand figure and cannot predict a 6x range in box volume, so every `dock`
+ETA is wrong. This matters before committing server time to seven subtypes.
+
+**Worth doing: carry box volume as a covariate in the score model.** More search space
+means more chance of a spuriously good pose, and box volume could correlate with cluster
+membership, so it is a confounder for the cluster-versus-control test.
+
+### Docking engine: Uni-Dock 1.2.0 on GPU
+
+Validated 2026-11-03 on a Colab L4 against a finished smina run, using identical
+receptor PDBQTs, identical ligands and identical boxes. Logs: `unidock_tests.log` and
+`unidock_results.json` on POSEIDON; bundle `unidock_test.tgz`.
+
+**Why change engines at all.** smina 2020.12.10 is based on AutoDock Vina 1.1.2 and is
+the end of its line (last SourceForge upload 2021-12-01). On 64 CPU cores it measured
+~200 core-seconds per ligand, which puts the full 209-protein panel at ~15 days per
+subtype and ~61 days for all seven — infeasible, and it was forcing the design down to
+clusters-plus-controls only. The user dropped the 2023-continuity requirement and
+accepted a protonation change, removing both objections.
+
+**Measured throughput: median 0.176 s/ligand on one L4.**
+
+| target | box | s/ligand |
 |---|---|---|
-| all clusters (Pmax >= 0.7) | 31 | 0.67 d |
-| clusters + matched controls | ~62 | ~1.3 d |
-| whole panel | 209 | 4.5 d |
+| 7UNG_W_P_11 | 3,679 A^3 | 0.180 |
+| 6LK0_A_P_2_1 | 7,897 A^3 | 0.174 |
+| 2JT0_A_P_1 | 13,031 A^3 | 0.177 |
+| 2KMU_A_P_1 | 20,112 A^3 | 0.157 |
+
+| scope | GPU-hours | compute units (L4 @ 1.94/hr, measured) |
+|---|---|---|
+| 183-protein panel, 1,960 ligands, 1 replicate | 17.5 | 34 |
+| all 7 subtypes, 1 replicate | 122.8 | 238 |
+| **all 7 subtypes, 5 replicates** | 614 | **1,191** |
+
+Against a 1,600-unit balance, so the production screen consumes about **74%** of it.
+That is feasible but leaves little margin for reruns, and units expire after 90 days.
+If the margin becomes a problem, the fallbacks in order are: drop to 3 replicates
+(714 units), run 5 replicates only for ligand-target pairs within ~0.3 kcal/mol of a
+decision threshold, or move production to TRUBA. The validation run itself cost 0.91
+units, so exploratory work is effectively free.
+
+Panel size note: 183 is the count after **both** the 30 A longest-side cap and
+Uni-Dock grid-legality at 0.375 A spacing (492 eligible pockets). Grid-legality alone
+would give 203 and the cap alone 183; the user accepted losing the proteins.
+
+### Ligand conformer preparation
+
+Vina-family docking samples torsions but **not ring conformations or stereochemistry**,
+so the input conformer's ring pucker and stereo centres are fixed for the whole run. A
+strained or wrong input geometry therefore cannot be recovered by any amount of search,
+and e-Drug3D's own 3D coordinates are of unknown provenance and quality. RDKit also
+reports "molecule is tagged as 2D, but at least one Z coordinate is not zero" for every
+record in the library, i.e. the dimensionality flag disagrees with the coordinates.
+
+**Decision (user, 2026-11-03): prepare ligand conformers before docking.**
+
+Recommended approach, to be confirmed by the builder:
+- **Minimise in place with MMFF94** rather than regenerating from SMILES, so the
+  library's curated geometry and stereochemistry are preserved. Regenerate with ETKDG
+  only for records that fail sanitisation or minimisation, and log every such record.
+- Fix the 2D/3D flag so downstream tools do not mis-handle the coordinates.
+- One conformer per ligand is sufficient for Vina-type search, which explores torsions
+  itself; multiple ring conformers would only matter for macrocycles, which the
+  `rot > 15 or MW > 900` filter already removes.
+- `unidocktools ligandprep` exists and may do this; compare it against an explicit RDKit
+  step before choosing, and record which was used.
+- Preparation is **deterministic and done once**, with the prepared library hashed into
+  the dock stage fingerprint, so it never becomes a source of run-to-run variation.
+
+This is a methodological change from the 2023 pipeline and from the smina baseline, both
+of which docked e-Drug3D's shipped coordinates. The smina-versus-Uni-Dock agreement
+figures above were measured on *unprepared* ligands and will need re-measuring after
+this change.
+
+**Throughput is flat across box volume** (0.180 s/ligand at 3,679 A^3 against 0.157 at
+20,112). On CPU smina box volume was the dominant cost driver; on GPU it is noise. So the
+*performance* argument for capping box size is gone and only the pose-validity argument
+remains — see the box section above, and the open test below.
+
+**Agreement with smina is strong**, better than expected: n=580, Pearson r=0.962,
+**Spearman rho=0.951**, with Uni-Dock **+0.326 kcal/mol less negative** (medians -5.73
+against -6.06). Uni-Dock uses the published Vina weights but a reimplemented CUDA
+evaluator and a different sampling regime (exhaustiveness 384 at `balance`, not 12), so
+this is a shift of the score scale, not a redesign of it. Any threshold carried over from
+smina needs re-centring by about +0.33 kcal/mol. Caveat: n=580 is enough to establish the
+relationship, not to calibrate the offset precisely or to show it is constant across the
+score range.
+
+**Determinism: issue #133 is confirmed and quantified.**
+
+| target | ligands differing across 3 same-seed repeats | mean abs delta | max abs delta |
+|---|---|---|---|
+| 7UNG_W_P_11 | 138/145 (95%) | 0.069 | 0.626 |
+| 6LK0_A_P_2_1 | 142/145 (98%) | 0.134 | 1.202 |
+| 2JT0_A_P_1 | 142/145 (98%) | 0.094 | 0.819 |
+
+Essentially every ligand's score moves between identical runs, by ~0.1 kcal/mol on
+average against a ~6.4 kcal/mol score range, with excursions to 1.2. This matters more
+here than for most users, because the study's claim concerns *weak* cumulative binding and
+jitter of that size is comparable to the signal.
+
+**Decision: run 5 replicates and average** (user, 2026-11-03), reporting a per-score
+standard error and propagating it into the cluster-versus-control test.
+
+**The SE reasoning used here was wrong in kind** (audit, 2026-11-03) and must be redone.
+It divided a *mean absolute delta across repeats* by sqrt(N); that statistic is not a
+standard deviation (for a normal, E|X-Y| ~ 1.13 sigma), and the quantity wanted is
+sigma/sqrt(N). It also assumes replicate independence, which the document itself cannot
+justify while the root cause is unsettled — if the jitter is batch-composition dependent
+rather than floating-point, replicates in the same batch configuration are correlated and
+sqrt(N) does not apply. And averaging does not control the tail: max |delta| was
+1.202 kcal/mol.
+
+**A deeper problem the averaging does not touch:** the statistic is a *threshold count*
+(`min_targets` counts targets below a score cutoff), not a score. Jitter near a hard
+cutoff flips classifications, and averaging the score does not fix that in any simple way
+— the variance of the count is driven by how many ligand-target pairs sit within ~1 sigma
+of the threshold. No power statement exists, so "0.06 is enough" is unsupported, and the
+document elsewhere concedes jitter of this size "is comparable to the signal".
+The pipeline's reproducibility guarantee is restated: not "results do not depend on
+`--nprocs`" but **"scores are means over N replicates with a reported SE"**. This is
+better science than a single deterministic-looking number, and 3 replicates for all seven
+subtypes is affordable (814 of 1,600 units).
+
+Root cause is **not** settled. `--max_gpu_memory` is an engine flag that `unidocktools`
+rejects as unrecognised, so the VRAM-driven batch-composition hypothesis could not be
+tested through the wrapper. With only 150 ligands everything fits one batch (default
+`--batch_size` 18000) and the jitter persisted anyway, which points at floating-point
+non-associativity rather than batch composition — but settling it needs the `unidock`
+engine binary called directly.
+
+**Practical notes for the builder.**
+- Install: `micromamba create -p <prefix> -c conda-forge unidock` plus
+  `pip install unidock-tools` — 31 seconds, no Docker daemon required.
+- `unidock_tools` writes **one SDF per input ligand** (`<stem>_<i>.sdf`) in the save dir
+  plus a `results.csv`. It preserves the input SD fields (`<ID>`, `<name>`, `<cas>`,
+  `<status>`) and adds **`<docking_score>`** — not the engine's `ENERGY=` tag. Key on the
+  `<ID>` SD field; RDKit rewrites the molecule title.
+- Use `--search_mode balance`. Do not try to mirror smina's exhaustiveness 12; the engine
+  assumes high exhaustiveness with capped steps.
+- Add a sanity filter for absurd scores (open issue #205 reports +300 kcal/mol on a
+  Meeko-prepared ligand). None appeared in 580 pairs here.
+- RDKit emits "molecule is tagged as 2D, but at least one Z coordinate is not zero" on
+  these ligands. Appears benign; confirm before production.
+
+### GPU host and the Colab operating pattern
+
+Colab Pro+ is the host, driven from POSEIDON (which has no GPU). The operating pattern
+below is **load-bearing** and should be reused for the production run.
+
+`colab exec` **reliably hangs the local client** when driven from POSEIDON — observed
+three times out of three, once with an explicit `RuntimeError: Connection was lost` —
+**but the kernel completes the work server-side and the VM survives** (session stays
+allocated, status returns to IDLE). So never hold a long `colab exec`. Instead:
+
+1. `colab upload <local> <remote>` (both paths are required)
+2. a short exec that unpacks and launches the job with `nohup ... &`
+3. poll every ~2 minutes with a tiny exec that tails the log; the poll doubles as a
+   liveness ping so Colab does not reclaim the VM as idle
+4. `colab download` the results, then **`colab stop -s <name>`** — a GPU session burns
+   compute units while it merely exists
+
+Scripts on POSEIDON: `launch.py`, `poll.py`, `driver.py`. The Colab CLI needs
+**Python >= 3.12** (conda env `colabcli`, symlinked into `~/.local/bin`, which is on the
+login-shell PATH). Despite its README the default `--auth` is `oauth2`; `--auth adc` works
+from `gcloud auth application-default login --no-launch-browser`, which is the right
+choice for a headless host. GPU allocation succeeded for L4 on request.
+
+Data movement is not a constraint: a docking run needs only the selected targets'
+receptor and pocket files — about 100 MB in and 400 MB out per subtype, against the
+7.9 GB `02_structures` and 9.8 GB `04_pockets` of the full stage outputs.
 
 ### The experiment: clusters versus matched controls
 
@@ -562,6 +824,338 @@ subpocket rule. A sensitivity analysis on ~50 targets is correspondingly weak; s
 
 This holds only because both are subsets. Any future sensitivity analysis defined by
 *loosening* a filter, admitting proteins outside the panel, would need its own docking.
+
+## Container design: split into two images
+
+The current single `polyphar:1.0` image (1.53 GB, CPU-only) cannot carry the new docking
+stage: Uni-Dock needs a CUDA runtime, POSEIDON has no GPU at all, and the GPU hosts we
+will actually use (Colab, TRUBA) have **no Docker daemon** and must run the image through
+Apptainer. **Decision: two images.**
+
+### Why split rather than one fat image
+
+- A CUDA runtime base adds 2-3 GB to stages that never touch a GPU, and every stage from
+  `ids` to `select` runs on POSEIDON, which has no GPU.
+- The GPU image must convert cleanly to Apptainer. Conversion downloads and flattens the
+  whole image, so size is a direct cost on Colab's disk and session time.
+- The two have different release cadences: stages 00-06 are stable, the docking stage is
+  the part that is changing.
+- Neither host can build the other's image.
+
+The shared `polyphar` Python package is installed into both, from the same source, so
+there is one implementation and two runtimes.
+
+### `polyphar-core:<ver>` — CPU, stages 00-06
+
+Base must be Debian/Ubuntu with **i386 multiarch enabled**: PocketMatch uses the upstream
+prebuilt 32-bit binaries at commit 4648bff, because the 64-bit build overflows. That
+constraint rules out a plain slim-python or Alpine base.
+
+Contains: the `polyphar` package; PocketMatch 32-bit binaries plus `libc6:i386`;
+openmm/pdbfixer, OpenBabel, RDKit, Biopython, pandas, networkx; and the client side of
+the DoGSiteScorer host queue.
+
+Explicitly **not** in the image:
+- **DoGSiteScorer.** Host-licensed, device-locked; it runs on the host and is fed through
+  the file queue in `04_pockets/queue/`. Never bake it in, never mount it in, never use a
+  privileged container or the Docker socket.
+- **Uni-Dock / CUDA.**
+
+smina stays, marked reference-only: it is what the CPU baseline and the
+smina-versus-Uni-Dock agreement figures were measured with, and keeping it preserves the
+ability to reproduce them.
+
+### `polyphar-dock:<ver>` — GPU, stage 07
+
+Base: `nvidia/cuda:12.x-runtime-ubuntu22.04` — **runtime, not devel**, since nothing is
+compiled at run time.
+
+Contains: the `polyphar` package (dock stage and shared code); Uni-Dock 1.2.0 from
+conda-forge plus `unidock-tools` from pip; RDKit for ligand conformer preparation;
+OpenBabel for receptor PDBQT preparation.
+
+**On Colab, do not use the image.** Colab Pro+ is the primary GPU host (user decision),
+and its VMs are ephemeral — every session starts clean. Converting and flattening a 3-4 GB
+image through Apptainer on each fresh VM would cost minutes of session time and disk every
+go, whereas `micromamba create -c conda-forge unidock` plus `pip install unidock-tools`
+took a **measured 31 seconds** in the 2026-11-03 validation. So the stage has three
+runtime paths for the same code:
+
+| host | mechanism | why |
+|---|---|---|
+| **Colab Pro+** (primary) | micromamba + a **pinned lockfile** | ephemeral VMs; 31 s beats a multi-GB pull per session |
+| TRUBA | Apptainer `.sif` built from the image | persistent filesystem, so the flatten cost is paid once |
+| RunPod / vast.ai | the Docker image directly | an instance *is* a container from your image |
+
+Reproducibility therefore rests on a **pinned conda lockfile**, not on the image, and the
+image is built from that same spec so all three paths resolve identical versions. The
+dock manifest records which path was used along with the resolved versions. Without the
+lockfile the Colab path would silently drift as conda-forge moves, which is the one thing
+that would make replicate scores incomparable across sessions.
+
+**Apptainer compatibility is a hard requirement for the TRUBA path, and it constrains the
+build:**
+- Apptainer mounts the image **read-only** and runs as the invoking user, so nothing may
+  be written inside the image and no fixed UID may be assumed. The current Docker wrapper
+  passes `--user $(id -u):$(id -g)`; that has no Apptainer equivalent and must not be
+  depended on.
+- Every writable path must live in the bind-mounted run folder. No `$HOME` writes, no
+  caches under `/opt`, no temp files outside the mount.
+- No host-specific paths baked in (notably not `/content`, which is Colab-only).
+- Must work under `apptainer run --nv`, which is how GPU passthrough is granted.
+- Conversion path is registry-based: `apptainer build polyphar-dock.sif docker://<registry>/polyphar-dock:<ver>`.
+  `docker-daemon://` will not work on a host without a daemon.
+
+### Orchestration across the two
+
+1. POSEIDON runs `polyphar-core` for stages 00-06 through `bin/polyphar-docker`, with
+   DoGSiteScorer on the host, exactly as now.
+2. A new **dock bundle** step exports only what docking needs: the selected targets'
+   receptors and pocket files, the prepared ligand library, and `final_targets.csv`.
+   Measured at ~100 MB for a full panel against the 7.9 GB `02_structures` and 9.8 GB
+   `04_pockets` of the full stage outputs.
+3. The GPU host runs `polyphar-dock` over that bundle — Docker on RunPod or vast.ai
+   (where an instance *is* a container from your image), Apptainer on Colab and TRUBA.
+4. Results come back (~400 MB per subtype) and merge into the run folder.
+
+This works because docking is compute-bound, not data-bound, which the measurements
+confirmed. Per-chunk `.done` markers already make the stage resumable, so a bundle can be
+worked through across several sessions on a session-limited host.
+
+### Provenance the dock manifest must record
+
+With 5 replicates and a reimplemented scoring evaluator, per-run provenance matters more
+than it did:
+
+image digest; Uni-Dock version; `unidock-tools` version; CUDA runtime version; **GPU
+model** (throughput and possibly scores vary by device); `search_mode`; `--batch_size`;
+**replicate index and its seed**; the prepared-library hash; and the per-score mean and
+standard error across replicates.
+
+### Deliberately out of scope for v1
+
+gnina, as a Vina-scoring cross-check and CNN rescorer, is a third image (its static
+binary alone is ~2 GB). Add it only if the rescoring arm goes ahead.
+
+## Tests to run before the production screen
+
+All five fit in one Colab session for a handful of compute units, reusing
+`unidock_test.tgz`. The first is the only one that can still overturn a decision.
+
+1. **Pose-in-pocket validation (required).** Dock across the full box-size range and
+   measure each best pose's centroid against the cavity's own `_gps_` grid points. The
+   concern driving the 30 A cap is that a large box can swallow a neighbouring groove, so
+   a good score need not involve the selected pocket — which would sever the link between
+   pocket similarity and binding that the whole study rests on. This has never been
+   tested; on CPU it was unaffordable. The box cap is being kept regardless (user
+   decision), so this test now serves to **confirm the cap is sufficient**, not to decide
+   whether to have one, and to quantify how often poses stray at the sizes we do keep.
+2. **Replicate-count curve.** Run 8-10 replicates on a few targets and plot SE against N.
+   N=5 was chosen by decision, not measurement; this confirms it is enough near decision
+   thresholds, where it matters.
+3. **Offset constancy.** n=580 shows smina and Uni-Dock agree (rho=0.951) but not that
+   the +0.326 kcal/mol offset is flat across the score range. If it drifts, translating
+   thresholds is not a simple shift. ~5,400 pairs are available from the existing 7,200
+   smina reference scores in about 15 minutes. **Re-run after conformer preparation**,
+   since the current figures used unprepared ligands.
+4. **`balance` versus `detail`.** `balance` was chosen on the authors' recommendation.
+   Confirm `detail` does not materially reorder ligands before committing ~600 GPU-hours.
+5. **Conformer preparation effect.** Compare scores before and after preparation on a
+   fixed target set, so the methodological change is quantified rather than assumed
+   harmless.
+
+Grid spacing 0.375 against 0.5 is no longer worth testing: 0.5 existed only to rescue the
+6 proteins that fail grid-legality, and the user accepted losing proteins to the box
+constraints.
+
+## Audit findings, 2026-11-03 — THIS DESIGN IS NOT READY TO IMPLEMENT
+
+An independent audit of this document, the 19 spike scripts and the pipeline code found
+problems serious enough that **implementation must not start until items 1-4 below are
+resolved**. Some are decisions only the user can make. Corrections already applied inline
+are marked where they appear; what follows is what remains.
+
+### Blocking — these change what gets built or what the result means
+
+**1. Clusters are defined over pockets; docking uses one pocket per protein, and they
+need not be the same pocket.** The panel algorithm picks each protein's *highest
+drugScore* eligible pocket; cluster detection runs over *all* eligible pockets; `dock`
+consumes exactly one pocket per row. So a protein can belong to cluster 4 via pocket X
+while the pocket actually docked is pocket Y, chosen by an unrelated criterion. The
+cumulative-binding statistic would then measure binding to pockets that are **not** the
+ones whose similarity defines the cluster — severing the very mechanism this study rests
+on, by a different route than the oversized-box problem this document already worries
+about. This is not hypothetical: cluster 1 is 6 proteins over 9 pockets, cluster 2 is 10
+over 11. The existing note about counting proteins rather than pockets addresses
+double-counting, not this. **Three options, all scientific decisions: dock the cluster's
+pocket; dock every eligible pocket of a cluster member; or define clusters over the
+one-per-protein panel pockets.**
+
+**2. The panel number is inconsistent and nothing downstream was recomputed.** The engine
+section says 183 (after the 30 A cap and grid-legality); roughly a dozen other places
+still say 209 / 645 pockets, including cluster coverage (31/209), the control donor pool
+(~178), residualisation ("uses all 209"), and the experimental-only sensitivity subset
+("about 50"). **153 of 645 eligible pockets (24%) are not dockable, and nobody checked how
+many of the 51 clustered pockets survive** — the three 3-protein clusters sit exactly on
+the `>= 3 proteins` rule and could vanish. The donor pool falls to ~152, worsening a
+matching problem already called marginal. Related: the box section says *clamp and flag*,
+the engine section says *drop 26 proteins*. Those are different operations. Neither the
+cap nor grid-legality appears in **Pocket eligibility**, so as written `select` emits 209
+rows and `dock` silently loses 26 — which violates this document's own anti-goal against
+silently dropping proteins, and Goal 2 (panel size should be a property of the filters,
+not of a GPU grid constraint).
+
+**3. The 7 clusters are not 7 independent tests, and they are proposed as the
+multiple-testing unit.** The member lists hold 46 protein-slots over 31 distinct
+proteins: CENPI appears in four clusters, EME1 in three, ten more in two. With one docked
+pocket per protein, **the same score is reused in up to four cluster statistics**.
+Clusters 1 and 3 share four proteins; cluster 7 is nearly a subset of 5 ∪ 3. Across 7
+subtypes × ~7 clusters × 2 disease positive sets this is ~100 non-independent tests with
+**no correction scheme proposed at all** — the existing multiple-testing item addresses
+only the legacy threshold × `min_targets` grid.
+
+**4. The calibration that residualisation depends on mismatches production on four axes.**
+Wrong engine (smina, not Uni-Dock — and offset constancy is still an open test), wrong
+ligand geometry (unprepared), wrong sampling design (the document describes
+`build_calib.py`'s maximin 24 AF / 24 experimental design, which `build_calib2.py`
+explicitly supersedes with a proportional box-volume-stratified sample — and the
+discarded space-filling property is exactly what a geometry regression needs), and wrong
+ligand range. With 48 pockets and ~6 collinear descriptors the geometry term is weakly
+identified before any of this; no power or identifiability analysis exists. **Either
+re-run the calibration against production conditions, or abandon residualisation for
+matching and say so.**
+
+### Serious — would draw reviewer objections
+
+**5. The `MITOTIC` gene set has no provenance and was used to tune the filters it then
+validated.** It is a hardcoded 23-gene list in seven spikes, found nowhere else in the
+repo — no source, no citation, no derivation, most plausibly read off the hub
+neighbourhood, i.e. from the data. Worse, `panel_final.py` and `tm_variants.py` print a
+`mito` column for every threshold combination in the sweeps that chose
+`volume <= 2000, segments <= 3` and TM policy C. So the thresholds were picked partly by
+how many mitotic genes survived, and the ~3x enrichment is **not independent evidence**.
+Document its provenance or drop every claim that depends on it.
+
+**6. Rejecting unfiltered clustering was quantitative; accepting filtered clustering is a
+narrative.** Unfiltered was rejected on purity 0.19, 5% density, internal Pmax 0.760,
+across four resolutions. Filtered is accepted on internal Pmax 0.708-0.751 — essentially
+the same — plus reading seven gene lists, two readings of which were wrong (see the
+cluster section). `families.py` computes no purity, no enrichment, no base rate, no null
+model, and tests one resolution. **The document never states the quantitative criterion
+that filtered clustering passes and unfiltered fails.**
+
+**7. There is no positive control of any kind, and the document spins that as a strength.**
+Calling the absence of known drug targets "cleaner for their absence" is rhetoric: it
+removes the only internal scale for what a genuine binder scores against these receptors
+under this engine. The study would report cumulative sub-threshold binding on receptors
+that are ~75% AlphaFold models with a new engine carrying an uncharacterised +0.33
+offset, with nothing anchoring score to real binding. The redocking control (co-crystal
+ligands) is one HETATM pass over already-downloaded mmCIFs and should be **promoted from
+"later if wanted" to a prerequisite.**
+
+**8. The 209/645 figures were computed under TM policy A, not the stated default C.**
+Every spike producing panel and cluster numbers uses `nseg >= 2` (drop multi-pass only).
+Only `tm_variants.py` implements C, and on the superseded 241-protein panel. Under the
+stated default both numbers are wrong by an unmeasured amount, including the per-pocket
+overlap rule's effect on cluster membership.
+
+**9. The engine validation is quoted as settled and un-validated in the same document.**
+"Validated 2026-11-03" and rho=0.951 sit beside the admission that those figures used
+unprepared ligands and need re-measuring. The same applies to **0.176 s/ligand**, from
+which the entire 614 GPU-hour / 1,191-unit budget derives: measured on 4 targets × 145
+ligands of unstated rotatable-bond composition. Vina-family throughput is dominated by
+torsion count — this document has a whole section on flexible ligands stalling smina — so
+if that subset is rigid-skewed the budget is wrong in the dangerous direction. Stale
+figures also remain: Constraints still says "dock calibrated at 57 s/ligand", which is
+the superseded benchmark and the basis of the `dock(d)` columns that informed the filter
+choice, making those ~3.5x optimistic. And the CPU "~61 days for seven subtypes" implies
+~3.9 net1-equivalents while every GPU figure uses 7.0 × net1 — the two cost models are
+not on the same basis.
+
+**10. Residualising on pocket geometry may remove the signal it protects.** Cluster
+membership is a deterministic function of pocket similarity, itself a function of shape
+and size — the quantities being residualised out. The choice between residualisation and
+matching is currently to be settled by how well descriptors predict baseline score, which
+is the wrong criterion. Report the association between each descriptor and cluster
+membership first.
+
+**11. The matched-control construction has never been feasibility-checked.** Four
+simultaneous constraints against a ~152-protein donor pool for 46 control slots. The
+pairwise-Pmax constraint is probably satisfiable; the 4-variable matching is the binding
+one, which this document half-concedes. Running the construction on the actual eligible
+table takes minutes, and without it "report achieved balance" may mean reporting that the
+match failed after the docking is paid for.
+
+**12. Pmax is size-normalised, so clusters are partly size-matched by construction.**
+`Pmax <= min(n1,n2)/max(n1,n2)`, so Pmax >= 0.7 forces the two pockets within ~30% of
+each other in size — across a 300-2000 A^3 band, a 6.7x span. The claim that pocket-level
+size filters "correct the same confound at source" was never tested on the filtered set;
+the size-conditional threshold was only rejected on the *unfiltered* network. This also
+cuts against the control construction, which matches on volume while requiring pairwise
+Pmax < 0.5 — the two constraints pull against each other.
+
+### Implementation blockers
+
+**13. Replacing smina with Uni-Dock breaks the dock stage's resumability and provenance
+design, and this document does not address it.** A chunk's `.done` job key includes the
+smina version and assumes determinism; with a non-deterministic engine and N replicates
+it must gain a replicate index, and a `.done` marker no longer certifies *which* scores.
+`RESULT_COLUMNS` has no replicate or SE dimension.
+`tests/test_stage_dock.py::test_cpu_and_chunk_invariance` **cannot pass** with Uni-Dock
+and is not on the retirement list. `run`'s preflight checks `smina --version` and will
+exit 2 without it. And **there is no execution model for a remote GPU**: the DoGSiteScorer
+problem was solved with an explicit host queue and worker; the "dock bundle" here has no
+queue protocol, no cross-host manifest reconciliation, and no story for how the Colab
+polling loop drives `polyphar dock`. This is a stage-sized piece of design presented as a
+bullet.
+
+**14. "Grid legality at 0.375 A spacing" is never defined** yet costs proteins. No limit
+cited, no enforcement point named. A builder cannot implement it from this document.
+
+**15. The rotatable-bond definition is non-standard and unpinned.** `ligsize.py` counts
+single, non-ring, non-terminal heavy-atom bonds via bridge detection and does **not**
+exclude amide C-N bonds, as the conventional RDKit/Lipinski definition does. So its count
+runs systematically high, and the offered `obabel` alternative *does* exclude amides —
+swapping implementations silently changes which 123 ligands are excluded. Pin the exact
+definition in Methods. The "~106 legitimate flexible drugs vs ~17 peptides" split is an
+eyeball reading of the top 25, stated as a measurement.
+
+**16. "PocketMatch is not re-run" contradicts "re-run from `similarity` onward".** The
+former is a leftover from the spike context, where net1's pair file already existed; for
+the six other subtypes `similarity` has not run at all, and running it *is* running
+PocketMatch. It is cheap (~205k pairs against 67.2M), so there is no real problem — but
+the document tells a builder two incompatible things. Also: `select` reads
+`05_similarity/Pocketsim.csv`, not `PocketMatch_score.txt`, and `Pocketsim.csv` already
+holds all surviving pairs with Pmin/Pmax and no threshold — so this document names the
+wrong input file. And because the similarity-side filter deliberately excludes TM policy
+while the panel filter includes it, the cluster graph contains pockets the panel rejects,
+needing a second filtering pass that is not specified.
+
+**17. The pipeline silently drops `Pmax == 1.0` pairs — the strongest possible cluster
+edges.** `parse_scores` (`similarity.py:714`) excludes them as a "legacy filter". Since
+same-accession pairs are excluded separately, this discards *cross-protein* pocket pairs
+with perfect Pmax, exactly the tightest links a cluster could have. This document's entire
+contribution is clusters at Pmax >= 0.7 and it inherits the filter unexamined. How many
+such pairs exist among the 645 eligible pockets is a one-line check nobody ran.
+
+**18. Colab feasibility at 614 GPU-hours is asserted, not demonstrated.** The operating
+pattern was validated on a run costing 0.91 units. Production is 1,191 units over 614
+GPU-hours on a client that hung three times out of three, under a ~24-hour session
+ceiling — roughly 26 attended session-days. TRUBA is named as the fallback but never
+sized: no partition, no queue wait, and no Apptainer build validated against any of the
+four constraints this document calls hard requirements.
+
+### Repair order
+
+1. Reconcile the panel to one number end-to-end and decide whether the 30 A cap flags or
+   drops. Re-derive clusters, coverage, donor pool and sensitivity subsets on the
+   **dockable** set. Nothing else is meaningful until this is done.
+2. Resolve the cluster/docked-pocket mismatch (finding 1). Scientific decision.
+3. State the multiple-testing scheme for the cluster tests.
+4. Re-run the calibration against production conditions, or drop residualisation.
+5. Add the redocking positive control.
+6. Document `MITOTIC`'s provenance or drop the enrichment claims.
+7. Design the remote-GPU execution model properly.
 
 ## Open questions
 
