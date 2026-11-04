@@ -169,3 +169,21 @@ def test_dock_refuses_a_raw_library_when_ligands_has_not_run_in_a_pipeline_folde
     other.write_text("$$$$\n")
     assert dock_mod._library_path(layout, argparse.Namespace(library="inputs/mine.sdf"),
                                   copy=False) == other
+
+
+def test_export_counts_every_receptor_it_will_prepare_not_just_the_bundles(monkeypatch):
+    """--max-units caps what is EXPORTED, never what is PREPARED.
+
+    dock_export.run() calls prepare_receptors(), which walks plan.usable -- all of it.
+    Counting only the capped subset announced "0 units (no work)" on net1 for an export
+    that then prepared ~257 receptors through pdbfixer and openbabel.
+    """
+    import inspect
+
+    from polyphar.stages import dock_export
+
+    src = inspect.getsource(dock_export.units)
+    assert "plan.usable" in src, "the count must follow prepare_receptors"
+    assert "_whole_targets" not in src, "the cap does not limit receptor preparation"
+    # and prepare_receptors really does walk the whole usable set
+    assert "plan.usable" in inspect.getsource(dock.prepare_receptors)

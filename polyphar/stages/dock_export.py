@@ -69,16 +69,11 @@ def units(layout, args):
 
     layout, lib = dock.control_view(layout, args)
     plan, _lib, _engine = dock.plan_for(layout, args, library=lib)
-    outstanding = plan.outstanding(layout)
-    if getattr(args, "max_units", None):
-        outstanding = dock._whole_targets([u for u, _state in outstanding],
-                                          int(args.max_units))
-        labels = {u.label for u in outstanding}
-    else:
-        labels = {u.label for u, _state in outstanding}
-    by_label = {t.label: t for t in plan.targets}
-    todo = sum(1 for lab in labels
-               if lab in by_label and not dock.receptor_is_prepared(layout, by_label[lab]))
+    # Every USABLE target, not just the ones this bundle will carry: prepare_receptors()
+    # walks plan.usable, so --max-units caps what is exported, never what is prepared.
+    # Counting the bundle's targets instead announced "0 units (no work)" for an export
+    # that then spent a quarter of an hour on pdbfixer and openbabel.
+    todo = sum(1 for t in plan.usable if not dock.receptor_is_prepared(layout, t))
     return WorkUnits(todo, "receptor")
 
 
