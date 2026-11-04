@@ -126,3 +126,46 @@ def test_control_flag_is_on_export_and_merge_but_not_on_the_worker():
 
     worker = build_parser().parse_args(["dock-worker", "--bundle", "/tmp/b"])
     assert not hasattr(worker, "control") or worker.control is False
+
+
+def test_dock_refuses_a_raw_library_when_ligands_has_not_run_in_a_pipeline_folder(tmp_path):
+    """A deleted `ligands` directory looks exactly like a stage that never ran.
+
+    On 2026-11-04 the prepared library was removed by hand as a presumed leftover, and
+    dock-export silently fell back to the raw source: 2083 unprepared records per unit
+    instead of 1960 prepared ones -- no valence repair, no MMFF94 minimisation, and the
+    123 records `ligands` excludes back in the library. prepared_state() documents "no
+    manifest: not a warning", which is right for a fixture and wrong for a run folder
+    whose panel already exists.
+    """
+    import argparse
+
+    from polyphar.common import RunLayout
+    from polyphar.stages import dock as dock_mod
+
+    run = tmp_path / "run"
+    (run / "inputs").mkdir(parents=True)
+    raw = run / "inputs" / "e-Drug3D_2083.sdf"
+    raw.write_text("$$$$\n")
+    layout = RunLayout(run)
+    args = argparse.Namespace(library=dock_mod.DEFAULT_LIBRARY)
+
+    # no panel yet: nothing to refuse, the raw library is all there is
+    assert dock_mod._library_path(layout, args, copy=False) == raw
+
+    # a panel exists -> this is a pipeline run, and ligands belongs before dock
+    layout.final_targets_csv.parent.mkdir(parents=True, exist_ok=True)
+    layout.final_targets_csv.write_text("Node\n")
+    try:
+        dock_mod._library_path(layout, args, copy=False)
+    except FileNotFoundError as exc:
+        assert "polyphar ligands" in str(exc)
+        assert "--library" in str(exc)          # the escape hatch is named
+    else:                                        # pragma: no cover
+        raise AssertionError("dock must refuse to dock an unprepared library here")
+
+    # naming a library explicitly is a deliberate choice and still allowed
+    other = run / "inputs" / "mine.sdf"
+    other.write_text("$$$$\n")
+    assert dock_mod._library_path(layout, argparse.Namespace(library="inputs/mine.sdf"),
+                                  copy=False) == other

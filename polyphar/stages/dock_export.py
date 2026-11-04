@@ -58,15 +58,28 @@ def _bundle_dir(layout, args) -> Path:
 
 
 def units(layout, args):
-    """Units to export, capped by --max-units. Counted in ligands, like `dock`."""
+    """Units to export, counted as TARGETS whose receptor has to be prepared.
+
+    NOT in ligands. Counting ligands made the ETA borrow `dock`'s per-ligand DOCKING rate
+    for a stage that docks nothing: on net1 it announced ~55 h for an export that takes
+    about half an hour, and almost all of that half hour is pdbfixer and openbabel turning
+    panel structures into receptor PDBQTs. A target already prepared is nearly free, so the
+    work is the targets still missing a receptor."""
     from polyphar.common import WorkUnits
 
     layout, lib = dock.control_view(layout, args)
     plan, _lib, _engine = dock.plan_for(layout, args, library=lib)
-    n = len(plan.outstanding(layout))
+    outstanding = plan.outstanding(layout)
     if getattr(args, "max_units", None):
-        n = min(n, int(args.max_units))
-    return WorkUnits(n * plan.n_ligands, "ligand")
+        outstanding = dock._whole_targets([u for u, _state in outstanding],
+                                          int(args.max_units))
+        labels = {u.label for u in outstanding}
+    else:
+        labels = {u.label for u, _state in outstanding}
+    by_label = {t.label: t for t in plan.targets}
+    todo = sum(1 for lab in labels
+               if lab in by_label and not dock.receptor_is_prepared(layout, by_label[lab]))
+    return WorkUnits(todo, "receptor")
 
 
 def run(layout, args, progress) -> dict:

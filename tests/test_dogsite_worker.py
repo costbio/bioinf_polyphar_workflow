@@ -674,7 +674,9 @@ def _no_worker_left(run_dir):
 @pytest.mark.parametrize("argv, env, expected", [
     (["pockets", "--nprocs", "16"], {}, "16"),
     (["pockets", "--no-notify", "--nprocs=8"], {"NPROCS": "3"}, "8"),
-    (["run", "--from", "fix"], {"NPROCS": "6"}, "6"),
+    # --engine smina: this is a worker test, and without it the wrapper would route
+    # `dock` to the GPU round trip on a machine that has no GPU
+    (["run", "--from", "fix", "--engine", "smina"], {"NPROCS": "6"}, "6"),
     (["pockets"], {}, "4"),
 ])
 def test_wrapper_passes_nprocs_to_worker(tmp_path, argv, env, expected):
@@ -691,8 +693,8 @@ def test_wrapper_passes_nprocs_to_worker(tmp_path, argv, env, expected):
     (["pockets"], {}, "dogsite2"),                       # the default
     (["pockets"], {"POLYPHAR_POCKET_TOOL": "dogsite2"}, "dogsite2"),
     (["pockets", "--pocket-tool", "dogsite2"], {"POLYPHAR_POCKET_TOOL": "dogsite3"}, "dogsite2"),
-    (["run", "--from", "fix", "--pocket-tool=dogsite3"], {"POLYPHAR_POCKET_TOOL": "dogsite2"},
-     "dogsite3"),
+    (["run", "--from", "fix", "--pocket-tool=dogsite3", "--engine", "smina"],
+     {"POLYPHAR_POCKET_TOOL": "dogsite2"}, "dogsite3"),
 ])
 def test_wrapper_passes_the_pocket_tool_to_worker_and_container(tmp_path, argv, env, expected):
     run_dir, env = _fake_docker_env(tmp_path, **env)
@@ -721,12 +723,12 @@ def test_wrapper_benchmarks_when_the_calibration_is_of_the_other_tool(tmp_path):
     run_dir, env = _fake_docker_env(tmp_path)    # calibrated, without a tool: dogsite2
     env.update(POLYPHAR_POCKET_TOOL="dogsite3", DOGSITE_BIN=str(FAKE))
     home = Path(env["POLYPHAR_HOME"])
-    r = subprocess.run([str(WRAPPER), "run"], env=env, capture_output=True, text=True,
+    r = subprocess.run([str(WRAPPER), "run", "--engine", "smina"], env=env, capture_output=True, text=True,
                        timeout=60)
     assert r.returncode == 0, r.stdout + r.stderr
     assert json.loads((home / "calibration.json").read_text())["pockets"]["tool"] == "dogsite3"
     stamp = (home / "calibration.json").stat().st_mtime_ns
-    r = subprocess.run([str(WRAPPER), "run"], env=env, capture_output=True, text=True,
+    r = subprocess.run([str(WRAPPER), "run", "--engine", "smina"], env=env, capture_output=True, text=True,
                        timeout=60)
     assert r.returncode == 0, r.stdout + r.stderr
     assert (home / "calibration.json").stat().st_mtime_ns == stamp   # calibrated: no rerun
@@ -823,7 +825,7 @@ def test_wrapper_benchmarks_pockets_before_run_when_uncalibrated(tmp_path):
     home = tmp_path / "home"
     env = _env(PATH=f"{bindir}:{os.environ['PATH']}", RUN=run_dir, POLYPHAR_RUN_DIR=run_dir,
                POLYPHAR_HOME=home, DOGSITE_BIN=FAKE2)
-    r = subprocess.run([str(WRAPPER), "run"], env=env, capture_output=True, text=True,
+    r = subprocess.run([str(WRAPPER), "run", "--engine", "smina"], env=env, capture_output=True, text=True,
                        timeout=60)
     assert r.returncode == 0, r.stdout + r.stderr
     assert "pockets" in json.loads((home / "calibration.json").read_text())

@@ -699,6 +699,25 @@ def _library_path(layout, args, copy: bool = True, progress=None) -> Path:
         return prepared
     if why:
         _warn_raw_library(progress, why, raw)
+        return raw
+
+    # No `ligands` manifest at all. That reads as "the stage never ran", but it reads
+    # exactly the same when the stage DID run and its directory was removed -- which
+    # happened on 2026-11-04, and the fallback was silent because the evidence it checks
+    # for went with the directory. Docking raw records is never what a pipeline run wants:
+    # no valence repair, no MMFF94 minimisation, and the records `ligands` excluded (123
+    # of 2083 on net1) back in the library. Refuse when this is plainly a pipeline run --
+    # a panel exists and the library is the default one.
+    if getattr(args, "library", DEFAULT_LIBRARY) == DEFAULT_LIBRARY \
+            and Path(layout.final_targets_csv).is_file():
+        raise FileNotFoundError(
+            f"the `ligands` stage has not been run here (no manifest in "
+            f"{ligands.stage_dir(layout)}), so the only library available is the raw "
+            f"source {raw.name}.\n"
+            f"Docking it would use unprepared records: no valence repair, no MMFF94 "
+            f"minimisation, and the records `ligands` excludes.\n"
+            f"Run `polyphar ligands` first. If you really mean to dock a raw file, name "
+            f"it: `--library <path>`.")
     return raw
 
 
@@ -1054,6 +1073,20 @@ def _plan(layout, args, lib: Path, engine: str) -> _Plan:
             units.append(Unit(t.label, i, seed,
                               _unit_key(src, pocket, library_sha, i, seed, opts)))
     return _Plan(targets, library_sha, len(records), usable, missing, units, opts)
+
+
+def receptor_is_prepared(layout, target: Target) -> bool:
+    """Whether 07_docking/<label>/receptor.pdbqt is already usable for this target.
+
+    The same test `_prepare_receptor` makes before doing the work, exposed so
+    `dock-export` can count what it will actually have to build instead of pretending the
+    cost is per ligand."""
+    d = _target_dir(layout, target)
+    try:
+        return ((d / "receptor.pdbqt").is_file()
+                and (d / "receptor.key").read_text().strip() == _prep_stamp(target))
+    except OSError:
+        return False
 
 
 def _prepare_receptor(layout, t: Target) -> Path:
