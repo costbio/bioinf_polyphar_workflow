@@ -13,9 +13,12 @@ import subprocess
 BUNDLE = "/content/bundle"
 OUT = "/content/results.tgz"
 
-done = sorted(glob.glob(f"{BUNDLE}/results/*.done"))
-csvs = sorted(glob.glob(f"{BUNDLE}/results/*.csv"))
-print(f"results: {len(csvs)} csv, {len(done)} done", flush=True)
+# results are nested: results/<label>/replicates/r<i>.done, not flat. A flat glob here
+# found nothing and the empty-bundle guard refused the pack -- correct refusal, wrong
+# reason.
+done = sorted(glob.glob(f"{BUNDLE}/results/**/*.done", recursive=True))
+csvs = sorted(glob.glob(f"{BUNDLE}/results/**/*.sdf", recursive=True))
+print(f"results: {len(done)} done, {len(csvs)} sdf", flush=True)
 if not done:
     raise SystemExit("nothing finished - do not pack an empty bundle")
 
