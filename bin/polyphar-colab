@@ -49,6 +49,17 @@ command -v colab >/dev/null 2>&1 || die "the colab CLI is not on PATH (pip insta
 [ -d "$run_dir" ] || die "run dir $run_dir does not exist"
 [ -d "$repo/bin/colab" ] || die "$repo/bin/colab not found; set POLYPHAR_REPO"
 
+# The image tag: polyphar-docker defaults to `latest`, which does not exist on this
+# machine, and the failure is a docker "pull access denied" that says nothing about the
+# real cause. Check it here, where the message can name the fix.
+tag="${POLYPHAR_VERSION:-latest}"
+if ! docker image inspect "polyphar:$tag" >/dev/null 2>&1; then
+    die "docker image polyphar:$tag not found.
+     Set the tag before running, as §0 of the runbook does:
+         export POLYPHAR_VERSION=1.1
+     Available: $(docker images --format '{{.Repository}}:{{.Tag}}' polyphar 2>/dev/null | tr '\n' ' ')"
+fi
+
 commit="$(cd "$repo" && git rev-parse HEAD)"
 if ! (cd "$repo" && git diff --quiet HEAD -- polyphar); then
     die "the polyphar package has uncommitted changes. The worker installs polyphar from
