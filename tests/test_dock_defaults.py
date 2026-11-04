@@ -72,3 +72,57 @@ def test_outstanding_replicates_of_one_target_stay_together_even_when_partly_don
     together."""
     todo = _units(("A", 1), ("A", 2), ("B", 1), ("B", 2))
     assert [repr(u) for u in dock._whole_targets(todo, 3)] == ["A/r1", "A/r2"]
+
+
+def test_control_mode_swaps_the_layout_and_the_library_not_a_separate_stage():
+    """`--control` is a flag on dock-export/dock-merge, not a control-export triple.
+
+    `control` owns no docking code: it calls dock.run() with a ControlLayout (a RunLayout
+    whose `docking` is 08_control/docking) and the co-crystal SDF as `library`. Export and
+    merge need exactly that substitution. dock-worker needs nothing: a bundle is
+    self-contained.
+    """
+    import argparse
+    from pathlib import Path
+
+    from polyphar.common import RunLayout
+    from polyphar.stages import control as control_stage
+
+    run = Path("/tmp/polyphar-control-view-test")
+    layout = RunLayout(run)
+
+    plain, lib = dock.control_view(layout, argparse.Namespace(control=False))
+    assert plain is layout and lib is None
+
+    # without the library, the error names the command that writes it
+    try:
+        dock.control_view(layout, argparse.Namespace(control=True))
+    except FileNotFoundError as exc:
+        assert "polyphar control" in str(exc)
+    else:                                                    # pragma: no cover
+        raise AssertionError("a missing control library must be refused")
+
+    # with it: ControlLayout, and docking redirected away from 07_docking
+    libp = control_stage.library_path(layout)
+    libp.parent.mkdir(parents=True, exist_ok=True)
+    libp.write_text("")
+    try:
+        got, got_lib = dock.control_view(layout, argparse.Namespace(control=True))
+        assert isinstance(got, control_stage.ControlLayout)
+        assert got_lib == libp
+        assert got.docking != layout.docking
+        assert "08_control" in str(got.docking)
+    finally:
+        libp.unlink(missing_ok=True)
+
+
+def test_control_flag_is_on_export_and_merge_but_not_on_the_worker():
+    """The worker runs a bundle and needs no run folder, so it has no --control."""
+    from polyphar.cli import build_parser
+
+    for stage, extra in (("dock-export", []), ("dock-merge", ["--bundle", "/tmp/b"])):
+        a = build_parser().parse_args([stage, "--run-dir", "/tmp/x", "--control"] + extra)
+        assert a.control is True, stage
+
+    worker = build_parser().parse_args(["dock-worker", "--bundle", "/tmp/b"])
+    assert not hasattr(worker, "control") or worker.control is False

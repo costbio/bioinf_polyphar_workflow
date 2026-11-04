@@ -1282,6 +1282,21 @@ def run(layout, args, progress) -> dict:
             return _finish(layout, args, d, counts, rows, None)
 
         dargs = dock_args(args)
+        # The library is written by now, so a host with no engine can still prepare the
+        # control and hand the docking to a GPU elsewhere. Stopping here with a message
+        # beats raising: the co-crystal SDF and labels.csv are the inputs
+        # `dock-export --control` needs, and they are already on disk.
+        try:
+            dock.require_engine_host(dargs)
+        except Exception as exc:
+            progress.note(
+                f"control: prepared {len(labels)} co-crystal ligand(s) and wrote {lib.name}, "
+                f"but this host cannot run the engine: {exc} "
+                f"Export the control's docking instead: `polyphar dock-export --control`, "
+                f"work the bundle where the GPU is, `polyphar dock-merge --control`, then "
+                f"run `polyphar control` again to compute the readouts.")
+            counts["prepared_only"] = True
+            return _finish(layout, args, d, counts, rows, None)
         dock_counts = dock.run(ControlLayout(layout.run_dir), dargs, progress, library=lib)
         counts.update({f"dock_{k}": v for k, v in dock_counts.items()})
         # dock's failures are the CONTROL's failures: folded in only as `dock_*` they are

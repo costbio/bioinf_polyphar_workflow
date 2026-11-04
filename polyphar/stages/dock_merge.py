@@ -88,6 +88,7 @@ def add_arguments(parser) -> None:
     dock.add_arguments(parser)
     parser.add_argument("--bundle", required=True,
                         help="bundle directory worked by `polyphar dock-worker`")
+    parser.add_argument("--control", action="store_true", help=dock.CONTROL_FLAG_HELP)
 
 
 def _bundle(args):
@@ -166,7 +167,8 @@ def units(layout, args):
 
     bundle = _bundle(args)
     args.engine_version = _engine(args)
-    plan, _lib, _engine_v = dock.plan_for(layout, args)
+    layout, control_lib = dock.control_view(layout, args)
+    plan, _lib, _engine_v = dock.plan_for(layout, args, library=control_lib)
     bl = dock.BundleLayout(bundle)
     want = {(u.label, u.replicate): u for u in plan.units}
     n = 0
@@ -182,8 +184,9 @@ def units(layout, args):
 def run(layout, args, progress) -> dict:
     bundle = _bundle(args)
     args.engine_version = _engine(args)
+    layout, control_lib = dock.control_view(layout, args)
     _check_options(layout, progress, args)
-    plan, _lib, _engine_v = dock.plan_for(layout, args)
+    plan, _lib, _engine_v = dock.plan_for(layout, args, library=control_lib)
     # taken BEFORE import_bundle, which is what discards here: dock.run's own baseline is
     # taken after, so without this counts["discarded"] reported 0 while discarded.tsv grew.
     baseline = dock._count_discards(layout.docking)

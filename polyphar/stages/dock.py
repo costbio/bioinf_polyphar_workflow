@@ -1887,6 +1887,37 @@ class BundleLayout:
         return self.bundle / "results"
 
 
+CONTROL_FLAG_HELP = (
+    "operate on the CONTROL docking (08_control/docking/) and the co-crystal library "
+    "instead of the production panel. `polyphar control` writes that library and then "
+    "stops on a host with no GPU; this exports its units, and `dock-merge --control` "
+    "folds them back so a second `polyphar control` finds them recorded and goes on to "
+    "the readouts")
+
+
+def control_view(layout, args):
+    """(layout, library) for `--control`, else the pair given.
+
+    `control` owns no docking code: it calls dock.run() with a ControlLayout -- a RunLayout
+    whose `docking` points at 08_control/docking -- and the co-crystal SDF as `library`.
+    Export and merge therefore need exactly that same substitution and nothing else, which
+    is why there is no control-export/control-worker/control-merge triple. The worker needs
+    no change at all: a bundle is self-contained.
+    """
+    if not getattr(args, "control", False):
+        return layout, None
+    from polyphar.stages import control as control_stage
+
+    lib = control_stage.library_path(layout)
+    if not lib.is_file():
+        raise FileNotFoundError(
+            f"{lib} does not exist. `polyphar dock-export --control` exports the control's "
+            f"co-crystal docking, and that library is written by `polyphar control`. Run "
+            f"`polyphar control` first: it labels the panel's targets, writes the library, "
+            f"and stops when it cannot reach an engine host.")
+    return control_stage.ControlLayout(layout.run_dir), lib
+
+
 def _whole_targets(todo, max_units: int):
     """The longest prefix of `todo` that is a whole number of targets and fits in
     `max_units`; if not even one target fits, that one target anyway.
@@ -2224,8 +2255,12 @@ def _carry_discards(bundle, layout) -> None:
         fh.write("\n".join(rows) + "\n")
 
 
-def plan_for(layout, args, engine: str | None = None):
-    """(plan, library path, engine version) for the bundle subcommands."""
-    lib = _library_path(layout, args, copy=False)
+def plan_for(layout, args, engine: str | None = None, library=None):
+    """(plan, library path, engine version) for the bundle subcommands.
+
+    `library` overrides the run's own library, for `--control`: the control docks the
+    co-crystal SDF rather than the production panel's library, and the unit keys must be
+    planned against the library that will actually be docked."""
+    lib = Path(library) if library is not None else _library_path(layout, args, copy=False)
     engine = engine or engine_version(layout, args)
     return _plan(layout, args, lib, engine), lib, engine

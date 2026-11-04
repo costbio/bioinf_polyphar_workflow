@@ -38,6 +38,7 @@ def add_arguments(parser) -> None:
     parser.add_argument("--max-units", type=dock._positive_int, default=None,
                         help="export at most this many (target, replicate) units "
                              "(default: all outstanding ones)")
+    parser.add_argument("--control", action="store_true", help=dock.CONTROL_FLAG_HELP)
     parser.add_argument("--engine-version", default=None,
                         help="engine version to put in the unit keys when this host has no "
                              "engine binary (e.g. 'Uni-Dock 1.2.0'); without it the local "
@@ -60,7 +61,8 @@ def units(layout, args):
     """Units to export, capped by --max-units. Counted in ligands, like `dock`."""
     from polyphar.common import WorkUnits
 
-    plan, _lib, _engine = dock.plan_for(layout, args)
+    layout, lib = dock.control_view(layout, args)
+    plan, _lib, _engine = dock.plan_for(layout, args, library=lib)
     n = len(plan.outstanding(layout))
     if getattr(args, "max_units", None):
         n = min(n, int(args.max_units))
@@ -68,7 +70,8 @@ def units(layout, args):
 
 
 def run(layout, args, progress) -> dict:
-    plan, lib, engine = dock.plan_for(layout, args)
+    layout, control_lib = dock.control_view(layout, args)
+    plan, lib, engine = dock.plan_for(layout, args, library=control_lib)
     rows: list[tuple[str, str]] = list(plan.missing)
     prepared = dock.prepare_receptors(layout, plan, rows)
     ligands_sdf = dock.titled_library(layout, lib, plan)
