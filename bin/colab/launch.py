@@ -19,6 +19,43 @@ LOG = "/content/worker.log"
 PIDFILE = "/content/worker.pid"
 UD_BIN = "/content/ud/bin"
 
+PUSHOVER_ENV = "/content/pushover.env"
+WANT = ("PUSHOVER_APP_TOKEN", "PUSHOVER_USER_KEY")
+exports, keys = "", []
+if os.path.exists(PUSHOVER_ENV):
+    with open(PUSHOVER_ENV) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            k, v = k.strip(), v.strip().strip("'\"")
+            if k in WANT and v:
+                exports += f"{k}={shlex.quote(v)} "
+                keys.append(k)
+
+# Refuse to start silent. A detached worker that cannot notify runs for up to 20 hours and
+# reports nothing: it can finish, stall or die and the first you hear of it is when you
+# poll. That is a worse failure than not starting, and the VM is fresh every session, so
+# the upload is exactly the step that gets forgotten on session 20 of 40.
+if sorted(keys) != sorted(WANT):
+    if os.environ.get("ALLOW_SILENT") == "1":
+        print(f"pushover: NOT configured ({', '.join(keys) or 'no keys'}) - starting "
+              f"silent because ALLOW_SILENT=1", flush=True)
+    else:
+        raise SystemExit(
+            f"refusing to start a silent worker: {PUSHOVER_ENV} "
+            + ("is missing" if not os.path.exists(PUSHOVER_ENV)
+               else f"has only {', '.join(keys)} - it needs both "
+                    f"{' and '.join(WANT)}" if keys
+               else f"has neither {' nor '.join(WANT)}")
+            + ".\n\nUpload the credentials first:\n"
+            "    colab upload ~/.polyphar/pushover.env /content/pushover.env -s <session>\n\n"
+            "Then run this again. To start without notifications anyway, pass\n"
+            "    colab exec -f bin/colab/launch.py --env ALLOW_SILENT=1 ...")
+else:
+    print("pushover:", ", ".join(sorted(keys)), flush=True)
+
 if not os.path.exists(BUNDLE_TGZ):
     raise SystemExit(f"{BUNDLE_TGZ} not found - upload it first")
 
@@ -48,24 +85,6 @@ print(f"units to work: {n_units}", flush=True)
 # DEBUG level, and a token passed as an argument can end up there. Without this the
 # detached worker runs silent -- it still calls notify(), but notify() finds no
 # credentials, logs one warning and skips, and that log dies with the VM.
-PUSHOVER_ENV = "/content/pushover.env"
-exports = ""
-if os.path.exists(PUSHOVER_ENV):
-    keys = []
-    with open(PUSHOVER_ENV) as fh:
-        for line in fh:
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            k, v = line.split("=", 1)
-            k, v = k.strip(), v.strip().strip("'\"")
-            if k in ("PUSHOVER_APP_TOKEN", "PUSHOVER_USER_KEY"):
-                exports += f"{k}={shlex.quote(v)} "
-                keys.append(k)
-    print("pushover:", ", ".join(sorted(keys)) or "file present but no usable keys", flush=True)
-else:
-    print("pushover: no /content/pushover.env - the worker will run silent", flush=True)
-
 # unidock_tools calls the bare name "unidock", so the prefix must be on the detached
 # process's own PATH -- inheriting this exec's environment is not enough.
 env_path = f"{UD_BIN}:" + os.environ.get("PATH", "")

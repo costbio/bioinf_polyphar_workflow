@@ -39,6 +39,12 @@ Then upload the bundle and, so the worker can reach you, the Pushover credential
     colab upload bundle.tgz /content/bundle.tgz -s <session>
     colab upload ~/.polyphar/pushover.env /content/pushover.env -s <session>
 
+`launch.py` **refuses to start without both keys.** A detached worker that cannot notify
+runs for up to 20 hours and tells you nothing — it can finish, stall or die and the first
+you hear of it is when you next poll. Failing immediately is the better failure, and the VM
+is fresh every session, so this upload is exactly the step that gets forgotten on session 20
+of 40. To start anyway, pass `--env ALLOW_SILENT=1` to the `launch.py` exec.
+
 The credentials go as a **file, not through `colab exec --env`**: colab-cli records request
 bodies in `~/.config/colab-cli/colab.log` at DEBUG level, and a token passed as an argument
 can end up there. Without the file the worker runs silent — it still calls `notify()`, but
