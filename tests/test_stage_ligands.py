@@ -772,13 +772,16 @@ def test_the_prepared_library_survives_docks_orphan_sweep(tmp_path):
     (d / "library" / ligands.OUTPUT).write_text("PREPARED\n")
     (d / "library" / "manifest.json").write_text("{}")
     (d / "ligands" / "c50_00000.sdf").write_text("chunk\n")
-    (d / "df_results_T_P_1_fixed.csv").write_text("a\n")
-    (d / "df_results_GONE_P_9_fixed.csv").write_text("b\n")
+    (d / "df_results_T_P_1.csv").write_text("a\n")
+    (d / "df_results_GONE_P_9.csv").write_text("b\n")
+    # the retired replicate-0 schema: an orphan under EVERY label, current or not
+    (d / "df_results_T_P_1_fixed.csv").write_text("legacy\n")
     plan = dock._Plan(targets=[types.SimpleNamespace(label="T_P_1")], library_sha="",
                       n_ligands=0, usable=[], missing=[], units=[], opts={})
 
     orphans = dock._orphans(layout, plan)
-    assert sorted(p.name for p in orphans) == ["GONE_P_9", "df_results_GONE_P_9_fixed.csv"]
+    assert sorted(p.name for p in orphans) == [
+        "GONE_P_9", "df_results_GONE_P_9.csv", "df_results_T_P_1_fixed.csv"]
     dock._obsolete(layout, orphans)
     assert (d / "library" / ligands.OUTPUT).read_text() == "PREPARED\n"
     assert (d / "library" / "manifest.json").is_file()

@@ -1,0 +1,61 @@
+#!/usr/bin/env python3
+"""Stand-in for BOTH Uni-Dock binaries in the stage tests (Uni-Dock is not installed here,
+and needs a CUDA GPU that this machine does not have either).
+
+* `--version`            -> $FAKE_UNIDOCK_VERSION or "Uni-Dock v1.2.0"
+* `unidock_pipeline ...` -> one SDF per ligand of --ligand_index in --savedir, exactly as
+  `unidock_tools` writes them: the input SD fields preserved, a `<docking_score>` field
+  added, and **the title line rewritten**, so a test that keys on the title instead of
+  `<ID>` fails. The real tool may or may not rewrite it -- upstream `_postprocessing` never
+  touches `_Name` and an SDMolSupplier/SDWriter round-trip preserves it -- so the stub takes
+  the worst case on purpose: the pipeline must not depend on the title either way.
+
+Scores come from the ID, as in fake_smina. $FAKE_UNIDOCK_JITTER adds a per-seed shift plus
+per-invocation entropy; $FAKE_UNIDOCK_ABSURD_IDS gives those ligands a +345.6 kcal/mol
+score (the shape of upstream issue #205); $FAKE_UNIDOCK_CALLS logs one line per call.
+"""
+import os
+import sys
+
+argv = sys.argv[1:]
+if "--version" in argv:
+    print(os.environ.get("FAKE_UNIDOCK_VERSION") or "Uni-Dock v1.2.0")
+    sys.exit(0)
+if not argv or argv[0] != "unidock_pipeline":
+    sys.exit(f"fake_unidock: unknown invocation {argv!r}")
+opt = {argv[i]: argv[i + 1] for i in range(1, len(argv) - 1) if argv[i].startswith("--")}
+
+jitter = 0.0
+if os.environ.get("FAKE_UNIDOCK_JITTER"):
+    import random
+    jitter = int(opt["--seed"]) * 0.001 + random.SystemRandom().random() * 1e-5
+absurd = set(filter(None, os.environ.get("FAKE_UNIDOCK_ABSURD_IDS", "").split(",")))
+savedir = opt["--savedir"]
+os.makedirs(savedir, exist_ok=True)
+n = 0
+for path in open(opt["--ligand_index"]).read().split():
+    text = open(path).read()
+    lid = None
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        if line.startswith("> ") and "<ID>" in line and i + 1 < len(lines):
+            lid = lines[i + 1].strip()
+            break
+    if lid is None:
+        continue
+    n += 1
+    out = []
+    for pose in (1, 2):
+        score = 345.6 if lid in absurd else -int(lid) / 10 - pose / 100 + jitter
+        out.append("rdkit_rewrote_the_title\n     RDKit          3D\n\n"
+                   "  0  0  0  0  0  0  0  0  0  0999 V2000\nM  END\n"
+                   f"> <ID>\n{lid}\n\n> <name>\nNAME_{lid}\n\n"
+                   f"> <docking_score>\n{score:.5f}\n\n$$$$\n")
+    with open(os.path.join(savedir, f"{int(lid):06d}_out.sdf"), "w") as fh:
+        fh.write("".join(out))
+calls = os.environ.get("FAKE_UNIDOCK_CALLS")
+if calls:
+    with open(calls, "a") as fh:
+        fh.write(f"n={n} seed={opt['--seed']} search_mode={opt['--search_mode']} "
+                 f"batch_size={opt['--batch_size']} receptor={opt['--receptor']}\n")
+print(f"fake unidock_tools: docked {n} ligands")

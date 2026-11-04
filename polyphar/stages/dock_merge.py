@@ -41,8 +41,45 @@ STAGE = "dock-merge"
 # this run's units. `replicates` is deliberately not among them: how MANY draws a run wants
 # is not part of what one draw is (it is not in the unit key either), so a 3-replicate
 # bundle merging into a 5-replicate run is legitimate and only warned about.
-KEY_OPTIONS = ("base_seed", "exhaustiveness", "num_modes", "ligand_addH")
-FLAG_FOR = {"base_seed": "--seed", "replicates": "--replicates"}
+KEY_OPTIONS = ("base_seed", "exhaustiveness", "num_modes", "ligand_addH", "engine_name",
+               "search_mode", "batch_size")
+FLAG_FOR = {"base_seed": "--seed", "replicates": "--replicates",
+            "engine_name": "--engine", "search_mode": "--search-mode",
+            "batch_size": "--batch-size"}
+
+
+def _warn_gpu_span(layout, progress, args) -> list[str]:
+    """Warn when one target's replicates were drawn on different GPU models.
+
+    Throughput and plausibly scores vary by device, so replicates split across an L4 and an
+    A100 put a potential systematic difference INSIDE what is being averaged. The run is
+    not refused -- the draws are real and the raw per-replicate records are kept -- but the
+    Methods have to know, and nothing else in the pipeline would ever say so."""
+    plan, _lib, _engine_v = dock.plan_for(layout, args)
+    spans = []
+    for label in sorted({u.label for u in plan.units}):
+        models = {}
+        for u in plan.units_of(label):
+            model = (dock.read_provenance(layout, u).get("gpu_model") or "").strip()
+            if model:
+                models.setdefault(model, []).append(u.name)
+        if len(models) > 1:
+            spans.append(f"{label}: " + ", ".join(
+                f"{m} ({', '.join(sorted(n))})" for m, n in sorted(models.items())))
+    if not spans:
+        return []
+    message = (f"{len(spans)} target(s) have replicates drawn on DIFFERENT GPU models, so "
+               f"a device difference sits inside the mean over replicates: "
+               + "; ".join(spans[:5]) + (", ..." if len(spans) > 5 else "")
+               + ". The raw per-replicate scores are kept, so this can be checked")
+    print(f"{STAGE}: WARNING: {message}", file=sys.stderr, flush=True)
+    notifier = getattr(progress, "notifier", None)
+    if notifier is not None:
+        try:
+            notifier(f"{STAGE}: replicates span GPU models", message, priority=1)
+        except Exception:
+            pass
+    return spans
 
 
 def add_arguments(parser) -> None:
@@ -154,14 +191,22 @@ def run(layout, args, progress) -> dict:
     taken, rejected, dropped = dock.import_bundle(layout, plan, bundle)
     progress.advance(len(taken))
     # the engine is not run here: everything outstanding simply stays outstanding
+    spans = _warn_gpu_span(layout, progress, args)
     counts = dock.run(
         layout, args, progress, execute=False, discard_baseline=baseline,
         extra_counts={"merged": len(taken), "rejected": len(rejected),
-                      "dropped": len(dropped)},
+                      "dropped": len(dropped),
+                      "targets_spanning_gpu_models": len(spans)},
         extra_manifest={"merged_from": str(bundle),
                         # the engine the keys were planned under vs the one that drew them
                         "engine_worker": worker_engine or "unknown",
-                        "worker_versions": worker.get("versions") or {}})
+                        "worker_versions": worker.get("versions") or {},
+                        # the rest of what the bundle's worker recorded about its host:
+                        # worker.json used to be written and never read at all
+                        "worker_host": worker.get("host") or "unknown",
+                        "worker_engine_name": worker.get("engine_name") or "unknown",
+                        "worker_gpu_models": worker.get("gpu_models") or [],
+                        "targets_spanning_gpu_models": spans})
     counts = dict(counts)
     for item, reason in rejected:
         from polyphar.common import append_failure

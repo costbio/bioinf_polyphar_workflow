@@ -106,8 +106,11 @@ reproducibility claim — and the design must not imply otherwise.
 Per target, keep both the raw draws and the summary:
 
 ```
-07_docking/<label>/replicates/r0.csv .. r2.csv    raw: ID, Ligand, best_score
-07_docking/<label>/chunks/r<i>.done               unit markers (job key)
+07_docking/<label>/replicates/r<i>.sdf            raw: the replicate's pose records
+07_docking/<label>/replicates/r<i>.log            engine log
+07_docking/<label>/replicates/r<i>.prov.json      per-unit provenance (GPU model, ...)
+07_docking/<label>/replicates/r<i>.done           unit marker (job key), beside its record
+07_docking/<label>/poses.sdf                      --poses first: replicate 0's poses
 07_docking/df_results_<label>.csv                 merged summary
 ```
 
@@ -213,11 +216,15 @@ design decision here should be justified by compute cost.
 ## Implementation order
 
 1. Split the stage: `dock-export`, `dock-worker`, `dock-merge`, keeping `dock` as the
-   single-host convenience path for a machine that has both a GPU and the run folder.
-2. Replicate-aware identity, keys and resume.
-3. The Uni-Dock engine adapter and its ETA.
-4. Results schema and the merge summary.
-5. Host checks and preflight.
-6. Bundle format and `run_key.json` verification.
+   single-host convenience path for a machine that has both a GPU and the run folder. DONE
+2. Replicate-aware identity, keys and resume. DONE
+3. The Uni-Dock engine adapter and its ETA. DONE (`polyphar/stages/dock_unidock.py`;
+   exercised through `tests/fixtures/fake_unidock`, never against the real binary, which is
+   not installed and needs a GPU this host does not have)
+4. Results schema and the merge summary. DONE
+5. Host checks and preflight. DONE
+6. Bundle format and `run_key.json` verification. DONE, including the per-result digest
+   (L3): the worker records the result's sha256 in `r<i>.prov.json` and `dock-merge`
+   refuses a record that no longer matches it.
 
 Steps 1 and 2 carry the design risk; the rest is mechanical.

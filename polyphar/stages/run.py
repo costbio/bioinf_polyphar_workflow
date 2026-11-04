@@ -38,7 +38,11 @@ milestone progress, done / FAILED.
   summary (printed, notified at priority 1, appended to logs/run.log).
 * Exit codes: 0 success; 1 a stage failed (the exception propagates; 143 for SIGTERM,
   129 for SIGHUP) or failed too often;
-  2 usage error; 3 the run finished but failures were flagged.
+  2 usage error; 3 the run finished but failures were flagged; 4 the run stopped cleanly
+  with work still outstanding (`--engine unidock` on a host with no GPU: everything up to
+  dock is done, and dock-export / dock-worker / dock-merge finish it). 4 is not 0 because
+  the documented workflow is `tmux` + `bin/polyphar-docker run`, where the guidance on
+  stdout is what nobody reads and `polyphar run && <next>` is what proceeds.
 * --dry-run prints the `polyphar estimate` table and does nothing else.
 
 Heavy imports stay inside functions (cli.build_parser imports this module at parse time).
@@ -61,6 +65,11 @@ FLAG_KEYS = ("failed", "incomplete_targets")
 EXIT_USAGE = 2
 EXIT_FLAGGED = 3
 EXIT_STOPPED = 1
+# The run stopped cleanly with work still to do: nothing failed, but the pipeline is NOT
+# finished. Distinct from 0, because every machine-readable signal of the GPU-less stop
+# otherwise said success -- and `polyphar run && <next>` in the documented tmux workflow is
+# exactly where nobody reads the stdout that carried the guidance.
+EXIT_INCOMPLETE = 4
 SKIPPED = "skipped (done)"
 DEFAULT_MAX_FAILED_FRACTION = 0.2
 FRACTION_STAGES = ("structures", "fix", "pockets")
@@ -202,7 +211,10 @@ def failures_line(rows) -> str:
     return f"failures: {'; '.join(flags) if flags else 'none'}"
 
 
-def summary_table(rows, run_name: str) -> str:
+def summary_table(rows, run_name: str, note=None) -> str:
+    """The run's table, closed by `failures: ...` -- or by `note`, when the run ended for a
+    reason the failure count does not describe (the GPU-less stop: nothing failed, but the
+    pipeline is not finished, and "failures: none" alone reads as success)."""
     lines = [f"run summary ({run_name})",
              f"{'stage':<12}{'status':<16}{'units':<22}{'estimate':<14}{'actual':<12}"
              f"{'failed':<8}incomplete_targets"]
@@ -217,14 +229,14 @@ def summary_table(rows, run_name: str) -> str:
         actual = format_duration(r["elapsed_s"]) if r.get("elapsed_s") is not None else "-"
         lines.append(f"{r['stage']:<12}{r['status']:<16}{r.get('units', '-'):<22}{est:<14}"
                      f"{actual:<12}{failed:<8}{incomplete}")
-    lines.append(failures_line(rows))
+    lines.append(note or failures_line(rows))
     return "\n".join(lines)
 
 
-def _finish(layout, rows, notifier, title, priority) -> str:
+def _finish(layout, rows, notifier, title, priority, note=None) -> str:
     from polyphar.notify import run_name
 
-    text = summary_table(rows, run_name(layout.run_dir))
+    text = summary_table(rows, run_name(layout.run_dir), note)
     print(text, flush=True)
     try:
         layout.logs.mkdir(parents=True, exist_ok=True)
@@ -235,7 +247,7 @@ def _finish(layout, rows, notifier, title, priority) -> str:
         print(f"could not write logs/run.log: {exc}", flush=True)
     # notify() truncates at 1024 characters: the failures line goes first
     try:
-        notifier(title, failures_line(rows) + "\n" + text, priority=priority)
+        notifier(title, (note or failures_line(rows)) + "\n" + text, priority=priority)
     except Exception:
         pass   # notifications never fail a run
     return text
@@ -374,8 +386,20 @@ def preflight_problems(layout, args, stages) -> list[str]:
                 problems.append(f"ligands: {rdkit}")
     if "dock" in stages:
         from polyphar.stages import dock
+        from polyphar.stages import dock_unidock as unidock
 
-        if dock.smina_version() == "unavailable":
+        # engine-aware: demanding smina from a Uni-Dock run would stop a perfectly good
+        # GPU host that has no CPU engine at all.
+        if dock.engine_name(args) == dock.ENGINE_UNIDOCK:
+            # a GPU-less host is NOT a preflight failure: `run` does everything up to dock
+            # and stops cleanly there (see _gpu_stop). What IS a failure is a GPU host
+            # carrying a Uni-Dock too old to trust.
+            if unidock.gpu_model() is not None:
+                try:
+                    unidock.check_version()
+                except unidock.UniDockError as exc:
+                    problems.append(f"dock: {exc}")
+        elif dock.smina_version() == "unavailable":
             problems.append(f"dock: smina ({dock.smina_bin()}) not runnable "
                             "(`smina --version` failed)")
     if "similarity" in stages:
@@ -436,8 +460,25 @@ def _warn_code_version(name, manifest, current, notifier) -> None:
     _notify_quietly(notifier, f"{name}: skipped stage from another code version", msg)
 
 
+def _gpu_stop(args, name: str) -> str | None:
+    """Why `run` must stop cleanly before this stage, or None.
+
+    `--engine unidock` needs a CUDA GPU, and POSEIDON -- the host the run folders live on
+    -- has none. Everything up to dock is still worth doing there, so the run completes it
+    and stops at dock with the export/worker/merge instructions, rather than failing."""
+    if name != "dock":
+        return None
+    from polyphar.stages import dock
+    from polyphar.stages import dock_unidock as unidock
+
+    if dock.engine_name(args) != dock.ENGINE_UNIDOCK or unidock.gpu_model() is not None:
+        return None
+    return unidock.NO_GPU_MESSAGE
+
+
 def _run_stages(cli, layout, args, stages, ids_given, notifier) -> int:
     rows = []
+    gpu_stop = None
     current = getattr(args, "run_git_commit", None) or common._git_commit()
     for i, name in enumerate(stages):
         row = {"stage": name, "status": "running"}
@@ -469,6 +510,16 @@ def _run_stages(cli, layout, args, stages, ids_given, notifier) -> int:
                     if _too_many_failures(layout, args, rows, i, stages, notifier):
                         return EXIT_STOPPED
                     continue
+            # AFTER the "0 units left and a manifest exists" branch above, never before
+            # it: a run folder whose docking is already complete -- the normal end state
+            # of export / worker / merge -- must report `skipped (done)`, not `not run`
+            # with instructions to go and export a bundle it has already finished.
+            stop = _gpu_stop(args, name)
+            if stop is not None:
+                gpu_stop = (name, stop)
+                rows.pop()
+                rows.extend({"stage": s, "status": "not run"} for s in stages[i:])
+                break
             if units.count > 0 and _needs_benchmark(name):
                 _benchmark(name)
             row["counts"] = cli.gate(name, stage, layout, args, notifier, record=row,
@@ -481,6 +532,14 @@ def _run_stages(cli, layout, args, stages, ids_given, notifier) -> int:
             raise
         if _too_many_failures(layout, args, rows, i, stages, notifier):
             return EXIT_STOPPED
+    if gpu_stop is not None:
+        name, stop = gpu_stop
+        print(f"{name}: {stop}", flush=True)
+        _finish(layout, rows, notifier,
+                f"run stopped before {name}: this host has no GPU", priority=1,
+                note=f"stopped before {name}: run dock-export / dock-worker / dock-merge "
+                     f"to finish")
+        return EXIT_INCOMPLETE
     flags = _flags(rows)
     if flags:
         _finish(layout, rows, notifier, f"run done with failures ({len(flags)} flagged)",

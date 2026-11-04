@@ -47,3 +47,24 @@ def units(layout, args):
 
 def run(layout, args, progress) -> dict:
     return dock.work_bundle(_bundle(args), args, progress)
+
+
+def slots(args, threads_per_job: int = 1) -> int:
+    """Like `dock.slots`, but the engine comes from the BUNDLE, not from this host's
+    defaults -- the same source `work_bundle` uses when it sizes its pool. Without this the
+    ETA (and the calibration write-back) would divide a one-unit-at-a-time GPU run by
+    --nprocs."""
+    try:
+        bundle_args = dock.verify_run_key(_bundle(args), args)
+    except Exception:
+        bundle_args = args
+    return dock.slots(bundle_args, threads_per_job)
+
+
+def calibration_tool(args):
+    """The bundle decides the engine, so the ETA's calibration follows the bundle, not
+    whatever this host would default to."""
+    try:
+        return dock.calibration_tool(dock.verify_run_key(_bundle(args), args))
+    except Exception:
+        return dock.ENGINE_SMINA

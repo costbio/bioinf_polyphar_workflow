@@ -77,7 +77,7 @@ def test_e2e_two_proteins(tmp_path):
         assert (run_dir / d / "manifest.json").is_file(), f"{d} has no manifest"
     targets = (run_dir / "06_targets" / "final_targets.csv").read_text().splitlines()
     assert len(targets) >= 2, "final_targets.csv has no target rows"
-    results = list((run_dir / "07_docking").glob("df_results_*_fixed.csv"))
+    results = list((run_dir / "07_docking").glob("df_results_*.csv"))
     assert results and all(len(p.read_text().splitlines()) > 1 for p in results)
 
     # one start/ETA notification per stage, before that stage's first unit

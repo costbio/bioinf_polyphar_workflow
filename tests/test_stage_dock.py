@@ -1,3 +1,4 @@
+import os
 import json
 import shutil
 import subprocess
@@ -53,9 +54,9 @@ def test_reproduces_legacy_2mjw_scores(tmp_path, record_property):
     got = got[got.Pose == 1].reset_index(drop=True)
     legacy = pd.read_csv(LEGACY, index_col=0).reset_index(drop=True)
     assert got.Ligand.tolist() == legacy.Ligand.tolist()
-    rho = got.SMINA_Score.corr(legacy.SMINA_Score, method="spearman")
-    mad = (got.SMINA_Score.round(1) - legacy.SMINA_Score).abs().mean()   # log has 1 decimal
-    same = int((got.SMINA_Score.round(1) == legacy.SMINA_Score).sum())
+    rho = got.Score.corr(legacy.SMINA_Score, method="spearman")
+    mad = (got.Score.round(1) - legacy.SMINA_Score).abs().mean()   # log has 1 decimal
+    same = int((got.Score.round(1) == legacy.SMINA_Score).sum())
     record_property("spearman_rho", round(float(rho), 4))
     record_property("mean_abs_delta", round(float(mad), 4))
     print(f"\nlegacy 2mjw agreement: spearman_rho={rho:.4f} mean_abs_delta={mad:.3f} "
@@ -150,7 +151,8 @@ def test_placeholder_titles_resolved_by_id(tmp_path):
     subprocess.run([sys.executable, str(FAKE_SMINA), "-l", str(titled), "--out", str(out),
                     "--log", str(tmp_path / "l"), "--seed", "1", "--cpu", "1"], check=True)
     df = dock.parse_poses(out, lib, "X_P_1")
-    assert df.columns.tolist() == ["Pose", "SMINA_Score", "Ligand", "ID", "Pocket"]
+    assert df.columns.tolist() == dock.POSE_COLUMNS == [
+        "Pose", "Score", "Ligand", "ID", "Pocket"]
     assert df.groupby("ID").Ligand.first().to_dict() == {"3": "HISTAMINE", "4": "BUTABARBITAL"}
     assert df.Pose.tolist() == [1, 2, 1, 2]
 
@@ -256,9 +258,13 @@ def test_run_writes_one_result_per_replicate(run_folder):
         for i in range(3):
             assert (layout.docking / label / "replicates" / f"r{i}.sdf").is_file()
             assert (layout.docking / label / "replicates" / f"r{i}.done").is_file()
-        df = pd.read_csv(layout.docking / f"df_results_{label}_fixed.csv", dtype={"ID": str})
-        assert df.ID.tolist() == [str(i) for i in range(1, 21) for _ in (1, 2)]
-        assert (layout.docking / label / "poses.sdf").is_file()
+        df = pd.read_csv(layout.docking / f"df_results_{label}.csv", dtype={"ID": str})
+        # the summary is one row per LIGAND over the replicates, not one per pose
+        assert df.columns.tolist() == dock.SUMMARY_COLUMNS
+        assert df.ID.tolist() == [str(i) for i in range(1, 21)]
+        assert df.n.tolist() == [3] * 20
+        assert (layout.docking / label / "poses.sdf").is_file()     # --poses first
+        assert not list((layout.docking / label).glob("poses_r*.sdf"))
     # one engine call per unit, over the WHOLE library, with that replicate's seed
     lines = calls.read_text().splitlines()
     assert len(lines) == 6
@@ -509,7 +515,7 @@ def test_incomplete_target_flagged(run_folder, monkeypatch):
     # average it in silently).
     assert rows == [f"incomplete: 3 ligand ID(s) without poses in r{i}: 3,5,7; "
                     f"log: 07_docking/2mjw_A_P_1/replicates/r{i}.log" for i in range(3)]
-    assert not (layout.docking / f"df_results_{LABELS[0]}_fixed.csv").exists()
+    assert not (layout.docking / f"df_results_{LABELS[0]}.csv").exists()
     assert not (layout.docking / LABELS[0] / "poses.sdf").exists()
 
 
@@ -656,7 +662,7 @@ def test_export_worker_merge_round_trip(run_folder, tmp_path):
     assert mc["merged"] == 6 and mc["rejected"] == 0
     assert mc["complete"] == 2 and mc["incomplete_targets"] == 0
     for label in LABELS:
-        assert (layout.docking / f"df_results_{label}_fixed.csv").is_file()
+        assert (layout.docking / f"df_results_{label}.csv").is_file()
         for i in range(3):
             assert (layout.docking / label / "replicates" / f"r{i}.done").is_file()
     assert dock.units(layout, _args()).count == 0        # the run folder is now finished
@@ -925,3 +931,694 @@ def test_a_changed_receptor_pdbqt_is_warned_about_against_the_last_manifest(run_
     assert "receptor PDBQT changed" in capsys.readouterr().err
     assert LABELS[0] in json.loads(
         (layout.docking / "manifest.json").read_text())["receptors"]
+
+
+# --- the engine is selectable: Uni-Dock (stubbed) ---------------------------------------
+#
+# Uni-Dock is GPU-only and is not installed here, so every test below drives the adapter
+# through tests/fixtures/fake_unidock and a faked $POLYPHAR_GPU_MODEL. What is exercised
+# for real is everything polyphar owns: the argv, the split library, the <ID> keying, the
+# absurd-score filter, the version gate, the unit key, the provenance and the merge. The
+# only untested surface is whether the real `unidocktools` CLI spells its flags the way
+# dock_unidock.pipeline_cmd does.
+
+from polyphar.stages import dock_unidock as unidock   # noqa: E402
+
+FAKE_UNIDOCK = FIX / "fake_unidock"
+
+
+def install_fake_unidock(monkeypatch, bin_dir, name="unidock", target=FAKE_UNIDOCK):
+    """Put a stub named `name` on $PATH and return its path.
+
+    The engine that docks is whatever `unidock` resolves to on $PATH -- `unidock_tools`
+    hardcodes it -- so the stub has to be installed THERE, not only in $UNIDOCK_BIN. The two
+    are separate arguments here precisely so a test can make them disagree; wiring both to
+    one file is what hid the gap this fixture now exposes."""
+    bin_dir = Path(bin_dir)
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    path = bin_dir / name
+    if not path.exists():
+        path.symlink_to(target)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
+    return path
+
+
+@pytest.fixture
+def gpu_run_folder(run_folder, monkeypatch, tmp_path):
+    """The same run folder, with Uni-Dock stubbed and a GPU pretended."""
+    layout, _ = run_folder
+    calls = tmp_path / "unidock_calls.txt"
+    on_path = install_fake_unidock(monkeypatch, tmp_path / "ubin")
+    monkeypatch.setenv("UNIDOCK_BIN", str(on_path))
+    monkeypatch.setenv("UNIDOCK_TOOLS_BIN", str(FAKE_UNIDOCK))
+    monkeypatch.setenv("POLYPHAR_GPU_MODEL", "NVIDIA L4")
+    monkeypatch.setenv("POLYPHAR_CUDA_RUNTIME", "12.4")
+    monkeypatch.setenv("POLYPHAR_HOST_PATH", "colab")
+    monkeypatch.setenv("FAKE_UNIDOCK_CALLS", str(calls))
+    monkeypatch.delenv("FAKE_UNIDOCK_JITTER", raising=False)
+    monkeypatch.delenv("FAKE_UNIDOCK_ABSURD_IDS", raising=False)
+    monkeypatch.delenv("FAKE_UNIDOCK_VERSION", raising=False)
+    return layout, calls
+
+
+def _gpu_args(**kw):
+    base = dict(engine="unidock", search_mode="balance", batch_size=1200)
+    base.update(kw)
+    return _args(**base)
+
+
+def test_unidock_unit_keys_on_the_id_field_not_the_title(gpu_run_folder):
+    """The whole point of the <ID> keying: unidock_tools runs the ligand through RDKit and
+    the EDRUG3D_<ID> title convention cannot be relied on through it.
+
+    What this pins is the POLICY, not an upstream behaviour: the stub rewrites the title,
+    so the assertions below prove the stage still identifies every ligand and names it from
+    the LIBRARY when the title is gone. The real tool may well preserve it (upstream
+    `_postprocessing` never touches `_Name`); that would not make keying on the title
+    right. A prior investigation lost time looking for `ENERGY=` too -- the score field is
+    <docking_score>, which unidock_tools adds."""
+    layout, calls = gpu_run_folder
+    counts = dock.run(layout, _gpu_args(replicates=2), Prog())
+    assert counts["units_docked"] == 4 and counts["complete"] == 2
+    r0 = (layout.docking / LABELS[0] / "replicates" / "r0.sdf").read_text()
+    assert "EDRUG3D_" not in r0 and "rdkit_rewrote_the_title" in r0
+    assert "docking_score" in r0 and "ENERGY=" not in r0
+    df = pd.read_csv(layout.docking / f"df_results_{LABELS[0]}.csv", dtype={"ID": str})
+    assert df.ID.tolist() == [str(i) for i in range(1, 21)]
+    # the LIBRARY's name for that ID, not the one the engine put in the record
+    names = dict(zip(dock.read_library(layout.inputs / "lib.sdf").ID,
+                     dock.read_library(layout.inputs / "lib.sdf").name))
+    assert df.Ligand.tolist() == [names[i] for i in df.ID]
+    assert "NAME_1" not in set(df.Ligand)
+    assert df.score_mean[0] == pytest.approx(-0.12)   # best of the two poses
+    # search_mode balance (exhaustiveness 384), NOT smina's exhaustiveness 12
+    lines = calls.read_text().splitlines()
+    assert len(lines) == 4
+    assert {l.split()[2] for l in lines} == {"search_mode=balance"}
+    assert {l.split()[3] for l in lines} == {"batch_size=1200"}
+    assert sorted(l.split()[1] for l in lines) == ["seed=42"] * 2 + ["seed=43"] * 2
+    # one input FILE per ligand: unidock_tools writes one output per input file
+    index = layout.docking / dock.LIB_DIRNAME / "split" / unidock.INDEX_NAME
+    assert len(index.read_text().split()) == 20
+
+
+def test_the_engine_is_part_of_the_unit_key(run_folder, gpu_run_folder):
+    """An engine change supersedes the recorded draws rather than mixing two populations
+    under one target: the engine name and its search settings are in every unit key.
+
+    Both plans are built with the SAME engine-version string, so what separates the keys
+    can only be `engine_name` (and the search settings below). Passing two different
+    version strings would have made this pass even with `engine_name` dropped from
+    _options()."""
+    layout, _ = gpu_run_folder
+    version = "same build string for both"
+    smina_keys = {u.key for u in dock._plan(
+        layout, _args(), dock._library_path(layout, _args(), copy=False), version).units}
+    plan = dock._plan(layout, _gpu_args(), dock._library_path(layout, _gpu_args(),
+                                                              copy=False), version)
+    assert smina_keys.isdisjoint({u.key for u in plan.units})
+    # ... and so is the search mode
+    fast = dock._plan(layout, _gpu_args(search_mode="fast"),
+                      dock._library_path(layout, _gpu_args(), copy=False), "Uni-Dock v1.2.0")
+    assert {u.key for u in plan.units}.isdisjoint({u.key for u in fast.units})
+    assert dock._options(_gpu_args(), "x")["search_mode"] == "balance"
+    assert "exhaustiveness" not in dock._options(_gpu_args(), "x")
+
+
+def test_unidock_below_1_2_0_is_refused(gpu_run_folder, monkeypatch):
+    """Not a warning: before 1.2.0 Uni-Dock silently corrupted ~20 % of results for boxes
+    >= 30 A, which is most of this study's pockets."""
+    layout, _ = gpu_run_folder
+    monkeypatch.setenv("FAKE_UNIDOCK_VERSION", "Uni-Dock v1.1.1")
+    with pytest.raises(unidock.UniDockError, match="too old"):
+        dock.run(layout, _gpu_args(), Prog())
+    assert not list(layout.docking.glob("*/replicates/*.sdf"))
+    monkeypatch.setenv("FAKE_UNIDOCK_VERSION", "Uni-Dock v1.2.0")
+    assert dock.run(layout, _gpu_args(replicates=1), Prog())["complete"] == 2
+
+
+def test_a_gpu_less_host_fails_fast_with_guidance(gpu_run_folder, monkeypatch):
+    """POSEIDON is exactly this host, so it is the common case. It must fail BEFORE any
+    receptor is prepared or any engine call is made, and the message must say what to do."""
+    layout, calls = gpu_run_folder
+    monkeypatch.setenv("POLYPHAR_GPU_MODEL", "")
+    monkeypatch.setattr(unidock, "gpu_model", lambda: None)
+    with pytest.raises(unidock.UniDockError) as exc:
+        dock.run(layout, _gpu_args(), Prog())
+    for expected in ("dock-export", "dock-worker", "dock-merge", "--engine smina"):
+        assert expected in str(exc.value)
+    assert not calls.exists()
+
+
+def test_run_stops_cleanly_before_dock_on_a_gpu_less_host(gpu_run_folder, monkeypatch,
+                                                          capsys):
+    """`polyphar run` must finish everything it can and stop at dock, not fail: the stages
+    before it are perfectly runnable on the host that holds the run folder.
+
+    Not exit 0 either. The stop leaves the pipeline unfinished, and the documented workflow
+    is `tmux` + `bin/polyphar-docker run` -- the guidance goes to a stdout nobody reads,
+    while `polyphar run && <next>` reads the status. EXIT_INCOMPLETE (4) is the signal, the
+    notification goes out at priority 1, and it does not claim `failures: none`."""
+    from polyphar.stages import run as run_stage
+
+    layout, _ = gpu_run_folder
+    monkeypatch.setattr(unidock, "gpu_model", lambda: None)
+    args = _gpu_args()
+    assert run_stage._gpu_stop(args, "dock") is not None
+    assert run_stage._gpu_stop(args, "select") is None
+    assert run_stage._gpu_stop(_args(), "dock") is None   # smina needs no GPU
+
+    notes = []
+    rc = run_stage._run_stages(__import__("polyphar.cli", fromlist=["cli"]), layout, args,
+                               ["dock"], True,
+                               lambda t, m, priority=0: notes.append((t, m, priority)))
+    assert rc == run_stage.EXIT_INCOMPLETE == 4       # stopped cleanly, NOT success
+    out = capsys.readouterr().out
+    assert "no CUDA GPU found" in out and "dock-export" in out
+    assert "not run" in out and "FAILED" not in out
+    assert len(notes) == 1 and notes[0][2] == 1       # priority 1, not 0
+    assert "failures: none" not in notes[0][1]
+    assert "dock-export" in notes[0][1] and "dock-worker" in notes[0][1]
+
+
+def test_run_reports_a_finished_dock_as_done_not_as_not_run(gpu_run_folder, monkeypatch,
+                                                            capsys):
+    """The normal end state of the GPU workflow: dock is already complete (export / worker
+    / merge ran) and the user runs `polyphar run --engine unidock` again on the GPU-less
+    host that holds the run folder.
+
+    Evaluating the GPU stop at the TOP of the per-stage loop printed `dock: not run` and
+    told them to go and export a bundle for work that is finished. The check belongs after
+    the `skipped (done)` branch: dock.units() answers 0 on a GPU-less host perfectly well."""
+    from polyphar.stages import run as run_stage
+
+    layout, _ = gpu_run_folder
+    dock.run(layout, _gpu_args(), Prog())                       # finish the docking
+    monkeypatch.setattr(unidock, "gpu_model", lambda: None)     # now take the GPU away
+    assert dock.units(layout, _gpu_args()).count == 0
+    rc = run_stage._run_stages(__import__("polyphar.cli", fromlist=["cli"]), layout,
+                               _gpu_args(), ["dock"], True, lambda *a, **k: None)
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert run_stage.SKIPPED in out
+    assert "no CUDA GPU found" not in out and "not run" not in out
+
+
+def test_preflight_does_not_demand_smina_for_a_unidock_run(gpu_run_folder, monkeypatch):
+    from polyphar.stages import run as run_stage
+
+    layout, _ = gpu_run_folder
+    monkeypatch.setenv("SMINA_BIN", "/nonexistent/smina")
+    assert run_stage.preflight_problems(layout, _gpu_args(), ["dock"]) == []
+    smina_problems = run_stage.preflight_problems(layout, _args(), ["dock"])
+    assert len(smina_problems) == 1 and "smina" in smina_problems[0]
+    # a GPU host whose Uni-Dock is too old IS a preflight failure
+    monkeypatch.setenv("FAKE_UNIDOCK_VERSION", "Uni-Dock v1.0.0")
+    problems = run_stage.preflight_problems(layout, _gpu_args(), ["dock"])
+    assert len(problems) == 1 and "too old" in problems[0]
+
+
+def test_absurd_scores_are_filtered_and_logged(gpu_run_folder, monkeypatch):
+    """Upstream issue #205: +300 kcal/mol on a Meeko ligand. Such a value is not an
+    observation; it is dropped, and what was dropped is written down."""
+    layout, _ = gpu_run_folder
+    monkeypatch.setenv("FAKE_UNIDOCK_ABSURD_IDS", "4,9")
+    counts = dock.run(layout, _gpu_args(replicates=1), Prog())
+    assert counts["complete"] == 0 and counts["incomplete_targets"] == 2
+    d = layout.docking / LABELS[0] / "replicates"
+    filtered = pd.read_csv(d / "r0.filtered.tsv", sep="\t", dtype=str)
+    assert sorted(filtered.id) == ["4", "9"]
+    assert all("issue #205" in r for r in filtered.reason)
+    assert "2 ligand(s) filtered" in (d / "r0.log").read_text()
+    # and the ligands are then simply absent, which makes the replicate incomplete
+    assert "4" not in dock._records((d / "r0.sdf").read_text())[0].fields.get("ID", "")
+    failed = pd.read_csv(layout.docking / "failed.tsv", sep="\t", dtype=str)
+    assert any("without poses in r0: 4,9" in r for r in failed.reason)
+    assert dock_unidock_threshold() == 100.0
+
+
+def dock_unidock_threshold():
+    return unidock.ABSURD_SCORE
+
+
+# --- the summary over replicates ----------------------------------------------------------
+
+def test_the_summary_is_exact_with_a_fixed_valued_engine(run_folder):
+    """Determinism is now statistical. With a stubbed engine returning fixed values the
+    three draws are identical, so the mean is the value, the sd is exactly 0 and so is the
+    SE -- no tolerance needed."""
+    layout, _ = run_folder
+    dock.run(layout, _args(replicates=3), Prog())
+    df = pd.read_csv(layout.docking / f"df_results_{LABELS[0]}.csv", dtype={"ID": str})
+    assert df.columns.tolist() == dock.SUMMARY_COLUMNS
+    assert df.n.tolist() == [3] * 20
+    # the fake engine's best (pose 1) score for ligand i is -i/10 - 0.01
+    expected = [-int(i) / 10 - 0.02 for i in df.ID]   # the BEST of the two poses
+    assert df.score_mean.tolist() == pytest.approx(expected)
+    assert df.score_min.tolist() == pytest.approx(expected)
+    assert df.score_max.tolist() == pytest.approx(expected)
+    # zero spread to the last bit the arithmetic allows (summing three identical floats
+    # and dividing is not exact, so the residual is ~1e-17, never a real sd)
+    assert df.score_sd.tolist() == pytest.approx([0.0] * 20, abs=1e-12)
+    assert df.score_se.tolist() == pytest.approx([0.0] * 20, abs=1e-12)
+
+
+def test_the_se_tracks_the_input_distribution(run_folder, monkeypatch):
+    """The other half: with a jittering engine the SE must be the sd of the actual draws
+    over sqrt(n). A previous attempt used mean|delta| / sqrt(N), which for a normal is
+    1.128 sigma / sqrt(N) -- not a standard error of anything."""
+    import math
+
+    layout, _ = run_folder
+    monkeypatch.setenv("FAKE_SMINA_JITTER", "1")
+    dock.run(layout, _args(replicates=3), Prog())
+    library = dock.read_library(layout.inputs / "lib.sdf")
+    draws = {}
+    for i in range(3):                       # recomputed from the RAW per-replicate records
+        poses = dock.parse_poses(layout.docking / LABELS[0] / "replicates" / f"r{i}.sdf",
+                                 library, LABELS[0])
+        for lid, best in poses.groupby("ID")["Score"].min().items():
+            draws.setdefault(str(lid), []).append(float(best))
+    df = pd.read_csv(layout.docking / f"df_results_{LABELS[0]}.csv",
+                     dtype={"ID": str}).set_index("ID")
+    for lid, xs in draws.items():
+        mean = sum(xs) / 3
+        sd = math.sqrt(sum((x - mean) ** 2 for x in xs) / 2)
+        assert df.loc[lid, "score_mean"] == pytest.approx(mean)
+        assert df.loc[lid, "score_sd"] == pytest.approx(sd)
+        assert df.loc[lid, "score_se"] == pytest.approx(sd / math.sqrt(3))
+        assert df.loc[lid, "score_min"] == pytest.approx(min(xs))
+        assert df.loc[lid, "score_max"] == pytest.approx(max(xs))
+    assert (df.score_sd > 0).all()           # the draws really did differ
+
+
+def test_one_replicate_has_no_spread_rather_than_zero_spread(run_folder):
+    layout, _ = run_folder
+    dock.run(layout, _args(replicates=1), Prog())
+    df = pd.read_csv(layout.docking / f"df_results_{LABELS[0]}.csv")
+    assert df.n.tolist() == [1] * 20
+    assert df.score_sd.isna().all() and df.score_se.isna().all()
+
+
+def test_a_replicate_that_fails_validation_cannot_enter_the_summary(run_folder):
+    """The property `_check_replicate` exists for: a record truncated on a clean `$$$$`
+    boundary passes `result_intact`, and before it every such draw was averaged in."""
+    layout, _ = run_folder
+    dock.run(layout, _args(), Prog())
+    r1 = layout.docking / LABELS[0] / "replicates" / "r1.sdf"
+    r1.write_text("$$$$\n".join(r1.read_text().split("$$$$\n")[:6]) + "$$$$\n")
+    (layout.docking / "manifest.json").unlink()
+    counts = dock.run(layout, _args(), Prog())
+    assert counts["complete"] == 1
+    assert not (layout.docking / f"df_results_{LABELS[0]}.csv").exists()
+    assert not (layout.docking / LABELS[0] / "poses.sdf").exists()
+
+
+# --- poses -------------------------------------------------------------------------------
+
+def test_poses_are_written_for_replicate_0_only_by_default(run_folder):
+    layout, _ = run_folder
+    dock.run(layout, _args(), Prog())
+    d = layout.docking / LABELS[0]
+    assert (d / "poses.sdf").is_file()
+    assert (d / "poses.sdf").read_bytes() == (d / "replicates" / "r0.sdf").read_bytes()
+    assert not list(d.glob("poses_r*.sdf"))
+
+    dock.run(layout, _args(poses="all"), Prog())
+    assert sorted(p.name for p in d.glob("poses*.sdf")) == [
+        "poses.sdf", "poses_r1.sdf", "poses_r2.sdf"]
+    assert (d / "poses_r1.sdf").read_bytes() == (d / "replicates" / "r1.sdf").read_bytes()
+
+    dock.run(layout, _args(poses="none"), Prog())   # a lowered policy clears the stale ones
+    assert not list(d.glob("poses*.sdf"))
+    assert (layout.docking / f"df_results_{LABELS[0]}.csv").is_file()   # the summary stays
+    assert dock.DEFAULT_POSES == "first"
+
+
+# --- provenance, run_key and the GPU-model warning ----------------------------------------
+
+def test_every_unit_records_its_provenance(gpu_run_folder):
+    layout, _ = gpu_run_folder
+    dock.run(layout, _gpu_args(replicates=2), Prog())
+    u = _plan_of_engine(layout)[0]
+    info = dock.read_provenance(layout, u)
+    for field in ("engine_name", "engine_version", "unidock_tools", "cuda_driver_max",
+                  "gpu_model", "settings", "replicate", "seed", "library_sha256",
+                  "receptor_sha256", "pocket_sha256", "result_sha256", "host"):
+        assert field in info, field
+    assert info["engine_name"] == "unidock" and info["gpu_model"] == "NVIDIA L4"
+    assert info["cuda_driver_max"] == "12.4" and info["host"] == "colab"
+    assert info["settings"] == {"search_mode": "balance", "batch_size": 1200}
+    m = json.loads((layout.docking / "manifest.json").read_text())
+    assert m["units"][0]["provenance"]["gpu_model"] == "NVIDIA L4"
+    assert m["versions"]["engine_name"] == "unidock"
+
+
+def _plan_of_engine(layout):
+    args = _gpu_args()
+    plan = dock._plan(layout, args, dock._library_path(layout, args, copy=False),
+                      dock.engine_version(layout, args))
+    return [u for u in plan.units if u.label == LABELS[0]]
+
+
+def test_merge_warns_when_a_targets_replicates_span_gpu_models(run_folder, tmp_path,
+                                                               capsys):
+    """An L4 and an A100 inside one mean is a potential systematic difference inside what
+    is being averaged, and nothing else in the pipeline would ever say so."""
+    from polyphar.stages import dock_export, dock_merge, dock_worker
+
+    layout, _ = run_folder
+    bundle = tmp_path / "b"
+    args = _bundle_args(str(bundle))
+    dock_export.run(layout, args, Prog())
+    dock_worker.run(layout, args, Prog())
+    assert dock_merge.run(layout, args, Prog())["merged"] == 6
+    capsys.readouterr()
+    assert dock_merge._warn_gpu_span(layout, Prog(), args) == []   # one host: no warning
+
+    # now pretend r0 was drawn on an L4 and r1, r2 on an A100
+    for i, model in enumerate(("NVIDIA L4", "NVIDIA A100-SXM4-40GB", "NVIDIA A100-SXM4-40GB")):
+        p = layout.docking / LABELS[0] / "replicates" / f"r{i}.prov.json"
+        p.write_text(json.dumps({"gpu_model": model}))
+    (layout.docking / "manifest.json").unlink()   # force a re-merge, not an early return
+    counts = dock_merge.run(layout, args, Prog())
+    err = capsys.readouterr().err
+    assert "replicates drawn on DIFFERENT GPU models" in err
+    assert LABELS[0] in err and "NVIDIA L4 (r0)" in err
+    assert counts["targets_spanning_gpu_models"] == 1
+    m = json.loads((layout.docking / "manifest.json").read_text())
+    assert len(m["targets_spanning_gpu_models"]) == 1
+
+
+def test_merge_refuses_a_result_edited_after_the_engine_wrote_it(run_folder, tmp_path):
+    """L3: the marker and the `$$$$` terminator say nothing about the content, so a result
+    edited to different scores and re-terminated used to be copied in unchecked."""
+    from polyphar.stages import dock_export, dock_merge, dock_worker
+
+    layout, _ = run_folder
+    bundle = tmp_path / "b"
+    args = _bundle_args(str(bundle))
+    dock_export.run(layout, args, Prog())
+    dock_worker.run(layout, args, Prog())
+    victim = bundle / "results" / LABELS[0] / "replicates" / "r0.sdf"
+    text = victim.read_text().replace("-0.12", "-9.99")   # a better score, still terminated
+    victim.write_text(text)
+    assert dock.result_intact(victim)
+    counts = dock_merge.run(layout, args, Prog())
+    assert counts["merged"] == 5 and counts["rejected"] == 1
+    assert not (layout.docking / LABELS[0] / "replicates" / "r0.sdf").exists()
+    failed = pd.read_csv(layout.docking / "failed.tsv", sep="\t", dtype=str)
+    reasons = failed[failed.stage == "dock-merge"].reason.tolist()
+    assert len(reasons) == 1 and "changed after the engine wrote it" in reasons[0]
+
+
+def test_the_worker_verifies_the_run_key_before_doing_any_work(run_folder, tmp_path):
+    from polyphar.stages import dock_export, dock_worker
+
+    layout, calls = run_folder
+    bundle = tmp_path / "b"
+    dock_export.run(layout, _bundle_args(str(bundle)), Prog())
+    key = json.loads((bundle / dock.BUNDLE_KEY).read_text())
+    assert key["options"]["engine_name"] == "smina"
+    # the worker takes the engine FROM the bundle, whatever this host would default to
+    taken = dock.verify_run_key(bundle, _bundle_args(str(bundle), engine=None))
+    assert dock.engine_name(taken) == "smina"
+    # ... and refuses an explicit setting that contradicts it, before any engine call
+    calls.write_text("")
+    with pytest.raises(ValueError, match="run_key.json disagrees"):
+        dock_worker.run(layout, _bundle_args(str(bundle), engine="unidock"), Prog())
+    assert calls.read_text() == ""
+
+
+def test_the_bundle_run_key_carries_the_engine_settings(gpu_run_folder, tmp_path):
+    from polyphar.stages import dock_export
+
+    layout, _ = gpu_run_folder
+    bundle = tmp_path / "gb"
+    dock_export.run(layout, _bundle_args(str(bundle), engine="unidock",
+                                         search_mode="detail", batch_size=64), Prog())
+    opts = json.loads((bundle / dock.BUNDLE_KEY).read_text())["options"]
+    assert opts["engine_name"] == "unidock" and opts["search_mode"] == "detail"
+    assert opts["batch_size"] == 64 and opts["engine"].startswith("Uni-Dock")
+
+
+# --- ETA ----------------------------------------------------------------------------------
+
+def test_the_unidock_eta_is_a_per_device_rate_and_never_borrows_sminas(gpu_run_folder):
+    from polyphar.benchmark import unidock_rate
+    from polyphar.eta import Calibration, estimate_stage
+
+    layout, _ = gpu_run_folder
+    assert unidock_rate("NVIDIA L4") == (0.176, "L4")      # the measured figure
+    assert unidock_rate("NVIDIA A100-SXM4-40GB")[1] == "A100"
+    assert unidock_rate("some unknown card")[1].startswith("unlisted")
+
+    assert dock.calibration_tool(_gpu_args()) == "unidock:L4"
+    assert dock.calibration_tool(_args()) == "smina"
+    # a smina calibration is NOT reused for a GPU run: the ETA says uncalibrated instead
+    calib = Calibration(layout.run_dir / "calibration.json",
+                        {"dock": {"seconds_per_unit": 70.0, "n_observations": 1}})
+    from polyphar.common import WorkUnits
+
+    units = WorkUnits(1960, "ligand")
+    assert estimate_stage("dock", units, 8, calib, tool="smina").seconds == \
+        pytest.approx(1960 * 70.0 / 8)
+    gpu = estimate_stage("dock", units, 8, calib, tool="unidock:L4")
+    assert gpu.seconds is None and "uncalibrated for unidock:L4" in gpu.basis
+    # Uni-Dock runs ONE unit at a time, whatever nprocs says
+    assert dock._slots(_gpu_args(nprocs=32), 1) == 1
+    assert dock._slots(_args(nprocs=32), 2) == 16
+
+
+def _gate_eta(layout, args, calib_path, monkeypatch, nprocs):
+    """The ETA `cli.gate` would print, and the rate it would write back, for a dock run."""
+    import polyphar.cli as cli
+    from polyphar.eta import Calibration, Progress, estimate_stage, stage_slots
+
+    a = _gpu_args(nprocs=nprocs) if args == "unidock" else _args(nprocs=nprocs)
+    calib = Calibration.load(calib_path)
+    slots = stage_slots("dock", dock, a, 1)
+    units = dock.units(layout, a)
+    est = estimate_stage("dock", units, a.nprocs, calib, tool=dock.calibration_tool(a),
+                         slots=slots)
+    return est, slots, units, calib
+
+
+def test_the_unidock_eta_does_not_shrink_with_nprocs(gpu_run_folder, tmp_path, monkeypatch):
+    """P1: the ETA must come from the STAGE's slot count, not from nprocs // threads.
+
+    `dock._slots` already returned 1 for Uni-Dock, but only `_run_pool` consulted it:
+    `cli.gate` derived its own from the engine-blind eta.PARALLEL_EFFICIENCY table, so
+    `--nprocs 32` quoted an ETA 32x too short for a run that uses one GPU."""
+    from polyphar.eta import Calibration
+
+    layout, _ = gpu_run_folder
+    monkeypatch.setenv("POLYPHAR_HOME", str(tmp_path / "home"))
+    cal_dir = tmp_path / "home"
+    cal_dir.mkdir()
+    calib = Calibration(cal_dir / "calibration.json")
+    calib.update("dock", 0.176, tool="unidock:L4")
+    calib.save()
+
+    one, slots1, units, _ = _gate_eta(layout, "unidock", cal_dir, monkeypatch, 1)
+    many, slots32, _, _ = _gate_eta(layout, "unidock", cal_dir, monkeypatch, 32)
+    assert slots1 == slots32 == 1
+    assert one.seconds == many.seconds == pytest.approx(units.count * 0.176)
+    # the CPU engine still parallelises over nprocs -- this is not a blanket "slots = 1"
+    calib.update("dock", 2.0, tool="smina")
+    calib.save()
+    s1, sl1, u, _ = _gate_eta(layout, "smina", cal_dir, monkeypatch, 1)
+    s8, sl8, _, _ = _gate_eta(layout, "smina", cal_dir, monkeypatch, 8)
+    assert sl1 == 1 and sl8 == 8 and s8.seconds == pytest.approx(s1.seconds / 8)
+
+
+def test_a_finished_unidock_run_does_not_write_an_inflated_rate(gpu_run_folder, tmp_path,
+                                                                monkeypatch):
+    """P1, the other half: Progress writes back `elapsed * slots / work`, so the same wrong
+    slot count poisoned ~/.polyphar/calibration.json with an nprocs-fold inflated
+    seconds-per-ligand under the device's key -- destroying the single real measurement
+    and every later estimate for that device class."""
+    import polyphar.cli as cli
+    from polyphar.eta import Calibration, Estimate, Progress, stage_slots
+
+    layout, _ = gpu_run_folder
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("POLYPHAR_HOME", str(home))
+
+    # deterministic: 1,000 ligands in exactly 100 s is 0.1 s/ligand on the one GPU. With the
+    # table's slots (nprocs // tpj = 32) the same run stored 3.2 -- 32x the truth, under the
+    # device's own key, overwriting the single real 0.176 measurement.
+    args = _gpu_args(nprocs=32)
+    slots = stage_slots("dock", dock, args, 1)
+    assert slots == 1
+    now = [0.0]
+    calib = Calibration(home / "calibration.json")
+    prog = Progress("dock", 1000, Estimate(None, "x"), lambda *a, **k: None, calib=calib,
+                    slots=slots, clock=lambda: now[0], tool="unidock:L4")
+    now[0] = 100.0
+    prog.advance(1000)
+    prog.done({})
+    entry = json.loads((home / "calibration.json").read_text())["dock"]
+    assert entry["tool"] == "unidock:L4"
+    assert entry["seconds_per_unit"] == pytest.approx(0.1)
+
+    # and end to end: a real gate() run stores a rate under the device key, at one slot
+    home2 = tmp_path / "home2"
+    home2.mkdir()
+    monkeypatch.setenv("POLYPHAR_HOME", str(home2))
+    counts = cli.gate("dock", dock, layout, args, lambda *a, **k: None)
+    assert counts["units_docked"] > 0
+    assert json.loads((home2 / "calibration.json").read_text())["dock"]["tool"] == \
+        "unidock:L4"
+
+
+def test_the_version_gate_guards_the_binary_that_actually_docks(gpu_run_folder, tmp_path,
+                                                                monkeypatch):
+    """P2: `unidock_tools` hardcodes `cmd = ["unidock"]` -- no shutil.which, no env var, no
+    version check of its own. Gating $UNIDOCK_BIN while a different `unidock` sits first on
+    $PATH certified one build and ran another."""
+    layout, _ = gpu_run_folder
+    other = tmp_path / "elsewhere" / "unidock"
+    other.parent.mkdir()
+    shutil.copy2(FAKE_UNIDOCK, other)                 # a DIFFERENT build, e.g. a 1.1.x
+    monkeypatch.setenv("UNIDOCK_BIN", str(other))     # NOT the one on $PATH
+    with pytest.raises(unidock.UniDockError, match="NOT the binary that will dock"):
+        unidock.check_version()
+    with pytest.raises(unidock.UniDockError, match="NOT the binary that will dock"):
+        dock.run(layout, _gpu_args(), Prog())
+    # the same file reached through another path is still the same binary, and passes
+    link = tmp_path / "alias"
+    link.symlink_to(unidock.path_unidock())
+    monkeypatch.setenv("UNIDOCK_BIN", str(link))
+    assert unidock.check_version()
+    # $UNIDOCK_BIN alone, with nothing named `unidock` on $PATH, is refused: unidock_tools
+    # never reads it, so nothing would run
+    monkeypatch.setenv("UNIDOCK_BIN", str(other))
+    monkeypatch.setenv("PATH", str(tmp_path / "nothing-here"))
+    with pytest.raises(unidock.UniDockError, match="no `unidock` on .PATH"):
+        unidock.check_version()
+
+
+def test_the_version_gate_requires_the_banner_to_say_uni_dock(gpu_run_folder, monkeypatch):
+    """P2: a bare `\\d+\\.\\d+\\.\\d+` over the first line accepted 'AutoDock Vina v1.2.5' --
+    a different engine whose 1.2.5 has nothing to do with Uni-Dock's 1.2.0 grid fix -- and
+    'Uni-Dock v1.2.0-rc1', which may predate that fix."""
+    layout, _ = gpu_run_folder
+    for banner, why in (("AutoDock Vina v1.2.5", "does not identify itself as Uni-Dock"),
+                        ("vina 1.2.5", "does not identify itself as Uni-Dock"),
+                        ("Uni-Dock v1.2.0-rc1", "pre-release"),
+                        ("Uni-Dock v1.2.0rc1", "pre-release")):
+        monkeypatch.setenv("FAKE_UNIDOCK_VERSION", banner)
+        with pytest.raises(unidock.UniDockError, match=why):
+            dock.run(layout, _gpu_args(), Prog())
+    for ok in ("Uni-Dock v1.2.0", "Uni-Dock 1.3.1", "Uni-Dock v1.2.0+cuda12"):
+        assert unidock.check_version(ok) == ok
+
+
+def test_a_stale_minimized_affinity_never_overrides_the_engine_score(gpu_run_folder,
+                                                                     tmp_path):
+    """P3: `_postprocessing` clears five of its own properties and passes every other INPUT
+    SD field through, so a library that has been through smina / `obabel --minimize` would
+    hand every Uni-Dock record a stale <minimizedAffinity>. Taking the first present score
+    field replaced the real score with it, invisibly to the absurd-score filter."""
+    layout, _ = gpu_run_folder
+
+    def rec(lid, extra=""):
+        return (f"t\n x\n\n  0  0  0  0  0  0  0  0  0  0999 V2000\nM  END\n"
+                f"> <ID>\n{lid}\n\n> <name>\nN_{lid}\n\n{extra}$$$$\n")
+
+    stale = "> <minimizedAffinity>\n-9.99\n\n> <docking_score>\n-3.21\n\n"
+    out = tmp_path / "poses.sdf"
+    out.write_text(rec("1", stale))
+    lib = pd.DataFrame([["1", "drugA", "", "", 0]], columns=dock.LIBRARY_COLUMNS)
+    # the engine is named, so the engine's field is the one read
+    assert dock.parse_poses(out, lib, "L", score_field="docking_score").Score.tolist() == [-3.21]
+    # unnamed, a record carrying both is REFUSED, never silently resolved either way
+    with pytest.raises(ValueError, match="more than one score field"):
+        dock.parse_poses(out, lib, "L")
+    # the adapter drops such a record rather than emitting it
+    sd = tmp_path / "sd"
+    sd.mkdir()
+    (sd / "1.sdf").write_text(rec("1", stale))
+    n, dropped = unidock.collect(sd, tmp_path / "o.sdf", tmp_path / "f.tsv")
+    assert n == 0 and len(dropped) == 1 and "minimizedAffinity" in dropped[0][1]
+    # and such a library is refused BEFORE any GPU time
+    src = tmp_path / "lib.sdf"
+    src.write_text(rec("1", "> <minimizedAffinity>\n-9.99\n\n"))
+    with pytest.raises(unidock.UniDockError, match="already carries a <minimizedAffinity>"):
+        unidock.split_library(src, tmp_path / "split", "sha")
+
+
+def test_split_library_refuses_an_id_that_escapes_the_split_directory(tmp_path):
+    """P5: `dest / f"{lid}.sdf"` with an <ID> of '../ligands' overwrote
+    07_docking/ligands/ligands.sdf -- the prepared engine library -- and the escaped file
+    then survived the next `shutil.rmtree(dest)`."""
+    def rec(lid):
+        return (f"t\n x\n\n  0  0  0  0  0  0  0  0  0  0999 V2000\nM  END\n"
+                f"> <ID>\n{lid}\n\n$$$$\n")
+
+    lig = tmp_path / "ligands"
+    lig.mkdir()
+    (lig / "ligands.sdf").write_text("PRECIOUS PREPARED LIBRARY\n")
+    for bad in ("../ligands", "a/b", "..", "/abs"):
+        src = tmp_path / "src.sdf"
+        src.write_text(rec(bad) + rec("2"))
+        with pytest.raises(unidock.UniDockError, match="not usable as a filename"):
+            unidock.split_library(src, lig / "split", "sha")
+    assert (lig / "ligands.sdf").read_text() == "PRECIOUS PREPARED LIBRARY\n"
+    # and the IDs upstream's `stem.rstrip('_out')` would reduce to nothing
+    for bad in ("out", "too", "_"):
+        src = tmp_path / "src.sdf"
+        src.write_text(rec(bad))
+        with pytest.raises(unidock.UniDockError, match="empty stem"):
+            unidock.split_library(src, lig / "split2", "sha")
+
+
+def test_split_library_never_trusts_an_empty_library_sha(tmp_path):
+    """P5: `work_bundle` passes `str(key.get("library_sha256") or "")`. An empty sha
+    compared equal to an empty stamp, so a bundle without the field reused a stale split."""
+    def rec(lid):
+        return (f"t\n x\n\n  0  0  0  0  0  0  0  0  0  0999 V2000\nM  END\n"
+                f"> <ID>\n{lid}\n\n$$$$\n")
+
+    src = tmp_path / "l.sdf"
+    dest = tmp_path / "split"
+    src.write_text(rec("1") + rec("2"))
+    assert len(unidock.split_library(src, dest, "").read_text().split()) == 2
+    src.write_text(rec("1") + rec("2") + rec("3"))
+    assert len(unidock.split_library(src, dest, "").read_text().split()) == 3
+
+
+def test_a_failed_redraw_does_not_leave_the_previous_filtered_tsv(gpu_run_folder,
+                                                                  tmp_path, monkeypatch):
+    """P5: `run_unidock` only copied filtered.tsv on success, so a failing re-draw left the
+    previous draw's filtered list beside a record that no longer exists."""
+    layout, _ = gpu_run_folder
+    out = tmp_path / "r0.sdf"
+    filtered = tmp_path / "r0.filtered.tsv"
+    filtered.write_text("id\treason\n7\tfrom the PREVIOUS draw\n")
+    monkeypatch.setenv("FAKE_UNIDOCK_VERSION", "Uni-Dock v1.0.0")   # make it fail
+    with pytest.raises(unidock.UniDockError):
+        unidock.run_unidock("rec.pdbqt", tmp_path / "idx.txt", (0, 0, 0), (1, 1, 1),
+                            out, tmp_path / "r0.log", seed=42)
+    assert not filtered.exists()
+
+
+def test_an_empty_target_list_sweeps_nothing(run_folder, capsys):
+    """P8: with no labels, every df_results_*.csv and every <label>/ matches the orphan
+    rule, so a header-only final_targets.csv (a `select` that selected nothing) relocated
+    the WHOLE docking output to obsolete/ in one `polyphar dock`."""
+    layout, _ = run_folder
+    dock.run(layout, _args(), Prog())
+    before = sorted(p.name for p in layout.docking.iterdir())
+    assert any(n.startswith("df_results_") for n in before)
+    header = pd.read_csv(layout.final_targets_csv).iloc[0:0]
+    header.to_csv(layout.final_targets_csv, index=False)
+    plan = _plan_of(layout, _args())
+    assert plan.targets == []
+    assert dock._orphans(layout, plan) == []
+    assert "orphan sweep is SKIPPED" in capsys.readouterr().out
+    counts = dock.run(layout, _args(), Prog())
+    assert counts["obsoleted"] == 0
+    assert sorted(p.name for p in layout.docking.iterdir()) == before

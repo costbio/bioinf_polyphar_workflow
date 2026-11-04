@@ -30,11 +30,15 @@ PARALLEL_EFFICIENCY = {
     "fix": lambda nprocs, tpj=1: nprocs,
     "pockets": lambda nprocs, tpj=1: nprocs,
     "similarity": lambda nprocs, tpj=1: max(1, nprocs / 2),  # block-pair overhead
+    # CPU smina: one unit per nprocs//threads-per-job. This entry is ENGINE-BLIND and is
+    # therefore NOT what the dock stage's own ETA uses: Uni-Dock runs ONE unit at a time
+    # (it batches the whole library onto the one device), so `dock.slots()` -- the stage's
+    # own slot count, which `cli.gate` asks for and passes to both estimate_stage and
+    # Progress -- returns 1 for it whatever --nprocs says. Deriving the slots from the
+    # table here would divide a GPU ETA by --nprocs AND write back an --nprocs-inflated
+    # seconds-per-ligand into calibration.json. This entry is the fallback for callers that
+    # have no stage object (projected estimates for a stage not yet selected).
     "dock": lambda nprocs, tpj=1: max(1, nprocs // max(1, tpj)),
-    # the split stage: dock-worker docks like dock; export and merge are file work.
-    # Neither export nor worker has a calibration of its own yet (the Uni-Dock rate is the
-    # next step of the rework), so their ETA prints as uncalibrated rather than borrowing
-    # a figure measured with another engine.
     "dock-worker": lambda nprocs, tpj=1: max(1, nprocs // max(1, tpj)),
     "dock-export": lambda nprocs, tpj=1: 1,
     "dock-merge": None,
@@ -49,6 +53,18 @@ def slots_for(stage: str, nprocs: int, threads_per_job: int = 1,
     if fn is None:
         return None
     return max(1.0, float(fn(nprocs, threads_per_job)))
+
+
+def stage_slots(name: str, stage, args, threads_per_job: int = 1):
+    """The slot count to estimate AND calibrate `stage` with: its own `slots()` when it has
+    one, else the PARALLEL_EFFICIENCY table. None for a trivial stage.
+
+    A stage's parallelism can depend on more than nprocs (dock: the engine -- Uni-Dock runs
+    one unit at a time whatever --nprocs says), and the table cannot see that."""
+    fn = getattr(stage, "slots", None)
+    if fn is None:
+        return slots_for(name, getattr(args, "nprocs", 1), threads_per_job)
+    return max(1.0, float(fn(args, threads_per_job)))
 
 
 # --- calibration -----------------------------------------------------------
@@ -70,7 +86,20 @@ def _cpu_model() -> str:
 
 # Stages whose calibration depends on an external tool, and the tool an entry without a
 # `tool` field was measured with (pockets: DoGSiteScorer 2, the only tool before DoGSite3).
-LEGACY_TOOLS = {"pockets": "dogsite2"}
+# dock: an entry written before the engine was selectable was measured with smina, the
+# only engine then.
+LEGACY_TOOLS = {"pockets": "dogsite2", "dock": "smina", "dock-worker": "smina"}
+
+# How to re-measure a stage for a tool it has no calibration for. pockets is the exception:
+# DoGSiteScorer runs on the host, not through `polyphar benchmark`.
+RECALIBRATE_HINT = {"pockets": "bin/polyphar-dogsite-worker --benchmark --tool {tool}"}
+
+# Stages that are calibrated under another stage's name. `dock-worker` runs exactly the
+# engine calls `dock` does, on the same unit basis (ligands), so it uses dock's measured
+# rate instead of printing "uncalibrated" on the very host where the engine runs.
+# `dock-export` is deliberately NOT here: it copies files, so dock's per-ligand rate would
+# be nonsense for it.
+CALIBRATION_ALIAS = {"dock-worker": "dock"}
 
 
 class Calibration:
@@ -162,20 +191,29 @@ class Estimate:
 
 def estimate_stage(stage: str, units: WorkUnits, nprocs: int, calib: Calibration,
                    parallel_efficiency: dict | None = None, *,
-                   threads_per_job: int = 1, tool: str | None = None) -> Estimate:
+                   threads_per_job: int = 1, tool: str | None = None,
+                   slots: float | None = None) -> Estimate:
     """Wall-clock estimate: max(total work / slots, longest single job). With `tool`, only
-    a calibration measured with that tool is used."""
-    slots = slots_for(stage, nprocs, threads_per_job, parallel_efficiency)
+    a calibration measured with that tool is used.
+
+    `slots`, when given, OVERRIDES the PARALLEL_EFFICIENCY table. The table is engine-blind;
+    a stage that knows better (dock: one unit at a time on a GPU) reports its own count and
+    `cli.gate` passes it here and to Progress, so the ETA and the calibration write-back
+    both use the number the stage will actually run at."""
+    if slots is None:
+        slots = slots_for(stage, nprocs, threads_per_job, parallel_efficiency)
     if slots is None:
         return Estimate(0.0, "trivial")
     if units.count == 0:
         return Estimate(0.0, "no work")
-    c = calib.cost(stage, tool)
+    key = CALIBRATION_ALIAS.get(stage, stage)
+    c = calib.cost(key, tool)
     if c is None:
-        other = calib.tool_of(stage) if tool is not None else None
+        other = calib.tool_of(key) if tool is not None else None
         if other is not None:
+            hint = RECALIBRATE_HINT.get(stage, "polyphar benchmark --stages {stage}")
             return Estimate(None, f"uncalibrated for {tool} (calibration.json has {other}) — "
-                                  f"run bin/polyphar-dogsite-worker --benchmark --tool {tool}")
+                                  f"run " + hint.format(tool=tool, stage=stage))
         return Estimate(None, UNCALIBRATED)
     basis = f"calibrated ({units.cost_basis}, {slots:g} slots)"
     if units.sizes:

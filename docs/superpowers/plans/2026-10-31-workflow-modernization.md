@@ -84,7 +84,7 @@ Then rerun HCC subtype 1 (net1) on its real gene list, and after it every other 
   - 35 distinct molecules are titled `Molecule-1`, and `docking_screen_analysis.ipynb` groups by name.
   - 2xnn and TTK are targets of net1 and net3.
 - **e-Drug3D library:** md5 prefix `65b16127`, 2,083 records, with fields `status, cas, name, ID`. `ID` is unique; `name` is not.
-- **smina:** conda-forge `smina 2020.12.10`. The notebook reads `df_results_<target>_fixed.csv` (`Pose, SMINA_Score, Ligand, ID, Pocket`) and never uses the RMSD columns.
+- **smina:** conda-forge `smina 2020.12.10`. The 2023 notebook read `df_results_<target>_fixed.csv` (`Pose, SMINA_Score, Ligand, ID, Pocket`) and never used the RMSD columns. **That file is retired** (see the output contract below): the engine is selectable, so an engine-specific column name cannot survive, and one score column cannot express a distribution over replicates. A leftover `_fixed` file is now an orphan and the dock stage sweeps it into `07_docking/obsolete/<ts>/`.
 
 **Environment**
 - Workstation: Docker 29.8 works and IA32 emulation works in WSL2.
@@ -103,7 +103,7 @@ Then rerun HCC subtype 1 (net1) on its real gene list, and after it every other 
   <run>/04_pockets/<UniProt>/… ; DrugScore.csv
   <run>/05_similarity/Pocketsim.csv  PocketMatch_score.txt
   <run>/06_targets/final_targets.csv  centrality.csv  unique_pairs.csv
-  <run>/07_docking/<label>/poses.sdf ; df_results_<label>_fixed.csv
+  <run>/07_docking/<label>/poses.sdf ; <label>/replicates/r<i>.sdf ; df_results_<label>.csv
   <run>/logs/<stage>.log
   ```
   Every stage directory gets `manifest.json` and `failed.tsv` (`item, stage, reason`).
@@ -128,7 +128,8 @@ Then rerun HCC subtype 1 (net1) on its real gene list, and after it every other 
 - Output contracts kept for downstream notebooks:
   - `Pocketsim.csv` columns as above
   - `final_targets.csv` keeps the legacy columns and **adds** `Protein, Chain, Pocket, Pocket_Path, Receptor_Path`
-  - `df_results_<label>_fixed.csv` has the columns `Pose, SMINA_Score, Ligand, ID, Pocket`
+  - `df_results_<label>.csv` (**not** `_fixed`) has the columns `Ligand, ID, Pocket, n, score_mean, score_sd, score_se, score_min, score_max`: one row per ligand, summarising that ligand's BEST score in each of the `n` replicates. `score_sd` is the sample sd (ddof=1), `score_se = sd/sqrt(n)`; both are empty at `n == 1`. The per-replicate pose records stay in `<label>/replicates/r<i>.sdf`, so any other summary can be recomputed without re-docking.
+  - **Downstream code must key ligands on `ID`, not `Ligand`**: 35 different e-Drug3D drugs share the title `Molecule-1`.
 - **DoGSiteScorer runs only on the host** (user decision 2026-10-31: the binary's license is host-bound). It is never copied into or mounted into the image, and never committed to the repo.
   - The container hands work to the host through a **file job queue** in the shared run folder, `<run>/04_pockets/queue/`.
   - `bin/polyphar-dogsite-worker` is a host-side script that needs only Python ≥ 3.8 with the standard library. It consumes the queue and runs the binary given by `--dogsite` (default `$DOGSITE_BIN`).
@@ -138,7 +139,7 @@ Then rerun HCC subtype 1 (net1) on its real gene list, and after it every other 
 
 1. **A PDB entry listed in UniProt where no chain maps to that accession** (ortholog, e.g. 2HQW for Q05586). Skip and log it; never fall back to the first chain. Test: Task 5.
 2. **A case-sensitive filesystem**, as in Docker and on the server. Pocket files must be found by their exact on-disk name. Test: Task 8.
-3. **A docking job that dies part-way** (2xnn), or a ligand with no poses. Mark the target incomplete, list the missing IDs, and write no partial `df_results_*_fixed.csv`. Test: Task 12.
+3. **A docking job that dies part-way** (2xnn), or a ligand with no poses. Mark the target incomplete, list the missing IDs, and write no partial `df_results_*.csv`. Test: Task 12.
 4. **Pocket names over 32 characters, or names that collide after truncation.** Fail before PocketMatch runs. Test: Task 10.
 5. **An interrupted run that is restarted** (ssh drop, container killed). Finished units are skipped, half-written outputs are redone, and the new ETA counts only the remaining units. Tests: Tasks 5, 6, 8, 10 and 12 (the `resume` tests).
 
@@ -502,9 +503,9 @@ Then rerun HCC subtype 1 (net1) on its real gene list, and after it every other 
   - `receptor_to_pdbqt(pdb, pdbqt, ph=7.4)`: the legacy pybel steps.
   - `pocket_box(pocket_pdb) -> (center, size)`: unpadded.
   - `run_smina(receptor, ligands, center, size, out_sdf, log, seed, cpu, exhaustiveness=12, num_modes=12)`. Raises on a non-zero exit.
-  - `parse_poses(out_sdf, library, label) -> DataFrame[Pose, SMINA_Score, Ligand, ID, Pocket]`.
+  - `parse_poses(out_sdf, library, label) -> DataFrame[Pose, Score, Ligand, ID, Pocket]` (`Score`, not `SMINA_Score`: the engine is selectable).
   - Jobs are (target × chunk of `--chunk-size 50` ligands), run with `--threads-per-job 1` (default) under a `ProcessPoolExecutor(nprocs // threads_per_job)`. A chunk is done when its `.done` marker exists.
-  - Results are merged per target into `07_docking/<label>/poses.sdf` and `07_docking/df_results_<label>_fixed.csv`, where `label = f"{Protein}_{Pocket}"`.
+  - Results are merged per target into `07_docking/<label>/poses.sdf` and `07_docking/df_results_<label>.csv`, where `label = f"{Protein}_{Pocket}"`.
   - `units() = WorkUnits(count = n_remaining_chunks × chunk_size, cost_basis="ligand")`.
   - The manifest records `smina --version`, the library md5 and the seed.
   - CLI: `polyphar dock --library inputs/e-Drug3D_2083.sdf [--seed 42] [--chunk-size 50] [--threads-per-job 1]`.
@@ -568,7 +569,7 @@ Then rerun HCC subtype 1 (net1) on its real gene list, and after it every other 
   - the hub, any tie, and the number of targets
   - docking completeness
 - [ ] **Step 4:** Copy the run to `/mnt/c/experiments/adep_csb/disease_subtypes_v2/Liver_cancer/net1/` with `rsync -a`. Leave the old folders untouched.
-- [ ] **Step 5:** Hand off to `Gene_Disease_Association`, which is out of scope here. `docking_screen_analysis.ipynb` must read `07_docking/df_results_<label>_fixed.csv`, parse `label` (`<Protein>_<Pocket>`), and group by `ID`, not `Ligand`. `target_selection_analysis.py` is superseded by `polyphar select`.
+- [ ] **Step 5:** Hand off to `Gene_Disease_Association`, which is out of scope here. `docking_screen_analysis.ipynb` must read `07_docking/df_results_<label>.csv` (columns `Ligand, ID, Pocket, n, score_mean, score_sd, score_se, score_min, score_max` -- **not** the retired `_fixed` file, which the dock stage now sweeps into `obsolete/`), parse `label` (`<Protein>_<Pocket>`), and group by `ID`, not `Ligand`. `target_selection_analysis.py` is superseded by `polyphar select`.
 
 ### Task 16: Rerun net2, net3, AD Cluster1/3/4 (operational — after Task 15)
 

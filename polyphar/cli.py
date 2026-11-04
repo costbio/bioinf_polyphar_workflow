@@ -22,7 +22,7 @@ from pathlib import Path
 from polyphar import __version__
 from polyphar.common import RunLayout
 from polyphar.eta import (PARALLEL_EFFICIENCY, Calibration, Progress, estimate_stage,
-                          format_eta, polyphar_home, slots_for)
+                          format_eta, polyphar_home, stage_slots)
 from polyphar.notify import notify
 
 # subcommand -> (stage module, help text)
@@ -176,8 +176,13 @@ def gate(name, stage, layout, args, notifier, record=None, units=None) -> dict:
         units = stage.units(layout, args)
     calib = Calibration.load(polyphar_home())
     tool = stage.calibration_tool(args) if hasattr(stage, "calibration_tool") else None
+    # The stage's OWN slot count, not the engine-blind PARALLEL_EFFICIENCY table: the same
+    # number estimates the stage and scales the calibration write-back below, so a stage
+    # that does not parallelise over --nprocs (dock --engine unidock: one unit on the one
+    # GPU) neither reports an ETA divided by --nprocs nor stores an --nprocs-inflated rate.
+    slots = stage_slots(name, stage, args, tpj)
     est = estimate_stage(name, units, args.nprocs, calib, PARALLEL_EFFICIENCY,
-                         threads_per_job=tpj, tool=tool)
+                         threads_per_job=tpj, tool=tool, slots=slots)
     record.update(units=f"{units.count} ({units.cost_basis})", estimate_s=est.seconds)
     eta = format_eta(est, datetime.now())
     line = f"{name}: {units.count} units ({units.cost_basis}) - ETA {eta}"
@@ -187,7 +192,7 @@ def gate(name, stage, layout, args, notifier, record=None, units=None) -> dict:
     notifier(f"{name} starting", line)
     total_size = float(sum(units.sizes)) if units.sizes else None
     progress = Progress(name, units.count, est, notifier, total_size=total_size,
-                        calib=calib, slots=slots_for(name, args.nprocs, tpj) or 1.0,
+                        calib=calib, slots=slots or 1.0,
                         log_path=layout.logs / f"{name}.log", tool=tool)
     previous = _install_sigterm_handler()
     t0 = time.monotonic()

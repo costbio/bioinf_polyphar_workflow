@@ -1,4 +1,10 @@
-"""Stage 07: dock the ligand library (e-Drug3D) into every selected target with smina.
+"""Stage 07: dock the ligand library (e-Drug3D) into every selected target.
+
+The engine is selectable (`--engine`): **smina** on CPU, the single-host / development
+path, or **Uni-Dock >= 1.2.0** on a CUDA GPU through `unidock_tools`
+(polyphar/stages/dock_unidock.py). The engine name and its search settings are part of
+every unit key, so changing engine supersedes the recorded draws rather than mixing two
+populations under one target. Uni-Dock needs a GPU and says so before it does any work.
 
 Inputs: 06_targets/final_targets.csv (Protein, Pocket, Receptor_Path, Pocket_Path; paths
 relative to the run folder) and the library SDF (`--library`, default
@@ -64,6 +70,12 @@ target whose receptor preparation failed), aborted, or not executing at all
 07_docking/discarded/<timestamp>/<label>/r<i>.sdf, the policy orphan labels already follow;
 discarded.tsv names the archived file in its `archived` column.
 
+Per unit, beside the record, the host that DREW it writes r<i>.prov.json: engine build,
+unidock_tools version, CUDA runtime, GPU model, search settings, replicate and seed, the
+library / receptor / pocket sha256s, the host path, and the RESULT's sha256 -- which is
+what lets `dock-merge` refuse a record edited after the engine wrote it, and what lets it
+warn when one target's replicates span GPU models.
+
 Markers live in 07_docking/<label>/replicates/r<i>.done, beside the record they certify --
 inside the directory a copy, a tar or an `rm -rf` would treat as the unit, so the two
 cannot be separated. Results are 07_docking/<label>/replicates/r<i>.sdf with r<i>.log
@@ -73,13 +85,24 @@ log is named in failed.tsv. counts["failed"] is the number of failed units,
 counts["discarded"] the number of discarded draws; incomplete targets are counted in
 counts["incomplete_targets"].
 
-Outputs per target, label = f"{Protein}_{Pocket}": 07_docking/<label>/poses.sdf and
-07_docking/df_results_<label>_fixed.csv, both from REPLICATE 0 (Pose, SMINA_Score, Ligand,
-ID, Pocket). The summary over all replicates (n, mean, sd, se) is the next step of the
-rework and replaces these; the per-replicate SDFs are the raw record it will be built
-from. A target with a replicate not done, or with any ligand ID missing from replicate 0's
-poses, is incomplete: failed.tsv says why and NO df_results/poses.sdf is written for it.
-Outputs of labels no longer in final_targets.csv (df_results_<label>_fixed.csv, <label>/)
+Outputs per target, label = f"{Protein}_{Pocket}":
+
+* 07_docking/df_results_<label>.csv -- the SUMMARY over every replicate (SUMMARY_COLUMNS:
+  Ligand, ID, Pocket, n, score_mean, score_sd, score_se, score_min, score_max). One row per
+  ligand; the observation summarised is that ligand's BEST score in each replicate.
+* 07_docking/<label>/poses.sdf -- replicate 0's poses, under the default `--poses first`
+  (`all` adds poses_r<i>.sdf, `none` writes none). Replicate 0's poses are what the
+  pose-in-pocket validation reads.
+
+The raw per-replicate records (<label>/replicates/r<i>.sdf) are kept: they cost little,
+they let any other summary be recomputed without re-docking, and they are the only way to
+revisit the jitter question later.
+
+A target with a replicate not done, or with any ligand ID missing from ANY replicate, is
+incomplete: failed.tsv says why and no df_results/poses file is written for it -- a
+replicate that fails validation can never enter the summary.
+Outputs of labels no longer in final_targets.csv (df_results_<label>.csv, the retired
+df_results_<label>_fixed.csv under any label, <label>/)
 are moved, never deleted, to 07_docking/obsolete/<timestamp>/ and listed in the manifest
 (`obsoleted`); the manifest's `outputs` lists the current targets' files only.
 manifest.json is written last; a rerun on the same inputs changes nothing.
@@ -100,6 +123,7 @@ import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from polyphar.stages import dock_unidock as unidock
 from polyphar.stages import ligands
 from polyphar.stages.fix import H_SEED, reference_platform, seeded_placement, strip_date_remark
 
@@ -114,13 +138,53 @@ DEFAULT_UNIT_TIMEOUT = 43200   # seconds per engine call (12 h)
 AF_H_SEED = H_SEED   # seeds OpenMM's random hydrogen placement (deterministic output)
 AF_PH = 7.0   # AlphaFold receptors: pdbfixer addMissingHydrogens, as the fix stage
 TITLE_PREFIX = "EDRUG3D_"
-RESULT_COLUMNS = ["Pose", "SMINA_Score", "Ligand", "ID", "Pocket"]
+# Per-replicate raw poses. `RESULT_COLUMNS = ["Pose", "SMINA_Score", ...]` is RETIRED: the
+# engine-specific column name does not survive a selectable engine, and one score column
+# cannot express a distribution over replicates (see SUMMARY_COLUMNS).
+POSE_COLUMNS = ["Pose", "Score", "Ligand", "ID", "Pocket"]
+# df_results_<label>.csv: the summary over replicates. `n` is how many replicates
+# contributed, `score_sd` the SAMPLE standard deviation (ddof=1) of the per-replicate best
+# scores and `score_se` = score_sd / sqrt(n). Both are empty at n == 1, because a single
+# draw has no spread -- not 0, which would claim it had none.
+SUMMARY_COLUMNS = ["Ligand", "ID", "Pocket", "n", "score_mean", "score_sd", "score_se",
+                   "score_min", "score_max"]
 LIBRARY_COLUMNS = ["ID", "name", "cas", "status", "record_index"]
 END = "$$$$"
+
+# score field written by each engine (smina's own, and the one unidock_tools adds). Uni-Dock
+# results are keyed on <ID>, never on the title: RDKit may rewrite the title line.
+#
+# This is NOT a first-match preference list, and must not become one again. `unidock_tools`
+# clears only five of its own SD properties and passes every other INPUT field through, so a
+# library whose records already carry <minimizedAffinity> (any SDF that has been through
+# smina, `obabel --minimize`, or an earlier docking round) would hand every Uni-Dock record a
+# stale score next to the real <docking_score>. Taking the first present field replaced every
+# engine score with the library's, invisibly to the absurd-score filter. The score field is
+# therefore chosen by ENGINE (SCORE_FIELD_OF), a record carrying both is refused rather than
+# guessed, and `dock_unidock.split_library` refuses such a library before any GPU time.
+SCORE_FIELDS = ("minimizedAffinity", "docking_score")
+SCORE_FIELD_OF = {"smina": "minimizedAffinity", "unidock": "docking_score"}
+
+ENGINE_SMINA = "smina"
+ENGINE_UNIDOCK = "unidock"
+ENGINES = (ENGINE_SMINA, ENGINE_UNIDOCK)
+DEFAULT_ENGINE = ENGINE_SMINA   # the single-host / development path
+
+POSES_NONE, POSES_FIRST, POSES_ALL = "none", "first", "all"
+POSE_POLICIES = (POSES_NONE, POSES_FIRST, POSES_ALL)
+# Replicate 0's poses feed the pose-in-pocket validation -- whether the best-scoring pose
+# actually sits in the selected cavity, the assumption the pocket-similarity premise rests
+# on. Three replicates x 482 targets x 1,960 ligands of poses is far more than useful, so
+# only r0's are kept by default.
+DEFAULT_POSES = POSES_FIRST
 
 
 def smina_bin() -> str:
     return os.environ.get("SMINA_BIN") or "smina"
+
+
+def _engine_bin(args) -> str:
+    return (unidock.tools_bin() if engine_name(args) == ENGINE_UNIDOCK else smina_bin())
 
 
 # --- SDF text handling ---------------------------------------------------------------
@@ -279,6 +343,14 @@ class SminaError(RuntimeError):
     pass
 
 
+def _engine_reason(reason: str) -> str:
+    """A failure message without the engine's exception class in front of it: failed.tsv
+    reads the same whichever engine produced the failure."""
+    for prefix in ("SminaError: ", "UniDockError: "):
+        reason = reason.removeprefix(prefix)
+    return reason
+
+
 def smina_version() -> str:
     """First line of `smina --version`, or "unavailable"."""
     try:
@@ -336,20 +408,57 @@ def run_smina(receptor, ligands, center, size, out_sdf, log, seed: int, cpu: int
         tmp_log.unlink(missing_ok=True)
 
 
-def parse_poses(out_sdf, library, label: str, max_poses: int = NUM_MODES):
-    """DataFrame[Pose, SMINA_Score, Ligand, ID, Pocket] from a smina output SDF whose
-    titles are EDRUG3D_<ID>: Pose counts 1.. within each ligand's consecutive records,
-    SMINA_Score is minimizedAffinity, Ligand the library name. Each ligand's poses must
-    be one contiguous run of at most max_poses records; otherwise ValueError."""
+def _pose_id(rec: Record, names: dict, out_sdf) -> str:
+    """The library ID of one pose record.
+
+    The `<ID>` SD field comes FIRST: `unidock_tools` runs the ligand through RDKit and MAY
+    rewrite the title line, so the EDRUG3D_<ID> title that identifies a smina pose cannot be
+    relied on. The input SD fields are preserved. The title is the fallback, for engines
+    (smina) that pass the record through verbatim and write no `<ID>`."""
+    lid = rec.fields.get("ID")
+    if lid and str(lid) in names:
+        return str(lid)
+    title = rec.lines[0].strip()
+    if title.startswith(TITLE_PREFIX) and title[len(TITLE_PREFIX):] in names:
+        return title[len(TITLE_PREFIX):]
+    raise ValueError(f"{out_sdf}: pose {title!r} has no <ID> field and no library-ID title")
+
+
+def _pose_score(rec: Record, out_sdf, what: str, score_field: str | None = None) -> float:
+    """The pose's score. `score_field` pins it to the engine that wrote the file; without
+    one, exactly one of SCORE_FIELDS must be present -- a record carrying both is ambiguous
+    and is refused, never silently resolved in favour of either."""
+    if score_field is not None:
+        if score_field not in rec.fields:
+            raise ValueError(f"{out_sdf}: {what} has no <{score_field}> field")
+        return float(rec.fields[score_field])
+    present = [f for f in SCORE_FIELDS if f in rec.fields]
+    if len(present) == 1:
+        return float(rec.fields[present[0]])
+    if not present:
+        raise ValueError(f"{out_sdf}: {what} has none of the score fields "
+                         f"{', '.join(SCORE_FIELDS)}")
+    raise ValueError(f"{out_sdf}: {what} carries more than one score field "
+                     f"({', '.join(present)}); which one the engine wrote cannot be told "
+                     f"apart from a stale value the input library carried in")
+
+
+def parse_poses(out_sdf, library, label: str, max_poses: int = NUM_MODES,
+                score_field: str | None = None):
+    """DataFrame[Pose, Score, Ligand, ID, Pocket] from an engine's output SDF.
+
+    Engine-independent: a ligand is identified by its `<ID>` field (Uni-Dock) or, failing
+    that, by an EDRUG3D_<ID> title (smina), and the score is `minimizedAffinity` (smina) or
+    `docking_score` (unidock_tools) -- NOT the engine's own `ENERGY=` remark, which
+    `unidock_tools` does not write. Pose counts 1.. within each ligand's consecutive
+    records; each ligand's poses must be one contiguous run of at most max_poses records,
+    otherwise ValueError."""
     import pandas as pd
 
     names = dict(zip(library["ID"].astype(str), library["name"]))
     rows, prev, pose, seen = [], None, 0, set()
     for rec in _records(_read_text(out_sdf)):
-        title = rec.lines[0].strip()
-        if not title.startswith(TITLE_PREFIX) or title[len(TITLE_PREFIX):] not in names:
-            raise ValueError(f"{out_sdf}: pose title {title!r} is not a library ID")
-        lid = title[len(TITLE_PREFIX):]
+        lid = _pose_id(rec, names, out_sdf)
         if lid != prev and lid in seen:
             raise ValueError(f"{out_sdf}: the poses of ligand ID {lid} are not contiguous")
         seen.add(lid)
@@ -357,10 +466,47 @@ def parse_poses(out_sdf, library, label: str, max_poses: int = NUM_MODES):
         prev = lid
         if pose > max_poses:
             raise ValueError(f"{out_sdf}: ligand ID {lid} has more than {max_poses} poses")
-        if "minimizedAffinity" not in rec.fields:
-            raise ValueError(f"{out_sdf}: pose {pose} of {title} has no minimizedAffinity")
-        rows.append([pose, float(rec.fields["minimizedAffinity"]), names[lid], lid, label])
-    return pd.DataFrame(rows, columns=RESULT_COLUMNS)
+        rows.append([pose, _pose_score(rec, out_sdf, f"pose {pose} of ligand ID {lid}",
+                                       score_field),
+                     names[lid], lid, label])
+    return pd.DataFrame(rows, columns=POSE_COLUMNS)
+
+
+def summarize(frames: dict, library, label: str):
+    """DataFrame[SUMMARY_COLUMNS] over the replicates in `frames` ({replicate: poses}).
+
+    One observation per (ligand, replicate): that replicate's BEST (lowest) score for the
+    ligand. The summary is over those draws, so `n` is the number of replicates that
+    contributed, never the number of poses.
+
+    `score_sd` is the sample standard deviation (ddof=1) and `score_se` = sd / sqrt(n). A
+    previous attempt used mean|delta| / sqrt(N), which is NOT a standard error: for a normal,
+    E|X - Y| = 1.128 sigma, so that figure is biased by ~13 % and is not the sd of anything.
+    The raw per-replicate draws stay on disk precisely so any other summary can be
+    recomputed without re-running the engine."""
+    import math
+
+    import pandas as pd
+
+    names = dict(zip(library["ID"].astype(str), library["name"]))
+    best: dict[str, list[float]] = {}
+    for _i, df in sorted(frames.items()):
+        for lid, score in df.groupby("ID")["Score"].min().items():
+            best.setdefault(str(lid), []).append(float(score))
+    rows = []
+    for lid in library["ID"].astype(str):
+        draws = best.get(lid, [])
+        if not draws:
+            continue
+        n = len(draws)
+        mean = sum(draws) / n
+        if n > 1:
+            sd = math.sqrt(sum((x - mean) ** 2 for x in draws) / (n - 1))
+            se = sd / math.sqrt(n)
+        else:
+            sd = se = float("nan")
+        rows.append([names[lid], lid, label, n, mean, sd, se, min(draws), max(draws)])
+    return pd.DataFrame(rows, columns=SUMMARY_COLUMNS)
 
 
 # --- stage -------------------------------------------------------------------------
@@ -401,6 +547,69 @@ def add_arguments(parser) -> None:
     parser.add_argument("--unit-timeout", type=_positive_int, default=DEFAULT_UNIT_TIMEOUT,
                         help=f"seconds before one unit's engine call is killed and the unit "
                              f"failed (default {DEFAULT_UNIT_TIMEOUT})")
+    parser.add_argument("--engine", choices=ENGINES, default=DEFAULT_ENGINE,
+                        help=f"docking engine (default {DEFAULT_ENGINE}); 'unidock' is "
+                             f"Uni-Dock >= 1.2.0 on a CUDA GPU through unidock_tools, "
+                             f"'smina' the CPU single-host path. The engine is part of "
+                             f"every unit key, so changing it supersedes recorded draws")
+    parser.add_argument("--search-mode", default=unidock.DEFAULT_SEARCH_MODE,
+                        choices=unidock.SEARCH_MODES,
+                        help=f"Uni-Dock search mode (default "
+                             f"{unidock.DEFAULT_SEARCH_MODE} = exhaustiveness 384); "
+                             f"ignored by --engine smina")
+    parser.add_argument("--batch-size", type=_positive_int,
+                        default=unidock.DEFAULT_BATCH_SIZE,
+                        help=f"Uni-Dock ligands per GPU batch (default "
+                             f"{unidock.DEFAULT_BATCH_SIZE}); ignored by --engine smina")
+    parser.add_argument("--poses", choices=POSE_POLICIES, default=DEFAULT_POSES,
+                        help=f"which replicates' poses to write out (default "
+                             f"{DEFAULT_POSES}: replicate 0 only, which is what the "
+                             f"pose-in-pocket validation needs)")
+
+
+def engine_name(args) -> str:
+    """Which engine this invocation uses ('smina' / 'unidock')."""
+    return str(getattr(args, "engine", None) or DEFAULT_ENGINE)
+
+
+def engine_settings(args) -> dict:
+    """The engine's own search settings -- part of what a draw IS, so part of the unit key.
+
+    smina's exhaustiveness/num_modes are a CPU figure and are deliberately NOT mirrored
+    onto Uni-Dock, whose `--search_mode balance` is exhaustiveness 384."""
+    if engine_name(args) == ENGINE_UNIDOCK:
+        return {"search_mode": str(getattr(args, "search_mode", None)
+                                   or unidock.DEFAULT_SEARCH_MODE),
+                "batch_size": int(getattr(args, "batch_size", None)
+                                  or unidock.DEFAULT_BATCH_SIZE)}
+    return {"exhaustiveness": EXHAUSTIVENESS, "num_modes": NUM_MODES}
+
+
+def calibration_tool(args) -> str:
+    """Which calibration entry this invocation's ETA may use.
+
+    'smina' for the CPU path; 'unidock:<device class>' for Uni-Dock, because the rate is
+    per device -- an L4 figure is not an A100's. The existing single seconds-per-ligand
+    smina calibration is therefore never borrowed by a GPU run (and the Uni-Dock rate never
+    by a CPU one): a mismatch prints "uncalibrated for ..." instead of a wrong ETA."""
+    if engine_name(args) != ENGINE_UNIDOCK:
+        return ENGINE_SMINA
+    from polyphar.benchmark import unidock_rate, unidock_tool_prefix
+
+    return unidock_tool_prefix() + unidock_rate(unidock.gpu_model())[1]
+
+
+def require_engine_host(args) -> None:
+    """Refuse to start when this host cannot run the chosen engine.
+
+    `--engine unidock` on a host with no GPU fails HERE, with the guidance for the split
+    export/worker/merge path, rather than after the stage has planned, prepared receptors
+    and launched a call that crashes. POSEIDON -- where the run folders are -- is exactly
+    such a host, so this is the common case."""
+    if engine_name(args) != ENGINE_UNIDOCK:
+        return
+    unidock.require_gpu()
+    unidock.check_version()
 
 
 @dataclass
@@ -680,6 +889,9 @@ def _archive_record(layout, u: Unit) -> str:
     os.replace(sdf, dest / f"{u.name}.sdf")
     if log.is_file():
         os.replace(log, dest / f"{u.name}.log")
+    prov = prov_path(layout, u)
+    if prov.is_file():   # the provenance travels with the draw it describes
+        os.replace(prov, dest / (u.name + PROV_SUFFIX))
     return (dest / f"{u.name}.sdf").relative_to(Path(layout.docking)).as_posix()
 
 
@@ -697,8 +909,13 @@ def discard(layout, u: Unit, reason: str, archived: str | None = None) -> None:
     log_discard(layout.docking, u, reason, where)
 
 
-def _df_path(layout, t: Target) -> Path:
-    return layout.docking / f"df_results_{t.label}_fixed.csv"
+def _df_path(layout, t) -> Path:
+    """The summary over replicates. The name drops the legacy `_fixed` suffix: the file is
+    no longer replicate 0's poses but a distribution (SUMMARY_COLUMNS), and a downstream
+    reader must not pick it up as if it were the old one. Old `_fixed` files are swept into
+    obsolete/ by the orphan sweep (_DF_RE matches both spellings)."""
+    label = t if isinstance(t, str) else t.label
+    return layout.docking / f"df_results_{label}.csv"
 
 
 def _openbabel_version() -> str:
@@ -754,11 +971,15 @@ def _unit_key(src_key: str, pocket_sha: str, library_sha: str, replicate: int, s
 
 
 def _options(args, engine: str) -> dict:
-    """What every unit of this run shares. `base_seed`, not `seed`: the seed is per unit."""
+    """What every unit of this run shares. `base_seed`, not `seed`: the seed is per unit.
+
+    `engine_name` and the engine's own search settings are in here, so they are in every
+    unit key: changing the engine, or its search mode, makes the recorded draws draws of
+    something else, and they are correctly superseded rather than mixed in."""
     return {"base_seed": int(getattr(args, "seed", DEFAULT_SEED)),
             "replicates": int(getattr(args, "replicates", DEFAULT_REPLICATES)),
-            "exhaustiveness": EXHAUSTIVENESS, "num_modes": NUM_MODES,
-            "ligand_addH": LIGAND_ADDH, "engine": engine}
+            "ligand_addH": LIGAND_ADDH, "engine": engine,
+            "engine_name": engine_name(args), **engine_settings(args)}
 
 
 @dataclass
@@ -828,11 +1049,10 @@ def _prepare_receptor(layout, t: Target) -> Path:
 
 # --- workers (spawn processes) -------------------------------------------------------
 
-def _dock_unit(receptor, ligands, center, size, sdf, log, done, seed, cpu, key,
-               timeout, docking_dir=None, unit=None, discard_reason=None) -> int:
-    """Run one unit and, only once its result file is in place, write the marker. The
-    marker is the claim "this draw was made and recorded", so it must never precede the
-    record.
+def _dock_unit(job: dict) -> int:
+    """Run one unit and, only once its result file AND its provenance are in place, write
+    the marker. The marker is the claim "this draw was made and recorded", so it must never
+    precede the record.
 
     When a record of a superseded or uncertified draw is standing in this unit's place, it
     is archived and logged HERE -- at the last moment before the engine call that replaces
@@ -841,11 +1061,105 @@ def _dock_unit(receptor, ligands, center, size, sdf, log, done, seed, cpu, key,
     taken before the engine runs rather than after, because `run_smina` renames its output
     over the record; a failed engine call therefore leaves the old draw in
     07_docking/discarded/ rather than destroyed."""
-    if discard_reason is not None and unit is not None:
-        discard(_ArchiveLayout(docking_dir), unit, discard_reason)
-    run_smina(receptor, ligands, center, size, sdf, log, seed=seed, cpu=cpu, timeout=timeout)
-    _atomic_text(Path(done), key + "\n")
+    unit, docking_dir = job["unit"], job["docking_dir"]
+    if job.get("discard_reason") is not None:
+        discard(_ArchiveLayout(docking_dir), unit, job["discard_reason"])
+    sdf, log = Path(job["sdf"]), Path(job["log"])
+    if job["engine_name"] == ENGINE_UNIDOCK:
+        unidock.run_unidock(job["receptor"], job["ligands"], job["center"], job["size"],
+                            sdf, log, seed=unit.seed,
+                            search_mode=job["settings"]["search_mode"],
+                            batch_size=job["settings"]["batch_size"],
+                            timeout=job["timeout"])
+    else:
+        run_smina(job["receptor"], job["ligands"], job["center"], job["size"], sdf, log,
+                  seed=unit.seed, cpu=job["cpu"], timeout=job["timeout"])
+    _write_provenance(Path(job["prov"]), job, sdf)
+    _atomic_text(Path(job["done"]), unit.key + "\n")
     return 0
+
+
+# --- per-unit provenance ------------------------------------------------------------------
+#
+# Written beside the record, by whoever actually ran the engine, and carried with it into
+# the run folder by `import_bundle`. It is the only place that can know the GPU model, the
+# CUDA runtime and the engine build: the planning host (`dock-export`) and the merging host
+# (`dock-merge`) need have none of them. It also closes L3 -- without `result_sha256` a
+# result SDF edited to different scores but still `$$$$`-terminated was copied in unchecked.
+
+PROV_SUFFIX = ".prov.json"
+
+
+def prov_path(layout, u: Unit) -> Path:
+    sdf = unit_paths(layout, u)[0]
+    return sdf.with_name(u.name + PROV_SUFFIX)
+
+
+def read_provenance(layout, u: Unit) -> dict:
+    import json
+
+    try:
+        info = json.loads(prov_path(layout, u).read_text())
+    except (OSError, ValueError):
+        return {}
+    return info if isinstance(info, dict) else {}
+
+
+def _write_provenance(path: Path, job: dict, sdf: Path) -> None:
+    """Everything the Methods need per unit, recorded where the draw was made."""
+    import platform
+
+    from polyphar.common import sha256_file
+
+    unit = job["unit"]
+    name = job["engine_name"]
+    info = {"label": unit.label, "replicate": unit.replicate, "seed": unit.seed,
+            "unit_key": unit.key, "engine_name": name,
+            "engine_version": job.get("engine_version") or "unknown",
+            "settings": job.get("settings") or {},
+            "library_sha256": job.get("library_sha256") or "",
+            "receptor_sha256": job.get("receptor_sha256") or "",
+            "pocket_sha256": job.get("pocket_sha256") or "",
+            "result_sha256": sha256_file(sdf),
+            "host": job.get("host") or host_path(),
+            "hostname": platform.node()}
+    if name == ENGINE_UNIDOCK:
+        info.update({"gpu_model": unidock.gpu_model() or "unknown",
+                     "cuda_driver_max": unidock.cuda_driver_max(),
+                     "unidock_tools": unidock.tools_version()})
+    else:
+        info.update({"gpu_model": "", "cuda_driver_max": "", "unidock_tools": ""})
+    _atomic_text(path, _json_indent(info))
+
+
+def host_path() -> str:
+    """Where the draw was made: Colab / TRUBA / a container image digest, as the host
+    declares it in $POLYPHAR_HOST_PATH, else the container digest or the hostname."""
+    import platform
+
+    return (os.environ.get("POLYPHAR_HOST_PATH")
+            or os.environ.get("POLYPHAR_IMAGE_DIGEST") or platform.node() or "unknown")
+
+
+def verify_result_digest(layout, u: Unit) -> str | None:
+    """None when the record matches the digest its provenance recorded, else why not.
+
+    No provenance (a draw made before this existed) is not a mismatch: it is only an
+    absence of evidence, and refusing those would discard every legacy record."""
+    from polyphar.common import sha256_file
+
+    info = read_provenance(layout, u)
+    want = info.get("result_sha256")
+    if not want:
+        return None
+    sdf = unit_paths(layout, u)[0]
+    if not sdf.is_file():
+        return "the result file is missing"
+    got = sha256_file(sdf)
+    if got != want:
+        return (f"the result file does not match the sha256 its provenance recorded "
+                f"({got[:12]} vs {want[:12]}): it was changed after the engine wrote it")
+    return None
 
 
 class _ArchiveLayout:
@@ -857,10 +1171,69 @@ class _ArchiveLayout:
         self.run_dir = self.docking
 
 
-def _unit_worker(*args) -> int:
+def _unit_worker(job) -> int:
     from polyphar.pool import task
 
-    return task(lambda: _dock_unit(*args))
+    return task(lambda: _dock_unit(job))
+
+
+def _slots(args, tpj: int) -> int:
+    """How many units run at once. ONE for Uni-Dock: it batches the whole library onto the
+    GPU and already saturates it, so a second concurrent unit contends for the same device
+    rather than adding throughput (and the authors' own guidance is one invocation per
+    device with as many ligands as possible)."""
+    if engine_name(args) == ENGINE_UNIDOCK:
+        return 1
+    return max(1, int(getattr(args, "nprocs", 1)) // max(1, tpj))
+
+
+def slots(args, threads_per_job: int = 1) -> int:
+    """The stage's parallel slots, for `cli.gate` (eta.stage_slots) as well as execution.
+
+    THE SAME number that `_run_pool` runs at: it scales the ETA and the seconds-per-unit
+    written back to calibration.json. Deriving it from nprocs alone (the engine-blind
+    eta.PARALLEL_EFFICIENCY table) made `--engine unidock --nprocs 32` quote an ETA 32x too
+    short and then store a 32x-inflated rate under the device's calibration key."""
+    return _slots(args, int(threads_per_job or 1))
+
+
+def _unit_dirs(layout, u: Unit) -> None:
+    for p in unit_paths(layout, u):
+        p.parent.mkdir(parents=True, exist_ok=True)
+
+
+def _engine_input(layout, args, plan, titled_sdf: Path) -> Path:
+    """What the engine is handed: the one titled SDF for smina, the split library's index
+    file for Uni-Dock (`unidock_tools` writes one output per INPUT FILE, so it cannot take
+    a single multi-record library)."""
+    if engine_name(args) != ENGINE_UNIDOCK:
+        return titled_sdf
+    return unidock.split_library(titled_sdf, Path(titled_sdf).parent / "split",
+                                 plan.library_sha)
+
+
+def _unit_job(u: Unit, args, engine: str, receptor, engine_input, center, size, docking_dir,
+              timeout, cpu: int, discard_reason, library_sha: str, pocket_sha: str) -> dict:
+    """Everything one unit's engine call needs, in one picklable dict.
+
+    One dict rather than a dozen positional arguments: the provenance the worker has to
+    record (engine build, GPU model, settings, input digests) grew the payload past what a
+    positional signature can carry readably, and every field here ends up in the unit's
+    provenance file."""
+    from polyphar.common import sha256_file
+
+    return {"unit": u, "engine_name": engine_name(args), "engine_version": engine,
+            "settings": engine_settings(args), "receptor": str(receptor),
+            "receptor_sha256": sha256_file(receptor), "ligands": str(engine_input),
+            "library_sha256": library_sha, "pocket_sha256": pocket_sha,
+            "center": center, "size": size, "cpu": int(cpu), "timeout": timeout,
+            "docking_dir": str(docking_dir), "discard_reason": discard_reason,
+            "host": host_path(),
+            "sdf": str(Path(docking_dir) / u.label / "replicates" / f"{u.name}.sdf"),
+            "log": str(Path(docking_dir) / u.label / "replicates" / f"{u.name}.log"),
+            "prov": str(Path(docking_dir) / u.label / "replicates"
+                        / (u.name + PROV_SUFFIX)),
+            "done": str(Path(docking_dir) / u.label / "replicates" / f"{u.name}.done")}
 
 
 # --- merge -----------------------------------------------------------------------------
@@ -874,8 +1247,11 @@ def _check_replicate(layout, t: Target, u: Unit, library):
     this check existed, entered the mean over replicates as a complete draw. Completeness
     is per replicate, not a property of r0."""
     sdf, log = unit_paths(layout, u)[:2]
+    # The unit's provenance records which engine drew it, so the score field is chosen by
+    # the engine rather than by which field happens to appear first in the record.
+    score_field = SCORE_FIELD_OF.get(read_provenance(layout, u).get("engine_name"))
     try:
-        df = parse_poses(sdf, library, t.label)
+        df = parse_poses(sdf, library, t.label, score_field=score_field)
     except ValueError as exc:
         return None, (f"{u.name}: unusable result: {exc}; "
                       f"log: {_rel(log, layout.run_dir)}")
@@ -886,51 +1262,74 @@ def _check_replicate(layout, t: Target, u: Unit, library):
     return df, None
 
 
-def _merge(layout, t: Target, units: list[Unit], library) -> list[str]:
-    """Build the target's poses.sdf and df_results from REPLICATE 0 (the summary over all
-    replicates is the next step of the rework). Returns the reasons the target is
-    incomplete ([] when it is complete); an incomplete target gets neither file, and stale
-    ones are removed.
-
-    EVERY replicate must be done AND complete: only r0's poses are written out, but a
-    target whose r1 holds 6 of 2,083 ligands is not finished, however good r0 looks (the
-    summary over replicates would average a 0.3%-complete draw in silently)."""
+def _pose_files(layout, t) -> list[Path]:
+    """Every poses file a target could have, under any --poses policy (so a policy change
+    can clear the ones it no longer wants)."""
     d = _target_dir(layout, t)
-    poses, df_path = d / "poses.sdf", _df_path(layout, t)
+    return sorted(set([d / "poses.sdf", *d.glob("poses_r*.sdf")]))
+
+
+def _clear_outputs(layout, t) -> None:
+    for p in [*_pose_files(layout, t), _df_path(layout, t)]:
+        p.unlink(missing_ok=True)
+
+
+def _write_poses(layout, t, units: list[Unit], policy: str) -> None:
+    """Copy out the replicates' pose records according to --poses.
+
+    `first` (the default) writes replicate 0's poses to <label>/poses.sdf, which is what
+    the pose-in-pocket validation reads. `all` adds <label>/poses_r<i>.sdf for the others;
+    `none` writes nothing. Files a previous policy left are removed first, so lowering the
+    policy does not leave a stale r1 behind looking current."""
+    for p in _pose_files(layout, t):
+        p.unlink(missing_ok=True)
+    if policy == POSES_NONE:
+        return
+    d = _target_dir(layout, t)
+    for u in sorted(units, key=lambda u: u.replicate):
+        if u.replicate == 0:
+            dest = d / "poses.sdf"
+        elif policy == POSES_ALL:
+            dest = d / f"poses_{u.name}.sdf"
+        else:
+            continue
+        _atomic_text(dest, _read_text(unit_paths(layout, u)[0]))
+
+
+def _merge(layout, t: Target, units: list[Unit], library, policy: str = DEFAULT_POSES
+           ) -> list[str]:
+    """Build the target's poses file(s) and its summary over EVERY replicate. Returns the
+    reasons the target is incomplete ([] when it is complete); an incomplete target gets no
+    files at all, and stale ones are removed.
+
+    Every replicate must be done AND complete, and every replicate's scores enter the
+    summary. A target whose r1 holds 6 of 2,083 ligands is not finished however good r0
+    looks: averaging a 0.3 %-complete draw in silently is the failure this guards. A
+    replicate that fails `_check_replicate` can therefore never reach `summarize`."""
     ordered = sorted(units, key=lambda u: u.replicate)
     undrawn = [u.name for u in ordered if unit_state(layout, u) != STATE_DONE]
-    first = [u for u in units if u.replicate == 0]
-    r0 = unit_paths(layout, first[0])[0] if first else None
-    if undrawn or r0 is None or not result_intact(r0):
-        poses.unlink(missing_ok=True)
-        df_path.unlink(missing_ok=True)
-        return [f"replicate(s) not recorded: {', '.join(undrawn)}"] if undrawn else \
-               ["replicate r0 has no usable result"]
-    reasons, df = [], None
+    if undrawn:
+        _clear_outputs(layout, t)
+        return [f"replicate(s) not recorded: {', '.join(undrawn)}"]
+    if not any(u.replicate == 0 for u in units):
+        _clear_outputs(layout, t)
+        return ["replicate r0 has no usable result"]
+    reasons, frames = [], {}
     for u in ordered:
         frame, why = _check_replicate(layout, t, u, library)
         if why:
             reasons.append(why)
-        elif u.replicate == 0:
-            df = frame
-    if reasons or df is None:
-        poses.unlink(missing_ok=True)
-        df_path.unlink(missing_ok=True)
+        else:
+            frames[u.replicate] = frame
+    if reasons or 0 not in frames:
+        _clear_outputs(layout, t)
         return reasons or ["replicate r0 has no usable result"]
-    text = _read_text(r0)
-    fd, tmp = tempfile.mkstemp(dir=d, prefix=".poses.sdf.", suffix=".tmp")
-    os.close(fd)
-    tmp = Path(tmp)
-    try:
-        tmp.write_text(text, encoding="utf-8", errors="surrogateescape")
-        os.chmod(tmp, 0o644)
-        os.replace(tmp, poses)
-    finally:
-        tmp.unlink(missing_ok=True)
+    _write_poses(layout, t, ordered, policy)
+    df_path = _df_path(layout, t)
     fd, tmpc = tempfile.mkstemp(dir=layout.docking, prefix=f".{df_path.name}.", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="") as fh:
-            df.to_csv(fh, index=False)
+            summarize(frames, library, t.label).to_csv(fh, index=False)
         os.chmod(tmpc, 0o644)
         os.replace(tmpc, df_path)
     except BaseException:
@@ -941,7 +1340,8 @@ def _merge(layout, t: Target, units: list[Unit], library) -> list[str]:
 
 # --- fingerprint / skip --------------------------------------------------------------
 
-def _stage_fingerprint(layout, plan: _Plan, lib_md5: str, opts: dict) -> str | None:
+def _stage_fingerprint(layout, plan: _Plan, lib_md5: str, opts: dict,
+                       policy: str = DEFAULT_POSES) -> str | None:
     """What the finished outputs depend on (not nprocs or threads): the final_targets.csv,
     each target's receptor, pocket and receptor PDBQT sha256, the library md5, the base
     seed, the replicate count, exhaustiveness, num_modes, ligand addH and the engine
@@ -962,16 +1362,19 @@ def _stage_fingerprint(layout, plan: _Plan, lib_md5: str, opts: dict) -> str | N
                          sha256_file(pdbqt)])
         else:
             rows.append([t.label, None, None, None, None])
+    # --poses is in here and NOT in the unit key: which replicates' poses are written out
+    # is not part of what a draw is (changing it must not supersede a recorded draw), but
+    # it does change the stage's outputs, so a changed policy has to re-merge.
     return _sha_text(_json({"final_targets_sha256": sha256_file(layout.final_targets_csv),
-                                 "targets": rows, "library_md5": lib_md5, **opts}))
+                            "targets": rows, "library_md5": lib_md5, "poses": policy,
+                            **opts}))
 
 
 def _outputs(layout, plan: _Plan) -> dict:
     """Sizes of the current targets' result files (never of an orphan label's)."""
     d = layout.docking
     files = [p for t in plan.targets
-             for p in (_df_path(layout, t), _target_dir(layout, t) / "poses.sdf")
-             if p.is_file()]
+             for p in (_df_path(layout, t), *_pose_files(layout, t)) if p.is_file()]
     return {p.relative_to(d).as_posix(): p.stat().st_size for p in sorted(files)}
 
 
@@ -987,7 +1390,10 @@ def _outputs(layout, plan: _Plan) -> dict:
 # into obsolete/ behind the user's back (and `dock-merge --bundle` would then fail to find
 # its own bundle). Pinned by test_orphans_never_sweep_the_export_or_discard_directories.
 RESERVED_DIRS = (LIB_DIRNAME, "obsolete", ligands.DIRNAME, EXPORT_DIRNAME, DISCARD_DIRNAME)
-_DF_RE = re.compile(r"^df_results_(.+)_fixed\.csv$")
+# Both spellings: `df_results_<label>.csv` is the current summary, `_fixed` the retired
+# replicate-0 table. A leftover `_fixed` file is an orphan under every label, so the sweep
+# moves it to obsolete/ instead of leaving a stale file with the old schema beside the new.
+_DF_RE = re.compile(r"^df_results_(.+?)(_fixed)?\.csv$")
 
 
 def _orphans(layout, plan: _Plan) -> list[Path]:
@@ -999,15 +1405,28 @@ def _orphans(layout, plan: _Plan) -> list[Path]:
     can never be swept: they are inside the label's directory, and the shape of what a
     label contains plays no part in the decision. Adding or removing replicates therefore
     does not turn anything into an orphan. Pinned by
-    test_orphans_never_sweep_replicate_results."""
+    test_orphans_never_sweep_replicate_results.
+
+    An EMPTY target list sweeps NOTHING. With no labels every df_results_*.csv and every
+    <label>/ matches, so a header-only final_targets.csv -- a `select` run that selected
+    nothing -- would relocate the entire docking output to obsolete/<ts>/ in one `polyphar
+    dock`. It is recoverable and counted, but it is a loud event that arrived silently.
+    Nothing to dock is not evidence that everything already docked is obsolete."""
     d = layout.docking
     if not d.is_dir():
         return []
     labels = {t.label for t in plan.targets}
+    if not labels:
+        if any(_DF_RE.match(p.name) or (p.is_dir() and p.name not in RESERVED_DIRS)
+               for p in d.iterdir()):
+            print(f"dock: {layout.final_targets_csv} lists no targets, so the orphan sweep "
+                  f"is SKIPPED: with no labels every result would count as an orphan. "
+                  f"Fix the target list, or move the old results yourself", flush=True)
+        return []
     out = []
     for p in sorted(d.iterdir()):
         m = _DF_RE.match(p.name)
-        if p.is_file() and m and m.group(1) not in labels:
+        if p.is_file() and m and (m.group(2) or m.group(1) not in labels):
             out.append(p)
         elif p.is_dir() and p.name not in labels and p.name not in RESERVED_DIRS:
             out.append(p)
@@ -1035,14 +1454,15 @@ def _obsolete(layout, orphans: list[Path]) -> list[dict]:
     return moved
 
 
-def _finished(layout, plan: _Plan, lib_md5: str, opts: dict) -> dict | None:
+def _finished(layout, plan: _Plan, lib_md5: str, opts: dict,
+              policy: str = DEFAULT_POSES) -> dict | None:
     import json
 
     try:
         manifest = json.loads((layout.docking / "manifest.json").read_text())
     except (OSError, ValueError):
         return None
-    fp = _stage_fingerprint(layout, plan, lib_md5, opts)
+    fp = _stage_fingerprint(layout, plan, lib_md5, opts, policy)
     if (fp is None or manifest.get("fingerprint") != fp
             or manifest.get("outputs") != _outputs(layout, plan) or _orphans(layout, plan)):
         return None
@@ -1061,7 +1481,8 @@ def engine_version(layout, args) -> str:
     pinned = getattr(args, "engine_version", None)
     if pinned:
         return str(pinned)
-    local = smina_version()
+    local = (unidock.unidock_version() if engine_name(args) == ENGINE_UNIDOCK
+             else smina_version())
     if local != "unavailable":
         return local
     return _recorded_engine(layout) or local
@@ -1087,7 +1508,8 @@ def units(layout, args):
     lib = _library_path(layout, args, copy=False)
     engine = engine_version(layout, args)
     plan = _plan(layout, args, lib, engine)
-    if _finished(layout, plan, _md5(lib), plan.opts) is not None:
+    policy = str(getattr(args, "poses", None) or DEFAULT_POSES)
+    if _finished(layout, plan, _md5(lib), plan.opts, policy) is not None:
         return WorkUnits(0, "ligand")
     return WorkUnits(plan.n_ligands * len(plan.outstanding(layout)), "ligand")
 
@@ -1171,13 +1593,18 @@ def run(layout, args, progress, execute: bool = True, discard_baseline: int | No
     from polyphar.pool import run_pool as _run_pool
 
     lib = _library_path(layout, args, progress=progress)
+    if execute:
+        # fail fast and with guidance, before any planning or receptor preparation: a
+        # GPU-less host cannot run `--engine unidock` at all.
+        require_engine_host(args)
     engine = engine_version(layout, args)
     if execute and engine == "unavailable":
-        raise FileNotFoundError(f"smina ({smina_bin()}) not runnable")
+        raise FileNotFoundError(f"{engine_name(args)} ({_engine_bin(args)}) not runnable")
     lib_md5 = _md5(lib)
     plan = _plan(layout, args, lib, engine)
     opts = plan.opts
-    done = _finished(layout, plan, lib_md5, opts)
+    policy = str(getattr(args, "poses", None) or DEFAULT_POSES)
+    done = _finished(layout, plan, lib_md5, opts, policy)
     if done is not None:   # finished on exactly these inputs: touch nothing
         done.update(extra_counts or {})   # ... but say what THIS invocation did
         return done
@@ -1196,22 +1623,22 @@ def run(layout, args, progress, execute: bool = True, discard_baseline: int | No
 
     tpj = int(getattr(args, "threads_per_job", DEFAULT_TPJ))
     timeout = int(getattr(args, "unit_timeout", None) or DEFAULT_UNIT_TIMEOUT)
-    slots = max(1, args.nprocs // tpj)
+    slots = _slots(args, tpj)
     n_outstanding = len(plan.outstanding(layout))
     # BEFORE anything that discards. `dock-merge` discards in import_bundle, before it
     # calls this, and passes its own earlier baseline.
     discarded = _count_discards(d) if discard_baseline is None else int(discard_baseline)
     todo = [(u, why) for u, why in plan_discards(layout, plan)
             if execute and u.label in prepared]
+    engine_input = _engine_input(layout, args, plan, ligands_sdf)
+    pocket_sha = {t.label: sha256_file(t.pocket) for t in plan.usable}
     tasks = []
     for u, why in todo:
         pdbqt, center, size = prepared[u.label]
-        sdf, log, marker = unit_paths(layout, u)
-        sdf.parent.mkdir(parents=True, exist_ok=True)
-        marker.parent.mkdir(parents=True, exist_ok=True)
-        tasks.append(((u.label, u.name), _unit_worker,
-                      (str(pdbqt), str(ligands_sdf), center, size, str(sdf), str(log),
-                       str(marker), u.seed, tpj, u.key, timeout, str(d), u, why)))
+        job = _unit_job(u, args, engine, pdbqt, engine_input, center, size, layout.docking,
+                        timeout, tpj, why, plan.library_sha, pocket_sha.get(u.label, ""))
+        _unit_dirs(layout, u)
+        tasks.append(((u.label, u.name), _unit_worker, (job,)))
     unit_by_item = {(u.label, u.name): u for u in plan.units}
 
     failed_units: set = set()
@@ -1220,7 +1647,7 @@ def run(layout, args, progress, execute: bool = True, discard_baseline: int | No
                             on_result=lambda item, _r: progress.advance(plan.n_ligands))
         for item, reason in outcome.failures:
             failed_units.add(item)
-            reason = reason.removeprefix("SminaError: ")
+            reason = _engine_reason(reason)
             log = _rel(unit_paths(layout, unit_by_item[item])[1], layout.run_dir)
             rows.append((f"{item[0]}/{item[1]}", f"{reason}; log: {log}"))
             progress.advance(plan.n_ligands)
@@ -1229,10 +1656,9 @@ def run(layout, args, progress, execute: bool = True, discard_baseline: int | No
         for t in plan.usable:
             if t.label not in prepared:
                 incomplete += 1
-                _df_path(layout, t).unlink(missing_ok=True)
-                (_target_dir(layout, t) / "poses.sdf").unlink(missing_ok=True)
+                _clear_outputs(layout, t)
                 continue
-            reasons = _merge(layout, t, plan.units_of(t.label), library)
+            reasons = _merge(layout, t, plan.units_of(t.label), library, policy)
             if reasons:
                 incomplete += 1
                 rows.extend((t.label, r) for r in reasons)
@@ -1260,14 +1686,16 @@ def run(layout, args, progress, execute: bool = True, discard_baseline: int | No
                            "pdbqt_sha256": sha256_file(prepared[t.label][0])}
                  for t in plan.usable if t.label in prepared}
     _warn_receptor_drift(progress, previous, receptors)
-    fingerprint = _stage_fingerprint(layout, plan, lib_md5, opts)
+    fingerprint = _stage_fingerprint(layout, plan, lib_md5, opts, policy)
     write_manifest(d, STAGE,
                    args={"nprocs": args.nprocs, "seed": opts["base_seed"],
                          "replicates": opts["replicates"],
-                         "threads_per_job": tpj, "exhaustiveness": EXHAUSTIVENESS,
-                         "num_modes": NUM_MODES, "ligand_addH": LIGAND_ADDH,
+                         "threads_per_job": tpj, "ligand_addH": LIGAND_ADDH,
+                         "engine": opts["engine_name"], "poses": policy,
+                         **engine_settings(args),
                          "unit_timeout": timeout, "library": _rel(lib, layout.run_dir)},
-                   inputs=[layout.final_targets_csv, lib], versions=_versions(engine),
+                   inputs=[layout.final_targets_csv, lib],
+                   versions=_versions(engine, opts["engine_name"]),
                    counts=counts, timing={},
                    extra={"fingerprint": fingerprint, "outputs": _outputs(layout, plan),
                           "library_md5": lib_md5, "library_sha256": plan.library_sha,
@@ -1275,10 +1703,13 @@ def run(layout, args, progress, execute: bool = True, discard_baseline: int | No
                           # library; False: from the raw SDF (Methods needs to say which).
                           "library_prepared": _library_is_prepared(layout, args, lib),
                           "base_seed": opts["base_seed"], "engine": engine, "smina": engine,
-                          # per unit: which draw it is, what seed it recorded, its key
+                          # per unit: which draw it is, what seed it recorded, its key,
+                          # and the provenance the host that DREW it recorded beside it
+                          # (engine build, GPU model, CUDA runtime, settings, digests)
                           "units": [{"label": u.label, "replicate": u.replicate,
                                      "seed": u.seed, "key": u.key,
-                                     "state": unit_state(layout, u)}
+                                     "state": unit_state(layout, u),
+                                     "provenance": read_provenance(layout, u)}
                                     for u in plan.units],
                           "receptors": receptors, "obsoleted": obsoleted,
                           **(extra_manifest or {})})
@@ -1353,10 +1784,17 @@ def _count_discards(stage_dir) -> int:
         return 0
 
 
-def _versions(smina: str) -> dict:
+def _versions(engine: str, name: str = ENGINE_SMINA) -> dict:
     import importlib.metadata
 
-    out = {"smina": smina}
+    out = {"engine": engine, "engine_name": name,
+           # kept under its old key so a reader that knows only `smina` still finds the
+           # engine string; it is the ENGINE's version, whichever engine that is.
+           "smina": engine}
+    if name == ENGINE_UNIDOCK:
+        out.update({"unidock_tools": unidock.tools_version(),
+                    "cuda_driver_max": unidock.cuda_driver_max(),
+                    "gpu_model": unidock.gpu_model() or "none"})
     for pkg in ("openbabel", "pdbfixer", "openmm"):
         try:
             out[pkg] = importlib.metadata.version(pkg)
@@ -1442,8 +1880,15 @@ def write_bundle(layout, args, dest, plan: _Plan, prepared: dict, ligands_sdf: P
                                + [repr(float(c)) for c in b.center]
                                + [repr(float(s)) for s in b.size]))
     _atomic_text(dest / BUNDLE_UNITS, "\n".join(lines) + "\n")
+    from polyphar.common import sha256_file
+
     _atomic_text(dest / BUNDLE_KEY, _json_indent({
         "run": Path(layout.run_dir).name, "library_sha256": plan.library_sha,
+        # the panel this bundle was planned against: a bundle exported before `select` was
+        # rerun describes targets that may no longer exist, and the per-unit key check
+        # would say so one opaque rejection at a time
+        "panel_sha256": sha256_file(layout.final_targets_csv),
+        "exported_from": host_path(),
         "n_ligands": plan.n_ligands, "options": plan.opts,
         "unit_timeout": int(getattr(args, "unit_timeout", None) or DEFAULT_UNIT_TIMEOUT),
         "units": len(out), "outstanding_total": len(plan.outstanding(layout))}))
@@ -1503,6 +1948,41 @@ def bundle_outstanding(bundle) -> list[tuple[BundleUnit, str | None]]:
     return out
 
 
+RUN_KEY_SETTINGS = ("engine_name", "search_mode", "batch_size", "base_seed", "ligand_addH",
+                    "exhaustiveness", "num_modes")
+
+
+def verify_run_key(bundle, args):
+    """Check the bundle's run_key.json against this host's settings BEFORE any work, and
+    return the arguments the units must actually be run with.
+
+    The bundle's settings win, because the unit keys were computed from them at export: a
+    worker that docked with its own engine or search mode would produce draws that
+    `dock-merge` then rejects on every key, after the GPU time was spent. A setting the
+    CALLER gave explicitly and that contradicts the bundle is refused outright rather than
+    silently overridden -- that is a user who believes they are running something else."""
+    import copy
+
+    opts = dict(read_run_key(bundle).get("options") or {})
+    out = copy.copy(args)
+    conflicts = []
+    for field, attr in (("engine_name", "engine"), ("search_mode", "search_mode"),
+                        ("batch_size", "batch_size")):
+        if field not in opts:
+            continue
+        given = getattr(args, attr, None)
+        if given is not None and str(given) != str(opts[field]):
+            conflicts.append(f"--{attr.replace('_', '-')}: bundle {opts[field]!r}, "
+                             f"this host {given!r}")
+        setattr(out, attr, opts[field])
+    if conflicts:
+        raise ValueError(
+            f"{bundle}: run_key.json disagrees with this host's settings, so its units "
+            f"would be drawn under an identity the merge will reject -- "
+            f"{'; '.join(conflicts)}. Drop the option, or export a new bundle with it")
+    return out
+
+
 def work_bundle(bundle, args, progress) -> dict:
     """Run the bundle's outstanding units in place. No run folder is needed and no key is
     computed: the keys come from units.tsv."""
@@ -1510,34 +1990,42 @@ def work_bundle(bundle, args, progress) -> dict:
 
     bundle = Path(bundle)
     key = read_run_key(bundle)
+    bundle_args = verify_run_key(bundle, args)
     bl = BundleLayout(bundle)
     todo = bundle_outstanding(bundle)
-    engine = smina_version()
+    name = engine_name(bundle_args)
+    if todo:
+        require_engine_host(bundle_args)
+    engine = (unidock.unidock_version() if name == ENGINE_UNIDOCK else smina_version())
     if todo and engine == "unavailable":
-        raise FileNotFoundError(f"smina ({smina_bin()}) not runnable")
+        raise FileNotFoundError(f"{name} ({_engine_bin(bundle_args)}) not runnable")
     n_lig = int(key.get("n_ligands") or 0)
     tpj = int(getattr(args, "threads_per_job", DEFAULT_TPJ))
     timeout = int(getattr(args, "unit_timeout", None) or key.get("unit_timeout")
                   or DEFAULT_UNIT_TIMEOUT)
+    engine_input = (bundle / BUNDLE_LIBRARY if name != ENGINE_UNIDOCK else
+                    unidock.split_library(bundle / BUNDLE_LIBRARY, bundle / "split",
+                                          str(key.get("library_sha256") or "")))
     tasks = []
     for b, why in todo:
-        sdf, log, marker = unit_paths(bl, b.unit)
-        sdf.parent.mkdir(parents=True, exist_ok=True)
-        marker.parent.mkdir(parents=True, exist_ok=True)
-        tasks.append(((b.unit.label, b.unit.name), _unit_worker,
-                      (str(bundle / b.receptor), str(bundle / BUNDLE_LIBRARY), b.center,
-                       b.size, str(sdf), str(log), str(marker), b.unit.seed, tpj,
-                       b.unit.key, timeout, str(bl.docking), b.unit, why)))
-    outcome = _run_pool(tasks, max(1, args.nprocs // tpj),
+        _unit_dirs(bl, b.unit)
+        job = _unit_job(b.unit, bundle_args, engine, bundle / b.receptor, engine_input,
+                        b.center, b.size, bl.docking, timeout, tpj, why,
+                        str(key.get("library_sha256") or ""), "")
+        tasks.append(((b.unit.label, b.unit.name), _unit_worker, (job,)))
+    outcome = _run_pool(tasks, _slots(bundle_args, tpj),
                         on_result=lambda item, _r: progress.advance(n_lig))
     for item, reason in outcome.failures:
         progress.advance(n_lig)
         append_bundle_failure(bundle, f"{item[0]}/{item[1]}",
-                              reason.removeprefix("SminaError: "))
+                              _engine_reason(reason))
     _atomic_text(bundle / "worker.json", _json_indent(
-        {"engine": engine, "units": len(read_bundle_units(bundle)),
+        {"engine": engine, "engine_name": name, "units": len(read_bundle_units(bundle)),
          "units_docked": len(tasks) - len(outcome.failures),
-         "failed": len(outcome.failures), "versions": _versions(engine)}))
+         "failed": len(outcome.failures), "versions": _versions(engine, name),
+         "host": host_path(),
+         "gpu_models": sorted({(read_provenance(bl, b.unit).get("gpu_model") or "")
+                               for b in read_bundle_units(bundle)} - {"", None})}))
     return {"units": len(read_bundle_units(bundle)),
             "units_docked": len(tasks) - len(outcome.failures),
             "skipped_existing": len(read_bundle_units(bundle)) - len(todo),
@@ -1579,6 +2067,14 @@ def import_bundle(layout, plan: _Plan, bundle):
             continue
         if unit_state(bl, u) != STATE_DONE:
             continue   # not drawn yet in the bundle; a later worker pass will
+        # L3: the marker and the `$$$$` terminator say nothing about the CONTENT, so a
+        # result edited to different scores and re-terminated used to be copied in
+        # unchecked. The worker recorded the result's sha256 in its provenance; a record
+        # that no longer matches it is not the draw that was made.
+        tampered = verify_result_digest(bl, u)
+        if tampered:
+            rejected.append((f"{u.label}/{u.name}", tampered))
+            continue
         src_sdf, src_log, src_done = unit_paths(bl, u)
         dst_sdf, dst_log, dst_done = unit_paths(layout, mine)
         if unit_state(layout, mine) == STATE_DONE:
@@ -1604,6 +2100,9 @@ def import_bundle(layout, plan: _Plan, bundle):
         shutil.copyfile(src_sdf, dst_sdf)
         if src_log.is_file():
             shutil.copyfile(src_log, dst_log)
+        src_prov = prov_path(bl, u)
+        if src_prov.is_file():   # the provenance of the draw travels with the draw
+            shutil.copyfile(src_prov, prov_path(layout, mine))
         _atomic_text(dst_done, mine.key + "\n")   # written last: the record is in place
         taken.append(mine)
     _carry_discards(bundle, layout)

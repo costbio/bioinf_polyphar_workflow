@@ -22,6 +22,7 @@ import shutil
 import tempfile
 import time
 from datetime import datetime
+from types import SimpleNamespace
 from pathlib import Path
 
 from polyphar.common import WorkUnits
@@ -139,9 +140,59 @@ def _bench_similarity(tmp: Path):
                              "bench_pairs": pairs}
 
 
+# Uni-Dock seconds per ligand, by GPU device class. Measured 0.176 s/ligand on an L4 and
+# -- the real simplification over CPU smina -- FLAT across box volumes from 3,679 to
+# 20,112 A^3, where smina's cost was dominated by box volume. So n_ligands x rate(device)
+# is an adequate estimate and no per-box term is needed. The other entries are scaled from
+# the L4 figure by relative throughput and are priors, not measurements; a device not
+# listed uses UNIDOCK_RATE_DEFAULT and says so.
+UNIDOCK_RATE_S_PER_LIGAND = {"L4": 0.176, "T4": 0.42, "A100": 0.075, "H100": 0.05,
+                             "V100": 0.30, "L40S": 0.11, "A10G": 0.20, "RTX 4090": 0.09}
+UNIDOCK_RATE_DEFAULT = 0.176   # the measured L4 rate, used for an unlisted device
+UNIDOCK_RATE_DEFAULT_CLASS = "unlisted-at-L4-rate"
+UNIDOCK_RATE_SOURCE = ("Uni-Dock 1.2.0 on an L4, 2026-11-03: 0.176 s/ligand, flat across "
+                       "box volumes 3,679-20,112 A^3")
+
+
+def unidock_rate(model: str | None) -> tuple[float, str]:
+    """(seconds per ligand, which device class it came from) for a GPU model name."""
+    name = (model or "").strip()
+    for key, rate in sorted(UNIDOCK_RATE_S_PER_LIGAND.items(), key=lambda kv: -len(kv[0])):
+        if key.lower() in name.lower():
+            return rate, key
+    # No spaces or parens: this becomes a calibration.json key ("unidock:<device class>").
+    return UNIDOCK_RATE_DEFAULT, UNIDOCK_RATE_DEFAULT_CLASS
+
+
+UNIDOCK_TOOL_PREFIX = "unidock:"
+
+
+def unidock_tool_prefix() -> str:
+    return UNIDOCK_TOOL_PREFIX
+
+
+def _bench_unidock():
+    """Calibrate Uni-Dock from the per-device table rather than by running it.
+
+    There is nothing a local run would add: the rate is flat across box volumes, so one
+    number per device class is the whole model, and a benchmark would need a GPU and the
+    real engine on the machine doing the estimating."""
+    from polyphar.stages import dock_unidock as unidock
+
+    model = unidock.gpu_model()
+    if model is None:
+        raise Skip("no CUDA GPU on this host")
+    rate, device = unidock_rate(model)
+    return rate, {"basis": "ligands", "tool": f"{unidock_tool_prefix()}{device}",
+                  "gpu_model": model, "device_class": device,
+                  "measured": False, "rate_source": UNIDOCK_RATE_SOURCE}
+
+
 def _bench_dock(tmp: Path):
     from polyphar.stages import dock
 
+    if bench_engine() == dock.ENGINE_UNIDOCK:
+        return _bench_unidock()
     smina = dock.smina_bin()
     if shutil.which(smina) is None and not os.access(smina, os.X_OK):
         raise Skip(f"smina not found ({smina})")
@@ -157,9 +208,25 @@ def _bench_dock(tmp: Path):
     seconds = time.monotonic() - t0
     measured = seconds / n
     return measured * DOCK_MIX_FACTOR, {
-        "basis": "ligands", "bench_seconds": round(seconds, 2), "bench_ligands": n,
+        "basis": "ligands", "tool": dock.ENGINE_SMINA,
+        "bench_seconds": round(seconds, 2), "bench_ligands": n,
         "measured_seconds_per_ligand": measured, "library_mix_factor": DOCK_MIX_FACTOR,
         "library_mix_source": DOCK_MIX_SOURCE}
+
+
+def bench_engine() -> str:
+    """Which dock engine to benchmark. $POLYPHAR_DOCK_ENGINE wins; otherwise Uni-Dock only
+    when this host actually has BOTH a GPU and a runnable Uni-Dock, so a GPU machine doing
+    a CPU run is never calibrated with the wrong engine."""
+    from polyphar.stages import dock
+    from polyphar.stages import dock_unidock as unidock
+
+    chosen = os.environ.get("POLYPHAR_DOCK_ENGINE")
+    if chosen in dock.ENGINES:
+        return chosen
+    if unidock.gpu_model() is not None and unidock.unidock_version() != "unavailable":
+        return dock.ENGINE_UNIDOCK
+    return dock.ENGINE_SMINA
 
 
 def _live_session():
@@ -263,7 +330,9 @@ def run_benchmark(stages, calib, log=print) -> dict:
                 continue
         elapsed = time.monotonic() - t0
         calib.data.pop(stage, None)
-        calib.update(stage, spc)
+        # dock is calibrated PER ENGINE (and, for Uni-Dock, per GPU device class): an L4
+        # rate must never be reused for an A100, nor a CPU smina rate for either.
+        calib.update(stage, spc, tool=extra.pop("tool", None))
         if stage in calib.data:
             calib.data[stage].update({**extra, "source": "polyphar benchmark"})
         results[stage] = {"status": "calibrated", "seconds_per_unit": spc,
@@ -496,8 +565,24 @@ def estimate_rows(layout, nprocs: int, calib) -> tuple[list[dict], list[str]]:
         if trivial:
             rows.append({"stage": stage, "kind": kind, "units": "-", "seconds": 0.0, "note": ""})
             continue
+        # dock's calibration is per engine, and per GPU device class for Uni-Dock: the
+        # estimate must not quote a CPU smina rate for a GPU run (or the reverse). The
+        # engine here is this host's (bench_engine); `polyphar dock --engine ...` uses the
+        # flag, through cli.gate -> dock.calibration_tool.
+        stage_tool, tpj, slots = None, 1, None
+        if stage == "pockets":
+            stage_tool = tool
+        elif stage == "dock":
+            from polyphar.stages import dock as _dock
+
+            engine = bench_engine()
+            eargs = SimpleNamespace(engine=engine, nprocs=nprocs)
+            stage_tool = _dock.calibration_tool(eargs)
+            # the stage's own slot count (1 for Uni-Dock: it saturates the one device), the
+            # same source cli.gate uses -- not the engine-blind PARALLEL_EFFICIENCY table.
+            slots = _dock.slots(eargs, tpj)
         est = estimate_stage(stage, units, nprocs, calib, PARALLEL_EFFICIENCY,
-                             tool=tool if stage == "pockets" else None)
+                             threads_per_job=tpj, tool=stage_tool, slots=slots)
         rows.append({"stage": stage, "kind": kind, "units": f"{units.count} ({units.cost_basis})",
                      "seconds": est.seconds, "note": note or est.basis})
     return rows, observed

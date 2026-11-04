@@ -216,6 +216,7 @@ Exit codes of `polyphar run`:
 | 1 | a stage failed, or failed more than `--max-failed-fraction`, and the run stopped (143 when stopped by SIGTERM / `docker stop`, 129 by SIGHUP) |
 | 2 | usage error (bad options, `--from` after `--to`, no ids source, failed preflight) |
 | 3 | the run finished, but failed units or incomplete targets were flagged |
+| 4 | the run stopped cleanly with work still outstanding: `--engine unidock` on a host with no GPU. Nothing failed; everything up to `dock` is done, and `dock-export` / `dock-worker` / `dock-merge` finish it |
 
 ## Run folder
 
@@ -233,8 +234,9 @@ modified or deleted.
     <run>/05_similarity/Pocketsim.csv  PocketMatch_score.txt  cabbage/
     <run>/06_targets/final_targets.csv  centrality.csv  unique_pairs.csv
     <run>/07_docking/library/library_prepared.sdf  ligands.csv
-    <run>/07_docking/<label>/replicates/r<i>.sdf  r<i>.done  poses.sdf
-    <run>/07_docking/df_results_<label>_fixed.csv  discarded.tsv  discarded/  export/  obsolete/
+    <run>/07_docking/<label>/replicates/r<i>.sdf  r<i>.log  r<i>.prov.json  r<i>.done
+    <run>/07_docking/<label>/poses.sdf  (poses_r<i>.sdf with --poses all)
+    <run>/07_docking/df_results_<label>.csv  discarded.tsv  discarded/  export/  obsolete/
     <run>/logs/<stage>.log  run.log  notifications.log
 
 Every stage directory gets `manifest.json` (written last; its presence marks the stage as
@@ -638,13 +640,44 @@ here.
     `incomplete_targets` counts targets with no
     results (a replicate not recorded, missing ligands, receptor preparation failure, or a
     missing receptor). An
-    incomplete target gets no `df_results_<label>_fixed.csv`, and `failed.tsv` lists its
+    incomplete target gets no `df_results_<label>.csv`, and `failed.tsv` lists its
     missing ligand IDs. Treat `incomplete_targets > 0` as a failure.
 - When `select` drops a target on a rerun, its docking outputs are moved to
   `07_docking/obsolete/<timestamp>/`, not deleted.
-- `df_results_<label>_fixed.csv` has `Pose, SMINA_Score, Ligand, ID, Pocket`. **Downstream
-  code must key ligands on `ID`, not `Ligand`**: 35 different e-Drug3D drugs share the title
-  `Molecule-1`.
+- `df_results_<label>.csv` has `Ligand, ID, Pocket, n, score_mean, score_sd, score_se,
+  score_min, score_max`: one row per ligand, summarising that ligand's BEST score in each
+  of the `n` replicates. `score_sd` is the sample sd (ddof=1) and `score_se = sd/sqrt(n)`;
+  both are empty at `n == 1`. The raw per-replicate pose records stay in
+  `<label>/replicates/r<i>.sdf`, so any other summary can be recomputed without re-docking.
+  The retired `df_results_<label>_fixed.csv` (`Pose, SMINA_Score, Ligand, ID, Pocket`) was
+  replicate 0 only: an engine-specific column name, and one number where there is now a
+  distribution. A leftover `_fixed` file is swept into `obsolete/`.
+  **Downstream code must key ligands on `ID`, not `Ligand`**: 35 different e-Drug3D drugs
+  share the title `Molecule-1`.
+- **Engines.** `--engine smina` (default) is the CPU single-host path; `--engine unidock`
+  is Uni-Dock >= 1.2.0 on a CUDA GPU through `unidock_tools`. The engine and its search
+  settings (`--search-mode`, default `balance` = exhaustiveness 384; `--batch-size`) are
+  part of every unit key, so changing them supersedes the recorded draws instead of mixing
+  two populations. Older Uni-Dock is refused outright: before 1.2.0 it silently corrupted
+  ~20 % of results for boxes >= 30 A. The gate checks the binary that will ACTUALLY dock --
+  `unidock_tools` spawns a hardcoded `unidock` from `$PATH` and never reads `$UNIDOCK_BIN`,
+  so a `$UNIDOCK_BIN` that is not that same file is refused -- and it requires the
+  `--version` banner to say `Uni-Dock` (a bare `1.2.5` could be AutoDock Vina) and to be a
+  released build, not an `-rc`. Scores beyond +-100 kcal/mol are dropped as the known
+  upstream failure (issue #205, reported against 1.2.0 itself) and listed in
+  `<label>/replicates/r<i>.filtered.tsv`; 1.2.0 also fixed out-of-bounds poses carrying
+  `FLT_MAX` affinities, which the same filter catches. A library whose records already
+  carry a `<minimizedAffinity>` field is refused before any GPU time: `unidock_tools`
+  passes input SD fields through, so that stale score would come back beside the real
+  `<docking_score>`. `--engine unidock` on a host with no GPU fails immediately with the
+  `dock-export` / `dock-worker` / `dock-merge` instructions, and `polyphar run` stops
+  cleanly before `dock` there (exit 4) rather than failing.
+- **ETA on a GPU.** Uni-Dock docks one unit at a time -- it batches the whole library onto
+  the one device -- so `--nprocs` does not shorten its ETA and does not scale the
+  seconds-per-ligand written back to `~/.polyphar/calibration.json`. The dock stage reports
+  its own slot count for both.
+- `--poses none|first|all` (default `first`) decides which replicates' poses are written
+  out. Replicate 0's poses are what the pose-in-pocket validation reads.
 
 ## Reproducibility caveats
 
