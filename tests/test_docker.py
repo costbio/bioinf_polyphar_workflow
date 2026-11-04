@@ -89,6 +89,7 @@ def test_image_has_no_dogsite_or_credentials(image):
 
 
 
+@pytest.mark.repo_files
 def test_wrapper_rejects_missing_run_dir(tmp_path):
     # Must fail before docker is invoked (no docker / image needed).
     missing = tmp_path / "no_such_run"

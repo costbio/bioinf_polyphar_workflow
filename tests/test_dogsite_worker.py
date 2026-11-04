@@ -22,6 +22,10 @@ from polyphar.stages import pockets
 REPO = Path(__file__).resolve().parent.parent
 WORKER = REPO / "bin" / "polyphar-dogsite-worker"
 WRAPPER = REPO / "bin" / "polyphar-docker"
+
+# Every test here drives the host-side wrappers in bin/, which the image does not ship
+# (docker/Dockerfile copies polyphar/ and tests/). They are checkout-only by nature.
+pytestmark = pytest.mark.repo_files
 FAKE = REPO / "tests" / "fixtures" / "fake_dogsite"
 # the same fake under a DoGSiteScorer 2 identity (its --help lists --druggability, as DS2 2.0.0)
 FAKE2 = REPO / "tests" / "fixtures" / "fake_dogsite2"

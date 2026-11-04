@@ -49,6 +49,9 @@ _REQUIREMENTS = {
     "rdkit": (_rdkit_ok, "rdkit not importable"),
     "openbabel": (_openbabel_ok, "openbabel not importable"),
     "repo_files": (_repo_files_ok, "docs/ and bin/ are not in the image, only a checkout"),
+    # pgrep is a test-only tool here: polyphar kills a timed-out engine by process group,
+    # never by name, so the slim image has no procps and these assertions cannot run there.
+    "procps": (lambda: shutil.which("pgrep") is not None, "pgrep not available (no procps)"),
     "pushover": (
         lambda: bool(os.environ.get("PUSHOVER_APP_TOKEN") and os.environ.get("PUSHOVER_USER_KEY")),
         "PUSHOVER_APP_TOKEN / PUSHOVER_USER_KEY not set",

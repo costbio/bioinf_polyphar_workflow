@@ -550,6 +550,7 @@ def test_missing_receptor_file_is_a_failed_target(run_folder):
     assert counts["complete"] == 1 and counts["incomplete_targets"] == 1
 
 
+@pytest.mark.procps
 def test_unit_timeout_kills_the_engine_and_fails_the_unit(run_folder, monkeypatch):
     import time
 
