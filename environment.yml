@@ -12,8 +12,13 @@ dependencies:
   - pdbfixer=1.12
   - openmm=8.6.1
   - openbabel=3.1.1
-  - rdkit=2026.09.1
   - smina=2020.12.10
   - openpyxl=3.1.5
   - pytest=9.2.0
   - pip
+  # rdkit comes from pip, not conda-forge: conda's smina=2020.12.10 (the only build
+  # there is) pins an old libboost that no conda rdkit can co-solve with, and the
+  # dock stage needs smina on a GPU-less host. The pip manylinux wheel bundles its
+  # own boost, so rdkit, openbabel and smina coexist. Verified on linux-64.
+  - pip:
+      - rdkit==2026.09.1
