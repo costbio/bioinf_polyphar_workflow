@@ -34,10 +34,22 @@ about six minutes, so ~200 units is a 20-hour session. **Do not export a second 
 before merging the first** — both would contain the same units, both would be worked, and
 the second merge's draws are dropped.
 
-Then, with `bundle.tgz` uploaded to the VM as `/content/bundle.tgz`:
+Then upload the bundle and, so the worker can reach you, the Pushover credentials:
+
+    colab upload bundle.tgz /content/bundle.tgz -s <session>
+    colab upload ~/.polyphar/pushover.env /content/pushover.env -s <session>
+
+The credentials go as a **file, not through `colab exec --env`**: colab-cli records request
+bodies in `~/.config/colab-cli/colab.log` at DEBUG level, and a token passed as an argument
+can end up there. Without the file the worker runs silent — it still calls `notify()`, but
+`notify()` finds no credentials, logs one warning and skips, and that log dies with the VM.
+On a 20-hour session that is the difference between hearing it finish and discovering hours
+later that it died.
+
+Then:
 
     export POLYPHAR_COMMIT=$(git rev-parse HEAD)     # must be the commit that exported
-    colab exec -f bin/colab/setup.py  --timeout 3600
+    colab exec -f bin/colab/setup.py  --timeout 3600 --env POLYPHAR_COMMIT=$POLYPHAR_COMMIT
     colab exec -f bin/colab/launch.py --timeout 600
     colab exec -f bin/colab/poll.py   --timeout 300  # repeat
     colab exec -f bin/colab/pack.py   --timeout 600
