@@ -95,6 +95,14 @@ stage_index() {
         *) echo "" ;;
     esac
 }
+stage_name() {   # the reverse of stage_index, for rebuilding a --from/--to range
+    case "$1" in
+        0) echo ids ;; 1) echo uniprot ;; 2) echo structures ;; 3) echo fix ;;
+        4) echo pockets ;; 5) echo annotate ;; 6) echo select ;; 7) echo similarity ;;
+        8) echo ligands ;; 9) echo dock ;; 10) echo control ;; 11) echo stats ;;
+        *) echo ids ;;
+    esac
+}
 pockets_index=4
 last_index=11
 set_stage() {   # $1 = from|to, $2 = stage name
@@ -128,10 +136,35 @@ for a in "$@"; do
     esac
     prev="$a"
 done
+# Docking on a GPU elsewhere is the same shape of problem as DoGSiteScorer: the engine is
+# not in the container, so the host drives it. `pockets` gets a host worker; `dock` gets a
+# round trip (export here, work on the GPU host, merge here), run by bin/polyphar-colab.
+# Without this, `polyphar dock` on POSEIDON just fails fast and the user has to know a
+# second command exists.
+want_roundtrip=0
+roundtrip_args=()
+engine="${POLYPHAR_ENGINE:-}"
+prev=""
+for a in "$@"; do
+    [ "$prev" = "--engine" ] && engine="$a"
+    case "$a" in --engine=*) engine="${a#--engine=}" ;; esac
+    prev="$a"
+done
+have_gpu=0
+if [ -n "${POLYPHAR_GPU_MODEL:-}" ] || nvidia-smi -L >/dev/null 2>&1; then have_gpu=1; fi
+dry_run=0
+for a in "$@"; do [ "$a" = "--dry-run" ] && dry_run=1; done
+
 want_worker=0
 want_bench=0
 case "${1:-}" in
     pockets) want_worker=1 ;;
+    dock|control)
+        if [ "$have_gpu" = 0 ] && [ "$dry_run" = 0 ] && [ "${engine:-unidock}" = unidock ]; then
+            want_roundtrip=1
+            [ "${1:-}" = control ] && roundtrip_args+=(--control)
+        fi
+        ;;
     benchmark) want_bench=1 ;;
     run)
         from=0 to="$last_index" prev=""
@@ -146,6 +179,10 @@ case "${1:-}" in
             esac
             prev="$a"
         done
+        if [ "$to" -ge 9 ] && [ "$from" -le 9 ] && [ "$have_gpu" = 0 ] \
+           && [ "$dry_run" = 0 ] && [ "${engine:-unidock}" = unidock ]; then
+            want_roundtrip=1
+        fi
         if [ "$from" -le "$pockets_index" ] && [ "$to" -ge "$pockets_index" ]; then
             want_worker=1
             if ! python3 - "$home_dir/calibration.json" "$pocket_tool" <<'PY' 2>/dev/null
@@ -162,9 +199,55 @@ PY
 esac
 for a in "$@"; do
     case "$a" in
-        --dry-run|-h|--help) want_worker=0 want_bench=0 ;;
+        --dry-run|-h|--help) want_worker=0 want_bench=0 want_roundtrip=0 ;;
     esac
 done
+
+# --- docking: the engine is on a GPU elsewhere, so the host drives the round trip -------
+# `polyphar dock` and `polyphar run` must do the whole job. Without this the container's
+# dock fails fast on a GPU-less host and the user is expected to know a separate command
+# exists -- exactly the gap that made the runbook unfollowable.
+#
+# `run` is split around dock: the stages before it run in the container, the round trip
+# happens on the host, then the stages after it run in the container. The ranges are built
+# from the `from`/`to` the case block already parsed, so `run --from dock` does not try to
+# run a backwards range and `run --to dock` does not carry on into control.
+if [ "$want_roundtrip" = 1 ]; then
+    # everything the user passed except the range flags: the split rebuilds those
+    passthru=()
+    skip=0
+    for a in "${@:2}"; do
+        if [ "$skip" = 1 ]; then skip=0; continue; fi
+        case "$a" in
+            --from|--to) skip=1; continue ;;
+            --from=*|--to=*) continue ;;
+        esac
+        passthru+=("$a")
+    done
+    colab="$(dirname "$(realpath "$0")")/polyphar-colab"
+    [ -x "$colab" ] || { echo "polyphar-docker: $colab not found" >&2; exit 2; }
+    dock_i=9
+    rt_rc=0
+
+    if [ "${1:-}" = run ] && [ "${from:-0}" -lt "$dock_i" ]; then
+        echo "== stages up to ligands (in the container)"
+        POLYPHAR_RUN_DIR="$run_dir" "$0" run --from "$(stage_name "${from:-0}")" --to ligands \
+            "${passthru[@]}" || rt_rc=$?
+        # 3 = finished with failures, 4 = incomplete: both leave usable output
+        case "$rt_rc" in 0|3|4) rt_rc=0 ;; *) exit "$rt_rc" ;; esac
+    fi
+
+    echo "== dock: no local GPU, so the work goes to the GPU host and comes back"
+    POLYPHAR_RUN_DIR="$run_dir" "$colab" "${roundtrip_args[@]}" || exit $?
+
+    if [ "${1:-}" = run ] && [ "${to:-$last_index}" -gt "$dock_i" ]; then
+        echo "== stages after dock (in the container)"
+        POLYPHAR_RUN_DIR="$run_dir" "$0" run --from control \
+            --to "$(stage_name "${to:-$last_index}")" "${passthru[@]}"
+        exit $?
+    fi
+    exit 0
+fi
 
 if [ "$want_worker" = 0 ] && [ "$want_bench" = 0 ]; then
     # shellcheck disable=SC2086  # POLYPHAR_DOCKER_OPTS is intentionally word-split

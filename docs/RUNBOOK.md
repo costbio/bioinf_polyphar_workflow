@@ -106,17 +106,13 @@ Start with **HCC net1**. Then the other subtypes, in whatever order suits you.
     $POLYPHAR similarity       # AFTER select: it runs on the panel's eligible pockets
     $POLYPHAR ligands          # prepares inputs/e-Drug3D_2083.sdf once, for every target
 
-    # dock needs a GPU and POSEIDON has none, so `run` stops here and exits 4.
-    # One command does the whole round trip; repeat until nothing is outstanding:
-    bin/polyphar-colab --max-units 200
-    bin/polyphar-docker dock --dry-run     # what is still outstanding
+    $POLYPHAR dock             # GPU is elsewhere: exports, works it there, merges back
+    $POLYPHAR dock --dry-run   # what is still outstanding
+    $POLYPHAR control          # same round trip, then the readouts
 
-    $POLYPHAR control          # labels targets, writes the co-crystal library, stops
-    bin/polyphar-colab --control           # its docking, same round trip
-    $POLYPHAR control          # -> inputs/positive_control.json
-
-`$POLYPHAR run` stops after `dock`: that is the default `--to`. On POSEIDON it stops *at*
-`dock` with exit 4, because the engine is on a GPU elsewhere — see below. The analysis stage is not
+`$POLYPHAR run` stops after `dock`: that is the default `--to`. It does **not** stop at
+`dock` on POSEIDON — the wrapper splits the run around it, sending the docking to the GPU
+host and carrying on afterwards. See below. The analysis stage is not
 in the default range because it needs a positive set that is clinical-guideline reading
 (below), and a run that would otherwise do nine stages must not refuse because the tenth
 cannot start. A run that ends at `dock` without one prints and pushes a single line saying
@@ -124,36 +120,29 @@ so.
 
 ### Docking: POSEIDON has no GPU, so the work travels
 
-`dock` defaults to **Uni-Dock on a GPU**. POSEIDON has none, so `polyphar dock` fails fast
-and `polyphar run` completes every stage up to `dock`, stops cleanly and **exits 4**
-(`EXIT_INCOMPLETE`) — not 0, so a wrapper or `&&` chain cannot read it as a finished run.
-That is the expected end of `run` on this machine.
+`dock` defaults to **Uni-Dock on a GPU**. POSEIDON has none, so `$POLYPHAR dock` does not
+run the engine locally: the wrapper exports the outstanding units, runs them on a Colab
+Pro+ GPU, and merges the results back. You type the same command you would anywhere else.
 
-**Use one command for the whole round trip:**
+    $POLYPHAR dock                      # one round trip
+    $POLYPHAR dock --dry-run            # what is still outstanding
+    $POLYPHAR run                       # splits itself around dock automatically
 
-    bin/polyphar-colab --max-units 200
+**Re-run until `--dry-run` reports nothing outstanding.** Every stage underneath resumes,
+so each run exports only what is still missing, and a dropped session costs at most the
+units in flight.
 
-It does all of it: `dock-export` here, creates or reuses a Colab session, uploads the
-bundle and your Pushover credentials, installs Uni-Dock pinned to the repo's current
-commit, launches the worker detached, polls until it finishes, packs, downloads, and runs
-`dock-merge` here. Then it stops the session.
+Sizing: one unit is one (target, replicate) — 1,960 ligands, about 6 GPU minutes. The
+wrapper takes 200 units per session (~20 h) unless `POLYPHAR_MAX_UNITS` says otherwise. The
+number is truncated **down to a whole number of targets**, because a target whose
+replicates are split across sessions can be drawn on two different GPU models, and that
+difference would land inside the replicate spread that exists to measure the engine's own
+jitter.
 
-**Re-run it until `dock` reports nothing outstanding.** Every stage underneath resumes, so
-each run exports only what is still missing, and a dropped session costs at most the units
-in flight. Check what remains at any time with:
+`--engine smina` keeps everything local and on CPU, which is far slower (~264 h for net1)
+but needs no GPU and no Colab.
 
-    bin/polyphar-docker dock --dry-run
-
-Options: `--session NAME` (default `dock`), `--gpu L4|A100|T4|G4` (default `L4`),
-`--max-units N`, `--keep` (leave the session running), `--control` (see below).
-
-Sizing `--max-units`: one unit is one (target, replicate) — 1,960 ligands, about 6 GPU
-minutes. ~200 units is a ~20 hour session. The number is truncated **down to a whole
-number of targets**, because a target whose replicates are split across sessions can be
-drawn on two different GPU models, and that difference would land inside the replicate
-spread that exists to measure the engine's own jitter.
-
-What the wrapper refuses to do, and why:
+What it refuses to do, and why:
 
 - **A second bundle while an earlier one is unmerged.** Both would hold the same units,
   both would be worked, and the second merge's draws are discarded with the GPU time
@@ -164,13 +153,11 @@ What the wrapper refuses to do, and why:
 - **Start a worker that cannot notify you.** Without `~/.polyphar/pushover.env` the worker
   would run up to 20 hours in silence. `ALLOW_SILENT=1` overrides.
 
-`dock-merge` exiting 3 is normal: it means this bundle merged and other units are still
-outstanding. The wrapper reports that and exits 0; anything else is a real failure and the
-bundle is left in place to retry.
+`dock-merge` exiting 3 is normal: this bundle merged and other units are still outstanding.
 
-Driving the steps by hand (another GPU host, debugging a session) is documented in
-[`bin/colab/README.md`](../bin/colab/README.md), which also records what was measured on
-the L4 on 2026-11-03 and why the worker is detached.
+Underneath, `bin/polyphar-colab` drives the round trip and
+[`bin/colab/README.md`](../bin/colab/README.md) documents the individual steps — useful for
+another GPU host or for debugging a session, but you should not need either.
 
 ### The control's docking goes the same way
 
@@ -182,9 +169,8 @@ scales (Uni-Dock reads +0.326 kcal/mol less negative) and biases the percentile 
 So `control` needs the GPU too. It is not a separate stage triple — the same commands take
 `--control`:
 
-    bin/polyphar-docker control        # labels targets, writes the co-crystal library, stops
-    bin/polyphar-colab --control       # exports, works and merges 08_control/docking
-    bin/polyphar-docker control        # units now recorded -> computes the readouts
+    $POLYPHAR control        # labels targets, writes the library, docks it on the GPU
+    $POLYPHAR control        # units now recorded -> computes the readouts
 
 The first `control` stops with a message rather than failing: the library it writes is the
 input the export needs. The last one finds every unit recorded and goes straight to the
