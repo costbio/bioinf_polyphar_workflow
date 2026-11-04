@@ -20,7 +20,6 @@ COLUMNS = ["UniProt ID", "Gene Name", "PDB", "Chain ID", "AlphaFold", "Resolutio
 HETS = ("HETATM 9001 CA    CA B 201      10.000  10.000  10.000  1.00  0.00          CA\n"
         "HETATM 9002  O   HOH B 301      12.000  12.000  12.000  1.00  0.00           O\n")
 
-
 def _model1(text, hets=""):
     """First model of the 2mjw_B fixture (keeps tests fast), optionally with HETATMs."""
     out = []
@@ -31,11 +30,9 @@ def _model1(text, hets=""):
             out.append(line)
     return "".join(out) + hets + "END\n"
 
-
 @pytest.fixture(scope="module")
 def small_pdb_text():
     return _model1((FIX / "2mjw_B.pdb").read_text())
-
 
 def _setup(tmp_path, files):
     """files: {relative name: text}; every PDB-like entry is listed in Protein_info.csv,
@@ -47,7 +44,6 @@ def _setup(tmp_path, files):
         p.write_text(text)
     return layout
 
-
 def _write_info(layout, listed):
     rows = []
     for rel in listed:
@@ -57,10 +53,8 @@ def _write_info(layout, listed):
                      f"02_structures/{rel}"])
     pd.DataFrame(rows, columns=COLUMNS).to_csv(layout.protein_info, index=False)
 
-
 def _args(nprocs=2):
     return SimpleNamespace(nprocs=nprocs, ph=7.0)
-
 
 class Prog:
     def __init__(self):
@@ -69,10 +63,8 @@ class Prog:
     def advance(self, n=1, size=None):
         self.calls.append((n, size))
 
-
 def _atoms(path):
     return [l for l in Path(path).read_text().splitlines() if l.startswith(("ATOM", "HETATM"))]
-
 
 def test_select_inputs_excludes_af(tmp_path, small_pdb_text):
     layout = _setup(tmp_path, {"P25815/2mjw_B.pdb": small_pdb_text,
@@ -80,7 +72,6 @@ def test_select_inputs_excludes_af(tmp_path, small_pdb_text):
                                "P25815/stray_A.pdb": small_pdb_text})
     _write_info(layout, ["P25815/2mjw_B.pdb", "P25815/AF-P25815-F1.pdb"])
     assert select_inputs(layout) == [layout.structures / "P25815" / "2mjw_B.pdb"]
-
 
 def test_fix_adds_hydrogens_and_drops_hets(tmp_path, small_pdb_text):
     src = tmp_path / "02_structures" / "P25815" / "2mjw_B.pdb"
@@ -99,7 +90,6 @@ def test_fix_adds_hydrogens_and_drops_hets(tmp_path, small_pdb_text):
     assert not any(l.startswith("HETATM") for l in atoms)
     assert not out.with_name(out.name + ".tmp").exists()
 
-
 def test_failure_keeps_input(tmp_path, small_pdb_text):
     bad = "this is not a pdb file\nATOM      1  N   garbage\n"
     layout = _setup(tmp_path, {"P25815/2mjw_B.pdb": small_pdb_text, "P25815/bad_B.pdb": bad})
@@ -116,7 +106,6 @@ def test_failure_keeps_input(tmp_path, small_pdb_text):
     assert not (layout.pdbfixer / "P25815" / "bad_B.pdb").exists()
     assert not list(layout.pdbfixer.rglob("*.tmp"))
     assert (layout.pdbfixer / "P25815" / "2mjw_B.pdb").is_file()
-
 
 def test_resume_ignores_partial_tmp(tmp_path, small_pdb_text):
     layout = _setup(tmp_path, {"P25815/2mjw_B.pdb": small_pdb_text,
@@ -141,7 +130,6 @@ def test_resume_ignores_partial_tmp(tmp_path, small_pdb_text):
     assert len(_atoms(out_dir / "2mjw_C.pdb")) > 100  # leftover .tmp was redone
     assert stale.read_text() == "ATOM      1  N   MET A   1 truncat"   # harmless leftover, ignored
 
-
 def test_empty_output_is_not_done(tmp_path, small_pdb_text):
     layout = _setup(tmp_path, {"P25815/2mjw_B.pdb": small_pdb_text})
     _write_info(layout, ["P25815/2mjw_B.pdb"])
@@ -149,7 +137,6 @@ def test_empty_output_is_not_done(tmp_path, small_pdb_text):
     out.parent.mkdir(parents=True)
     out.write_text("")
     assert fix.units(layout, _args()).count == 1
-
 
 def test_nprocs_gives_identical_output(tmp_path, small_pdb_text):
     texts = {f"P25815/2mjw_{c}.pdb": small_pdb_text for c in "BCD"}
@@ -160,7 +147,6 @@ def test_nprocs_gives_identical_output(tmp_path, small_pdb_text):
         fix.run(layout, _args(n), Prog())
         results.append({p.name: p.read_bytes() for p in layout.pdbfixer.rglob("*.pdb")})
     assert results[0] == results[1] and len(results[0]) == 3
-
 
 def test_manifest_written_last(tmp_path, small_pdb_text):
     layout = _setup(tmp_path, {"P25815/2mjw_B.pdb": small_pdb_text})
@@ -173,7 +159,6 @@ def test_manifest_written_last(tmp_path, small_pdb_text):
     assert m["args"]["h_seed"] == fix.H_SEED
     assert m["counts"] == {"inputs": 1, "fixed": 1, "skipped_existing": 0, "failed": 0}
     assert m["inputs"][0]["path"].endswith("Protein_info.csv")
-
 
 def test_interrupt_propagates_and_leaves_no_partial(tmp_path, small_pdb_text):
     texts = {f"P25815/2mjw_{c}.pdb": small_pdb_text for c in "BCDE"}
@@ -200,7 +185,6 @@ def test_interrupt_propagates_and_leaves_no_partial(tmp_path, small_pdb_text):
     assert counts["fixed"] + counts["skipped_existing"] == 4 and counts["failed"] == 0
     assert not list(layout.pdbfixer.rglob("*.tmp"))
 
-
 def test_concurrent_fix_one_same_output(tmp_path, small_pdb_text):
     from concurrent.futures import ThreadPoolExecutor
 
@@ -217,7 +201,6 @@ def test_concurrent_fix_one_same_output(tmp_path, small_pdb_text):
     out = tmp_path / "out" / "P25815" / "2mjw_B.pdb"
     assert len(_atoms(out)) > 100 and out.read_text().rstrip().endswith("END")
     assert oct(out.stat().st_mode & 0o777) == "0o644"
-
 
 def test_worker_crash_is_attributed_and_stage_continues(tmp_path, small_pdb_text, monkeypatch):
     texts = {f"P25815/2mjw_{c}.pdb": small_pdb_text for c in "BCDE"}
@@ -247,7 +230,6 @@ def test_worker_crash_is_attributed_and_stage_continues(tmp_path, small_pdb_text
     assert (layout.pdbfixer / "manifest.json").is_file()
     assert fix.units(layout, _args()).count == 1   # a rerun only retries the crasher
 
-
 def test_broken_pool_repools_and_isolates_only_repeat_offenders(tmp_path, small_pdb_text,
                                                                  monkeypatch):
     """fix uses the shared pool: after a worker dies, the units in flight go back to a fresh
@@ -273,7 +255,6 @@ def test_broken_pool_repools_and_isolates_only_repeat_offenders(tmp_path, small_
     isolated = calls[0][2]
     assert "P25815/2mjw_C.pdb" in isolated and len(isolated) <= 2
     assert not multiprocessing.active_children()
-
 
 def test_submit_race_routes_remaining_units_to_isolation(tmp_path, small_pdb_text, monkeypatch):
     import concurrent.futures as cf
@@ -302,16 +283,13 @@ def test_submit_race_routes_remaining_units_to_isolation(tmp_path, small_pdb_tex
     assert len(list(layout.pdbfixer.rglob("*.pdb"))) == 4
     assert not list(layout.pdbfixer.rglob("*.tmp"))
 
-
 def test_worker_exception_crosses_process_boundary_as_message(tmp_path):
     with pytest.raises(fix.FixError, match="^ValueError|^Exception|^\\w+Error"):
         fix._worker(tmp_path / "missing.pdb", tmp_path, tmp_path / "out", 7.0)
 
-
 def test_missing_protein_info_is_clear(tmp_path):
     with pytest.raises(FileNotFoundError, match="polyphar structures"):
         fix.units(RunLayout(tmp_path), _args())
-
 
 def test_cli_dry_run(tmp_path, small_pdb_text, capsys):
     layout = _setup(tmp_path, {"P25815/2mjw_B.pdb": small_pdb_text})
@@ -320,7 +298,6 @@ def test_cli_dry_run(tmp_path, small_pdb_text, capsys):
                      "--ph", "7.4"]) == 0
     assert "fix: 1 units (bytes)" in capsys.readouterr().out
     assert not layout.pdbfixer.exists()
-
 
 @pytest.mark.regression
 def test_regression_1q4k_B_matches_2023(tmp_path):
@@ -352,7 +329,6 @@ def test_regression_1q4k_B_matches_2023(tmp_path):
     for k in moved:
         assert sum((a - b) ** 2 for a, b in zip(new[k], old[k])) ** 0.5 < 0.5
 
-
 # --- reproducibility -------------------------------------------------------------------
 
 def _fix_bytes(tmp_dir, text):
@@ -365,10 +341,8 @@ def _fix_bytes(tmp_dir, text):
     assert b"CREATED WITH OPENMM" not in out
     return out
 
-
 def _fix_bytes_in_child(tmp_dir, text):   # module level: picklable for the spawn pool
     return _fix_bytes(tmp_dir, text)
-
 
 def _drop_residue_atoms(text):
     """Strip the side chain of one residue so pdbfixer also has missing atoms to add."""
@@ -381,14 +355,12 @@ def _drop_residue_atoms(text):
     assert seen, "fixture has no residue 5 side chain"
     return "".join(out)
 
-
 def test_fix_one_is_reproducible_in_process(tmp_path, small_pdb_text):
     text = _drop_residue_atoms(small_pdb_text)
     a = _fix_bytes(tmp_path / "a", text)
     b = _fix_bytes(tmp_path / "b", text)
     assert any(l[76:78].strip() == "H" for l in a.decode().splitlines() if l.startswith("ATOM"))
     assert a == b
-
 
 def test_fix_one_is_reproducible_across_processes(tmp_path, small_pdb_text):
     from concurrent.futures import ProcessPoolExecutor
@@ -401,7 +373,6 @@ def test_fix_one_is_reproducible_across_processes(tmp_path, small_pdb_text):
         b = ex2.submit(_fix_bytes_in_child, tmp_path / "b", text).result()
     assert a == b
 
-
 def test_fix_one_leaves_global_random_state_alone(tmp_path, small_pdb_text):
     import random
 
@@ -410,3 +381,27 @@ def test_fix_one_leaves_global_random_state_alone(tmp_path, small_pdb_text):
     random.seed(123)
     _fix_bytes(tmp_path, small_pdb_text)
     assert [random.random() for _ in range(3)] == expected
+
+def test_fix_one_is_deterministic_on_a_structure_with_heterogens(tmp_path):
+    """Two fix_one calls on one input, in one process, must be byte-identical.
+
+    4y32_C is a real 6.5 KB net1 chain with 32 HETATM records (13 HOH, 10 SEP, 9 49F) and
+    missing atoms. The synthetic `HETS` fixture does NOT reproduce this -- it is too small
+    to make the placement diverge -- which is why a real structure is vendored here.
+
+    Until 2026-11-04 removeHeterogens ran LAST, so those heterogens were still in the
+    system while addMissingAtoms and addMissingHydrogens placed atoms, and the result was
+    not deterministic. Measured on net1: two production runs on byte-identical input
+    differed in 901 of 2395 heavy atoms of 8j6s_L, and 387 of 3479 models (11%) came out
+    with a different selected-pocket set -- silently moving the panel. Pocket P_N labels
+    are positional, so a given label was a different cavity between runs."""
+    src_dir = tmp_path / "02_structures" / "P10636"
+    src_dir.mkdir(parents=True)
+    src = src_dir / "4y32_C.pdb"
+    src.write_bytes((FIX / "4y32_C.pdb").read_bytes())
+    out = []
+    for i in range(2):
+        d = tmp_path / f"r{i}"
+        fix.fix_one(src, tmp_path / "02_structures", d, 7.0)
+        out.append((d / "P10636" / "4y32_C.pdb").read_bytes())
+    assert out[0] == out[1], "fix_one is not deterministic on identical input"

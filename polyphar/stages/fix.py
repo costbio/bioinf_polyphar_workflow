@@ -135,10 +135,21 @@ def fix_one(src, structures_dir, out_dir, ph: float = DEFAULT_PH, token: str = "
         fixer = PDBFixer(filename=str(src), platform=reference_platform())
         with seeded_placement():
             fixer.findMissingResidues()
+            # Heterogens go FIRST, before anything is placed. Removing them last -- as this
+            # did until 2026-11-04 -- left waters, ions and ligands in the system while
+            # addMissingAtoms and addMissingHydrogens ran, and that is NOT DETERMINISTIC:
+            # two back-to-back fix_one calls on one input in one process gave different
+            # coordinates, 901 of 2395 heavy atoms differing on 8j6s_L. Downstream it moved
+            # the panel -- 387 of 3479 models (11%) got a different selected-pocket set, and
+            # pocket P_N labels are positional, so "P_1" was a different cavity between runs.
+            # Removing them first is also pdbfixer's own documented order, and it is the
+            # right chemistry: the docking receptor has no heterogens, so placing hydrogens
+            # against waters that are about to be deleted optimises the H-bond network
+            # against atoms the receptor will never have.
+            fixer.removeHeterogens(keepWater=False)
             fixer.findMissingAtoms()
             fixer.addMissingAtoms(seed=H_SEED)
             fixer.addMissingHydrogens(ph)
-            fixer.removeHeterogens(keepWater=False)
         buf = io.StringIO()
         PDBFile.writeFile(fixer.topology, fixer.positions, buf)
         with os.fdopen(fd, "w") as fh:
