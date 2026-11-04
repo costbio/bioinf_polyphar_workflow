@@ -21,11 +21,16 @@ losing the ssh connection mid-stage would kill it.
     export DOGSITE_BIN=/media/ilayda/Elements/adep_csb/dogsitescorer2/dogsitescorer-2.0.0/dogsite
     export NPROCS=64
     export POLYPHAR=$REPO/bin/polyphar-docker
+    export PATH=$HOME/.local/bin:$PATH      # the colab CLI lives here
 
 Check the tools answer before starting a subtype:
 
     "$DOGSITE_BIN" --version >/dev/null && echo "dogsite ok"
     docker images polyphar        # polyphar:1.1 must exist (1.0 predates rdkit)
+    colab usage                   # Colab auth + the compute-unit balance
+
+If `colab usage` opens an authorization URL, the token has expired: visit it, approve, and
+paste the code back. It expires often enough to catch you mid-week.
 
 **Every command below is run from inside the subtype's run folder** — the wrapper takes the
 run folder from the current directory.
