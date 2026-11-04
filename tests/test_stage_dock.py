@@ -676,10 +676,14 @@ def test_export_skips_recorded_replicates_and_caps_with_max_units(run_folder, tm
     dock.run(layout, _args(replicates=1), Prog())        # r0 of both targets recorded
     bundle = tmp_path / "b"
     out = dock_export.run(layout, _bundle_args(str(bundle), max_units=3), Prog())
-    assert out["units"] == 3 and out["outstanding"] == 4   # r1, r2 of two targets
     got = [(u.unit.label, u.unit.replicate) for u in dock.read_bundle_units(bundle)]
     assert 0 not in {r for _l, r in got}                 # never a recorded draw
-    assert [r for _l, r in got] == [1, 1, 2]             # replicate-major
+    # TARGET-major, and truncated to a whole target: max_units=3 asks for 3 of the 4
+    # outstanding units, but taking 3 would split the second target's replicates across
+    # two sessions -- and therefore possibly across two GPU models.
+    assert [r for _l, r in got] == [1, 2]
+    assert len({l for l, _r in got}) == 1                # one target, both its replicates
+    assert out["units"] == 2 and out["outstanding"] == 4
 
 
 def test_merge_refuses_units_whose_key_is_not_this_runs(run_folder, tmp_path):

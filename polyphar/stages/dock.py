@@ -1887,11 +1887,53 @@ class BundleLayout:
         return self.bundle / "results"
 
 
+def _whole_targets(todo, max_units: int):
+    """The longest prefix of `todo` that is a whole number of targets and fits in
+    `max_units`; if not even one target fits, that one target anyway.
+
+    `todo` is already target-major, so each target's units are contiguous. A target whose
+    replicates straddle two sessions can be drawn on two different GPU models, which is
+    exactly what target-major ordering exists to prevent -- so the cut is made on target
+    boundaries, never mid-target. Exporting nothing when `--max-units` is smaller than one
+    target would look like "no work outstanding" rather than a bad argument, so one whole
+    target goes instead.
+    """
+    from itertools import groupby
+
+    out = []
+    for _label, group in groupby(todo, key=lambda u: u.label):
+        group = list(group)
+        if out and len(out) + len(group) > max_units:
+            break
+        out.extend(group)
+        if len(out) >= max_units:
+            break
+    return out
+
+
 def write_bundle(layout, args, dest, plan: _Plan, prepared: dict, ligands_sdf: Path,
                  max_units: int | None = None) -> list[BundleUnit]:
     """Write the outstanding units and their inputs into `dest`. Returns the units written
-    (at most max_units, in replicate-major order so a lost session costs one draw of many
-    targets rather than every draw of a few).
+    (at most max_units, TARGET-major: every outstanding replicate of one target before the
+    next target's).
+
+    Why target-major and not replicate-major. The replicates exist to measure the ENGINE's
+    non-determinism -- 138-142 of 145 ligands move between two identical same-seed Uni-Dock
+    runs. A session gets whatever GPU the provider has free (Colab hands out L4, A100, T4 or
+    G4), so replicate-major ordering spreads one target's draws across sessions and
+    therefore across GPU models, and any systematic per-model score difference lands inside
+    the replicate spread, where it is indistinguishable from engine jitter. Keeping a
+    target's replicates together keeps that spread measuring what it is for. `dock-merge`
+    already counts `targets_spanning_gpu_models`, so the contamination is detectable --
+    this makes it avoidable.
+
+    What it costs: a dropped session now loses whole targets rather than one draw of many.
+    That is bounded and cheap to redo (replicates x ~6 GPU-minutes per target), and the
+    next export recomputes what is outstanding either way.
+
+    `max_units` is truncated DOWN to a whole number of targets for the same reason, so a
+    target never straddles two sessions -- except when it is smaller than one target's
+    worth, where one whole target is exported instead of nothing.
 
     Exporting touches nothing in the run folder: a record that is going to be replaced is
     discarded by whoever actually replaces it (`dock-merge`, or `dock` itself), not here,
@@ -1902,9 +1944,9 @@ def write_bundle(layout, args, dest, plan: _Plan, prepared: dict, ligands_sdf: P
     (dest / "receptors").mkdir(parents=True, exist_ok=True)
     (dest / "results").mkdir(parents=True, exist_ok=True)
     todo = [u for u, _state in plan.outstanding(layout) if u.label in prepared]
-    todo.sort(key=lambda u: (u.replicate, u.label))
+    todo.sort(key=lambda u: (u.label, u.replicate))
     if max_units is not None:
-        todo = todo[:max_units]
+        todo = _whole_targets(todo, int(max_units))
     out = []
     for u in todo:
         pdbqt, center, size = prepared[u.label]
