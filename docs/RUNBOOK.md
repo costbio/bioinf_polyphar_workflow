@@ -59,7 +59,9 @@ than failing 2,083 records one at a time:
 
 ## 1. The run folders
 
-Inputs are already in place (workbook + ligand library per folder).
+Inputs are already in place (workbook + ligand library per folder), and as of 2026-11-04
+every one of the seven folders also has `00_ids/` built. HCC net1 is complete through
+`ligands`; the other six have not run `uniprot` yet.
 
 | Subtype | Run folder | `ids` arguments |
 |---|---|---|
@@ -173,15 +175,25 @@ are also printed and pushed to Pushover.
 
 Check these before letting a subtype run on — a wrong count here invalidates everything after.
 
-| Subtype | Workbook rows | Expected after `ids` |
-|---|---|---|
-| net1 | 2060 | **461 reviewed rows → 459 unique accessions** (two accessions appear twice) |
-| net2 | 652 | 156 |
-| net3 | 869 | 197 |
-| Cluster1 | 78 | 78 rows |
-| Cluster2 | 88 | 88 rows |
-| Cluster3 | 132 | 132 rows |
-| Cluster4 | 21 | 21 rows |
+| Subtype | Workbook rows | `ids` → `ids.txt` lines | `uniprot` → `uniprot.csv` rows |
+|---|---|---|---|
+| net1 | 2060 | **459** (461 reviewed rows, two accessions appear twice) | 459 |
+| net2 | 652 | 156 | 156 |
+| net3 | 869 | 197 | 197 |
+| Cluster1 | 78 | 131 | **78** |
+| Cluster2 | 88 | 146 | **88** |
+| Cluster3 | 132 | 217 | **132** |
+| Cluster4 | 21 | 33 | **21** |
+
+All seven were materialised on 2026-11-04 and match this table.
+
+**The AD counts do not narrow at `ids`, and that is not a bug.** `ids` keeps *every*
+accession in a multi-accession `UNIPROTID` cell and records those rows in `00_ids/rows.tsv`
+(`row`, `gene`, `ids`, `solo`). The collapse to one protein per workbook row happens in
+`uniprot`, via `collapse_rows`, which drops the losers into `01_uniprot/excluded.tsv`.
+So Cluster1 legitimately reads 78 rows and writes 131 lines: 41 single-accession rows plus
+37 multi-accession rows, which collapse back to 41 + 37 = 78. Seeing 131 after `ids` and
+concluding the gene matching failed is a mistake — check `uniprot.csv`, not `ids.txt`.
 
 **net1 is the whole point of the rerun.** The 2023 `net1UniprotID.txt` was the *net3* tab
 (197 IDs). If `00_ids/ids.txt` comes out at 197, the wrong sheet was read — stop and fix it.
@@ -194,6 +206,39 @@ AD Cluster3 should now contain **P85299 (PRR5)**. The 2023 list had a truncated 
 
 An AD row whose accessions cannot be resolved to one protein by gene name **stops the stage**
 on purpose. Bring the row here rather than editing the workbook.
+
+### Reference results: HCC net1, 2026-11-04
+
+The first full v2 subtype, as a sanity check for the other six. Run on POSEIDON at
+`polyphar:1.1` / commit `a0289cd`.
+
+| Stage | Counts | Failed |
+|---|---|---|
+| `ids` | 459 accessions from 2060 rows | 0 |
+| `uniprot` | 459 kept | 0 |
+| `structures` | 3596 downloads | 32 |
+| `fix` | 3132 chains | 0 |
+| `pockets` | 3548 models, 88846 pockets, **11606 selected**, 711 outside_segment | 13 |
+| `annotate` | 11606 annotated (3589 AlphaFold / 8017 experimental), 1127 grid_illegal | 0 |
+| `select` | 2371 eligible pockets, **panel 269 proteins / 479 targets** (172 AF / 97 exp) | 0 |
+| `similarity` | 2802528 pairs → 2754032 rows | 3 |
+| `ligands` | 2083 records → **1960 kept**, 123 excluded | 0 |
+
+Two things in that table are worth knowing before reading your own:
+
+- **`grid_illegal=1127` at `annotate` is not a docking risk.** Those are pockets whose
+  Uni-Dock grid at 0.375 Å exceeds the engine's limits (128/axis, 531441 total), and
+  Uni-Dock *exits* on a violation. `panel.py` rejects them with reason `grid`, and the
+  funnel confirms it: `tm 2590 → grid 2385`. Verified on this run — of 2371 eligible
+  pockets and 479 final targets, **zero** are grid-illegal, by the stored flag and by
+  recomputing the grid independently from the box dimensions. Only 205 are dropped at the
+  `grid` step because the `volume` filter (11606 → 4682) already removed most oversized
+  clefts first.
+- **The 3 `similarity` failures are PocketMatch heap corruption**, not clean rejections:
+  `cabbage-core` died with SIGABRT (`malloc(): corrupted top size`, and a glibc malloc
+  assertion) on `P03952/6t7p_A` and two `P07288/2zch_P` pockets. Three of 2368 pockets does
+  not move the network, but memory corruption in the comparison binary is worth
+  understanding rather than filing as "3 failed".
 
 ## 4. Things that will bite
 
@@ -217,9 +262,19 @@ on purpose. Bring the row here rather than editing the workbook.
   (`9r1w_AAA_res_P_1_1.pdb`), because the 2023 DoGSiteScorer 2 scheme exceeded PocketMatch's
   32-character limit on current PDB entries with multi-character chain IDs. Pocket IDs and
   drugScores are unchanged.
-- **If `uniprot` reports "not reachable"**, check the endpoint before the network: UniProt's
-  `/stream` endpoint was returning intermittent HTTP 500s on 2026-11-02, which is why the
-  stage uses `/uniprotkb/search` with pagination.
+- **If a stage reports UniProt "not reachable", check the endpoint before the network.**
+  UniProt's REST service has twice returned HTTP 500 for a request shape that used to work,
+  while the service as a whole stayed up:
+  - 2026-11-02: intermittent 500s from `/stream`, which is why `uniprot` uses
+    `/uniprotkb/search` with pagination.
+  - 2026-11-04: `/uniprotkb/search` began rejecting `accession:A OR accession:B ...` queries
+    of **20 terms or more** (10 still returned 200, 20/40/80 did not), which killed `select`
+    mid-run on net1. `tmfetch` now uses `/uniprotkb/accessions`, the endpoint meant for
+    fetching a known list, which takes them comma-separated and is documented to 100 per call.
+
+  The tell in both cases is that a free-text query (`?query=insulin`) returns 200 while the
+  stage's own request 500s. That means the request shape, not the service — retrying will
+  never succeed. `tests/test_tmfetch.py` pins the accessions endpoint so it cannot regress.
 
 ## 5. When something fails
 
