@@ -75,6 +75,24 @@ folder and merging re-reads them there.
 version, so a worker running different code produces draws `dock-merge` cannot vouch for.
 `setup.py` refuses to run without it.
 
+## What you see while it runs
+
+Every poll prints a line, including one that fails:
+
+    20:03:43  STATE=RUNNING pid=2747  done=12/198  result_files=12
+               16:42:00 dock-worker: 23520/388080 units (6%)
+    20:05:43  poll FAILED (attempt 1): websocket: Connection was lost.
+               the worker is detached, so this is the connection, not the job
+
+Silence means the wrapper itself has died — nothing else. Before 2026-11-04 a failed poll
+was swallowed and the terminal showed nothing for 14 minutes while the worker was running
+normally, which is indistinguishable from a hang.
+
+Pushover comes from both ends. The worker notifies its own start, 5/25/50/75% and finish
+from the VM. The wrapper notifies the phases the worker cannot, because it does not exist
+during them: export, upload, launch, worker finished, merged, and any failure (priority 1,
+including six consecutive poll failures).
+
 ## Watch the unit balance
 
 Colab Pro+ had 1,598.9 units at the end of the validation session, against an estimated

@@ -16,7 +16,7 @@
 #   POLYPHAR_HOME      calibration / pushover.env dir (default: ~/.polyphar)
 #   POLYPHAR_VERSION   image tag, passed to polyphar-docker
 #   POLYPHAR_REPO      checkout holding bin/colab (default: this script's repo)
-#   COLAB_POLL_SECONDS seconds between progress polls (default 300)
+#   COLAB_POLL_SECONDS seconds between progress polls (default 120)
 #   POLYPHAR_MAX_UNITS units per session (default 200, ~20 h); --max-units wins
 #   ALLOW_SILENT=1     start the worker even without Pushover credentials
 #
@@ -28,7 +28,7 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo="${POLYPHAR_REPO:-$(cd "$here/.." && pwd)}"
 run_dir="$(realpath "${POLYPHAR_RUN_DIR:-$PWD}")"
 home_dir="$(realpath "${POLYPHAR_HOME:-$HOME/.polyphar}")"
-poll_s="${COLAB_POLL_SECONDS:-300}"
+poll_s="${COLAB_POLL_SECONDS:-120}"
 
 # 200 units is about 20 hours at ~6 GPU-minutes a unit: a session long enough to be worth
 # the setup, short enough that losing it to a dropped VM is not a disaster.
@@ -47,7 +47,23 @@ while [ $# -gt 0 ]; do
 done
 
 say() { printf '\n== %s\n' "$*"; }
-die() { printf 'polyphar-colab: %s\n' "$*" >&2; exit 1; }
+note() { printf '%s  %s\n' "$(date +%H:%M:%S)" "$*"; }
+
+# Pushover from the HOST, for the phases of the round trip the worker cannot report:
+# the worker only exists between launch and finish, so upload, merge and any failure
+# before or after it would otherwise reach nobody.
+push() {
+    local title="$1" msg="$2" prio="${3:-0}"
+    [ -f "$home_dir/pushover.env" ] || return 0
+    local tok usr
+    tok="$(sed -n 's/^PUSHOVER_APP_TOKEN=//p' "$home_dir/pushover.env" | tr -d "'\"" )"
+    usr="$(sed -n 's/^PUSHOVER_USER_KEY=//p' "$home_dir/pushover.env" | tr -d "'\"" )"
+    [ -n "$tok" ] && [ -n "$usr" ] || return 0
+    curl -s --max-time 20 -F "token=$tok" -F "user=$usr" -F "priority=$prio" \
+         -F "title=[$(basename "$run_dir")] $title" -F "message=$msg" \
+         https://api.pushover.net/1/messages.json >/dev/null 2>&1 || true
+}
+die() { printf 'polyphar-colab: %s\n' "$*" >&2; push "dock failed" "$*" 1; exit 1; }
 
 command -v colab >/dev/null 2>&1 || die "the colab CLI is not on PATH (pip install google-colab-cli)"
 [ -d "$run_dir" ] || die "run dir $run_dir does not exist"
@@ -98,6 +114,7 @@ bundle="$export_root/$name"
 n_units="$(( $(wc -l < "$bundle/units.tsv") - 1 ))"
 [ "$n_units" -gt 0 ] || { say "nothing outstanding; removing the empty bundle"; rm -rf "$bundle"; exit 0; }
 say "$n_units unit(s) to work"
+push "dock: exported $n_units units" "Bundle $name ready; uploading to Colab ($gpu)."
 
 tgz="$(mktemp -t polyphar-bundle-XXXXXX.tgz)"
 tar czf "$tgz" -C "$export_root" "$name"
@@ -122,21 +139,48 @@ fi
 say "installing the engine (pinned to $commit)"
 colab exec -f "$repo/bin/colab/setup.py" --env "POLYPHAR_COMMIT=$commit" --timeout 3600 -s "$session"
 
+push "dock: worker starting" "$n_units units on a $gpu. Progress every ${poll_s}s."
 say "launching the detached worker"
 colab exec -f "$repo/bin/colab/launch.py" --timeout 600 -s "$session" \
     ${ALLOW_SILENT:+--env "ALLOW_SILENT=$ALLOW_SILENT"}
 
 say "polling every ${poll_s}s (the poll is also the keep-alive)"
+# Every poll prints a line, including a failed one. Swallowing the failure and grepping
+# for ^STATE= made a dropped websocket look exactly like a quiet worker: on 2026-11-04 a
+# healthy run showed nothing in the terminal for 14 minutes while two polls silently
+# failed. Silence must mean one thing, so it is now reserved for "the wrapper is dead".
+fails=0
 while true; do
     sleep "$poll_s"
-    out="$(colab exec -f "$repo/bin/colab/poll.py" --timeout 120 -s "$session" 2>&1 || true)"
-    printf '%s\n' "$out" | grep -E '^STATE=' || true
+    if out="$(colab exec -f "$repo/bin/colab/poll.py" --timeout 120 -s "$session" 2>&1)"; then
+        line="$(printf '%s\n' "$out" | grep -m1 -E '^STATE=' || true)"
+        if [ -n "$line" ]; then
+            fails=0
+            note "$line"
+            # the worker's own progress, so the terminal shows ligands as well as units
+            printf '%s\n' "$out" | grep -m1 -E 'dock-worker: [0-9]+/[0-9]+ units' \
+                | sed 's/^/           /' || true
+        else
+            fails=$((fails + 1))
+            note "poll returned no STATE line (attempt $fails); worker is detached and unaffected"
+        fi
+    else
+        fails=$((fails + 1))
+        note "poll FAILED (attempt $fails): ${out##*$'\n'}"
+        note "           the worker is detached, so this is the connection, not the job"
+        if [ "$fails" = 6 ]; then
+            push "dock: cannot reach the GPU host" \
+                 "6 consecutive polls failed. The worker may still be running; check with
+colab download /content/worker.log /tmp/w.log -s $session" 1
+        fi
+    fi
     case "$out" in
         *STATE=GONE*|*STATE=NO-PIDFILE*) break ;;
     esac
 done
 
 # --- 4. bring it home -----------------------------------------------------------------
+push "dock: worker finished" "Packing and bringing results home."
 say "packing results"
 colab exec -f "$repo/bin/colab/pack.py" --timeout 600 -s "$session"
 res="$(mktemp -t polyphar-results-XXXXXX.tgz)"
@@ -161,4 +205,5 @@ esac
 [ -n "$keep" ] || colab stop -s "$session" || true
 rm -f "$tgz" "$res"
 
+push "dock: merged" "Bundle $name merged into the run folder. Re-run \`polyphar dock\` until nothing is outstanding."
 say "done: bundle $rel merged. Re-run until dock reports nothing outstanding."
