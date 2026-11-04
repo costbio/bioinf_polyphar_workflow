@@ -47,6 +47,10 @@ STAGES = {
                     "run a dock bundle's units where the engine is (no run folder needed)"),
     "dock-merge": ("polyphar.stages.dock_merge",
                    "fold a worked dock bundle's results into the run folder"),
+    "control": ("polyphar.stages.control",
+                "positive control: redock the co-crystal ligands (self-rank, "
+                "redocking RMSD, library percentile at home) and write "
+                "inputs/positive_control.json"),
     "stats": ("polyphar.stages.stats",
               "the cumulative weak-binding test (percentiles, M, permutation)"),
     "run": ("polyphar.stages.run", "run all stages in order"),

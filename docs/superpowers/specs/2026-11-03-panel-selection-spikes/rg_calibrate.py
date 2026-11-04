@@ -9,6 +9,25 @@ very dataset and set the cutoff to cover a stated fraction of them.
 
 Important: this is computed over ALL selected experimental pockets, BEFORE any Rg
 filtering, or we would be conditioning on the filter being calibrated.
+
+KNOWN DEFECTS (confirmed on real data, 2026-11-04). Both make a pocket read as UNOCCUPIED
+when its chain file cannot be found, because `atoms()` swallows OSError:
+
+  1. `stem = fn.split("_res_P")[0]` is wrong for a CHIMERIC chain, whose pocket file is
+     `<accession>_<stem>_res_P_1.pdb`: the split yields `<accession>_<stem>` and
+     `02_structures/<acc>/<accession>_<stem>.pdb` does not exist.
+  2. DoGSite3 spells the residue file `<out>_P_1_res.pdb`, which contains no `_res_P`, so
+     the split returns the whole filename. Under DoGSite3, EVERY pocket reads as
+     unoccupied.
+
+So the 687 labelled pockets this script reports are a LOWER BOUND, and the 7,318 "no
+ligand" pockets contain an unknown number of occupied ones. Occupied pockets have the
+larger median Rg, so the contamination raises the "no ligand" median and NARROWS the gap,
+biasing the comparison in the direction that supports the conclusion.
+
+`polyphar control` does not reuse this path: it derives the extracted chain from the
+target's own `Receptor_Path`, which is spelling-independent and has neither defect. Only
+the label CRITERION (CONTACT, MIN_FRAC, MIN_HEAVY, MAX_HEAVY, SKIP) is shared.
 """
 import csv, math, os, sys, statistics, collections
 from pathlib import Path

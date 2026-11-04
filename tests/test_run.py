@@ -16,6 +16,12 @@ from polyphar.stages import run as run_mod
 # imported, not duplicated: a local copy silently stops stubbing a stage the moment a
 # new one is added to the pipeline
 from polyphar.benchmark import ORDER, STAGE_DIRS as DIRS  # noqa: E402
+from polyphar.stages.run import DEFAULT_TO_STAGE  # noqa: E402
+
+# what `polyphar run` does with no --from/--to: ids .. dock. Derived from ORDER and the
+# stage `--to` defaults to, so inserting a stage after dock does not silently change what
+# this test claims the default range is.
+DEFAULT_RANGE = ORDER[:ORDER.index(DEFAULT_TO_STAGE) + 1]
 # the single source of truth: zipping ORDER against a hardcoded tuple silently
 # shifts every mapping when a stage is added
 
@@ -110,10 +116,11 @@ def test_runs_all_stages_in_order_through_the_gate(fake, capsys):
     (fake.run / "inputs").mkdir()
     (fake.run / "inputs" / "ids.txt").write_text("P25815\n")
     assert _main(fake, "--txt", "inputs/ids.txt") == 0
-    # --to defaults to `dock`, not ORDER[-1]: `stats` needs a guideline positive set
-    assert _runs(fake.events) == list(ORDER[:-1])
+    # --to defaults to `dock`, not ORDER[-1]: `stats` needs a guideline positive set and
+    # `control` a docking run of its own, so neither is in the default range
+    assert _runs(fake.events) == list(DEFAULT_RANGE)
     # per stage: units -> "<stage> starting" notification -> run (the single-stage gate)
-    for name in ORDER[:-1]:
+    for name in DEFAULT_RANGE:
         i_units = fake.events.index(("units", name))
         i_start = fake.events.index(("notify", f"{name} starting"))
         i_run = fake.events.index(("run", name))
@@ -125,7 +132,7 @@ def test_runs_all_stages_in_order_through_the_gate(fake, capsys):
     # final summary: printed and notified, one row per stage
     title, msg, prio = fake.notes[-1]
     assert title.startswith("run done") and prio == 0
-    for name in ORDER[:-1]:
+    for name in DEFAULT_RANGE:
         assert name in msg
     assert "run summary" in out
     assert (fake.run / "logs" / "run.log").read_text().count("run summary") == 1

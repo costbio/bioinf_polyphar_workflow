@@ -92,7 +92,7 @@ Outputs per target, label = f"{Protein}_{Pocket}":
   ligand; the observation summarised is that ligand's BEST score in each replicate.
 * 07_docking/<label>/poses.sdf -- replicate 0's poses, under the default `--poses first`
   (`all` adds poses_r<i>.sdf, `none` writes none). Replicate 0's poses are what the
-  pose-in-pocket validation reads.
+  control stage's geometric readouts read.
 
 The raw per-replicate records (<label>/replicates/r<i>.sdf) are kept: they cost little,
 they let any other summary be recomputed without re-docking, and they are the only way to
@@ -172,9 +172,11 @@ DEFAULT_ENGINE = ENGINE_SMINA   # the single-host / development path
 
 POSES_NONE, POSES_FIRST, POSES_ALL = "none", "first", "all"
 POSE_POLICIES = (POSES_NONE, POSES_FIRST, POSES_ALL)
-# Replicate 0's poses feed the pose-in-pocket validation -- whether the best-scoring pose
-# actually sits in the selected cavity, the assumption the pocket-similarity premise rests
-# on. Three replicates x 482 targets x 1,960 ligands of poses is far more than useful, so
+# Replicate 0's poses feed the control stage's redocking RMSD (the gate) and its
+# pose-in-pocket diagnostic -- whether the best-scoring pose is the one the
+# crystallographer saw, and whether it sits in the selected cavity at all, the assumption
+# the pocket-similarity premise rests on. Three replicates x 482 targets x 1,960 ligands
+# of poses is far more than useful, so
 # only r0's are kept by default.
 DEFAULT_POSES = POSES_FIRST
 
@@ -530,17 +532,17 @@ def _positive_int(value: str) -> int:
     return n
 
 
-def add_arguments(parser) -> None:
-    """Options shared by `dock`, `dock-export`, `dock-worker` and `dock-merge`: they all
-    have to agree on what a unit is, or the keys they compute would not match."""
-    parser.add_argument("--library", default=DEFAULT_LIBRARY,
-                        help=f"ligand SDF, relative to the run folder (default {DEFAULT_LIBRARY})")
+def add_engine_options(parser) -> None:
+    """The engine's own options, with no ligand set attached to them.
+
+    Split out of `add_arguments` so `polyphar control` -- which runs the SAME engine over
+    its OWN ligand set (the co-crystal ligands) and its own replicate count -- can offer
+    them with byte-identical argparse signatures. `polyphar run` merges the stages'
+    options and REFUSES two stages that define one option differently, so sharing the
+    definition rather than copying it is what keeps `run` working."""
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED,
                         help=f"BASE seed; replicate i runs with base + i and records it "
                              f"(provenance, not reproducibility) (default {DEFAULT_SEED})")
-    parser.add_argument("--replicates", type=_positive_int, default=DEFAULT_REPLICATES,
-                        help=f"independent draws per target (default {DEFAULT_REPLICATES}); "
-                             f"raising it adds units, it never re-runs existing ones")
     parser.add_argument("--threads-per-job", type=_positive_int, default=DEFAULT_TPJ,
                         help=f"engine threads per unit; nprocs // this units run at once "
                              f"(default {DEFAULT_TPJ})")
@@ -561,6 +563,17 @@ def add_arguments(parser) -> None:
                         default=unidock.DEFAULT_BATCH_SIZE,
                         help=f"Uni-Dock ligands per GPU batch (default "
                              f"{unidock.DEFAULT_BATCH_SIZE}); ignored by --engine smina")
+
+
+def add_arguments(parser) -> None:
+    """Options shared by `dock`, `dock-export`, `dock-worker` and `dock-merge`: they all
+    have to agree on what a unit is, or the keys they compute would not match."""
+    add_engine_options(parser)
+    parser.add_argument("--library", default=DEFAULT_LIBRARY,
+                        help=f"ligand SDF, relative to the run folder (default {DEFAULT_LIBRARY})")
+    parser.add_argument("--replicates", type=_positive_int, default=DEFAULT_REPLICATES,
+                        help=f"independent draws per target (default {DEFAULT_REPLICATES}); "
+                             f"raising it adds units, it never re-runs existing ones")
     parser.add_argument("--poses", choices=POSE_POLICIES, default=DEFAULT_POSES,
                         help=f"which replicates' poses to write out (default "
                              f"{DEFAULT_POSES}: replicate 0 only, which is what the "
@@ -701,10 +714,19 @@ def _warn_raw_library(progress, why: str, raw: Path) -> None:
 
 def _library_is_prepared(layout, args, lib: Path) -> bool:
     """Whether `lib` is the `ligands` stage's prepared library (for dock's manifest, so
-    Methods can say which library produced the scores without path archaeology)."""
+    Methods can say which library produced the scores without path archaeology).
+
+    False -- not an error -- when the source library named by --library is not there at
+    all: a caller that supplied its own library (`run(..., library=...)`, `polyphar
+    control`) need not have e-Drug3D in the run folder, and the honest answer for a
+    hand-supplied library is "no, the `ligands` stage did not prepare this"."""
     from polyphar.stages.ligands import prepared_library
 
-    prepared = prepared_library(layout, _raw_library_path(layout, args, copy=False))
+    try:
+        source = _raw_library_path(layout, args, copy=False)
+    except FileNotFoundError:
+        return False
+    prepared = prepared_library(layout, source)
     return prepared is not None and Path(prepared) == Path(lib)
 
 
@@ -1499,13 +1521,19 @@ def _recorded_engine(layout) -> str | None:
     return str(engine) if engine and engine != "unavailable" else None
 
 
-def units(layout, args):
+def units(layout, args, library: Path | None = None):
     """Ligands still to draw: n_ligands for every (target, replicate) that is not done
     (0 when the stage finished on exactly these inputs). A done replicate is never counted:
-    it is not re-run."""
+    it is not re-run.
+
+    `library`, when given, is docked AS GIVEN: `_library_path` is not consulted, so the
+    `ligands` stage's prepared e-Drug3D is never substituted for it and no "docking the
+    UNPREPARED library" warning is raised. It is for a caller that supplies its own ligand
+    set -- `polyphar control`, which redocks co-crystal ligands -- and writes elsewhere
+    (see polyphar.stages.control.ControlLayout)."""
     from polyphar.common import WorkUnits
 
-    lib = _library_path(layout, args, copy=False)
+    lib = Path(library) if library is not None else _library_path(layout, args, copy=False)
     engine = engine_version(layout, args)
     plan = _plan(layout, args, lib, engine)
     policy = str(getattr(args, "poses", None) or DEFAULT_POSES)
@@ -1580,7 +1608,8 @@ def plan_discards(layout, plan: _Plan) -> list[tuple[Unit, str | None]]:
 
 
 def run(layout, args, progress, execute: bool = True, discard_baseline: int | None = None,
-        extra_counts: dict | None = None, extra_manifest: dict | None = None) -> dict:
+        extra_counts: dict | None = None, extra_manifest: dict | None = None,
+        library: Path | None = None) -> dict:
     """Plan, run the outstanding units (unless execute is False: `dock-merge` only folds
     in results produced elsewhere) and merge.
 
@@ -1588,11 +1617,14 @@ def run(layout, args, progress, execute: bool = True, discard_baseline: int | No
     against; `dock-merge` takes it BEFORE it imports (importing is what discards there),
     so the merge's own discards are not under-reported as 0. `extra_counts` /
     `extra_manifest` let `dock-merge` record that a merge happened -- which bundle, how
-    many units, which engine actually drew them -- in the manifest this function writes."""
+    many units, which engine actually drew them -- in the manifest this function writes.
+
+    `library` overrides the library to dock; see `units`."""
     from polyphar.common import append_failure, sha256_file, write_manifest
     from polyphar.pool import run_pool as _run_pool
 
-    lib = _library_path(layout, args, progress=progress)
+    lib = Path(library) if library is not None else _library_path(layout, args,
+                                                                  progress=progress)
     if execute:
         # fail fast and with guidance, before any planning or receptor preparation: a
         # GPU-less host cannot run `--engine unidock` at all.

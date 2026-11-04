@@ -57,6 +57,21 @@ co-crystallised drug-like ligand:
 |---|---|---|
 | median Rg | **10.48** | 7.34 |
 
+> **Correction (2026-11-04): 687 is a LOWER BOUND, and the n=7,318 column is contaminated.**
+> `rg_calibrate.py` derives the extracted chain as
+> `02_structures/<acc>/<pocket filename>.split("_res_P")[0].pdb`. Two confirmed defects:
+> a **chimeric** chain's pocket file is `<acc>_<stem>_res_P_1.pdb`, so the split yields
+> `<acc>_<stem>` and the derived path does not exist; and **DoGSite3** spells its residue
+> file `<out>_P_1_res.pdb`, which contains no `_res_P` at all, so the split returns the
+> whole filename — under DoGSite3 **every pocket would read as unoccupied**. `atoms()`
+> swallows `OSError`, so in both cases a missing file reads as "no ligand" rather than as
+> an error. An unknown number of ligand-occupied pockets are therefore misfiled into the
+> right-hand column. Occupied pockets have the **larger** median Rg, so the contamination
+> pushes the "no ligand" median **up**, i.e. it **narrows** the gap this table reports and
+> biases the comparison **in the direction that supports the conclusion**, by an unmeasured
+> amount. The conclusion (`Rg <= 8.5` anti-enriches) survives the direction of the bias,
+> but the 10.48 / 7.34 figures must not be quoted as measured values.
+
 `Rg <= 8.5` kept **8%** of pockets known to bind a drug and 69% of the rest —
 **anti-enriching roughly eightfold**. Real binding sites have *large* lining-residue
 envelopes; a shallow surface dent has a small one. Covering 90% of ligand-bound pockets

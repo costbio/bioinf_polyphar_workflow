@@ -86,6 +86,13 @@ BENCH_STAGES = ("uniprot", "structures", "fix", "pockets", "similarity", "dock")
 # only (measured on net1: 1,367 of 11,599). Pairs scale as n^2, so a stale value
 # makes the similarity ETA wrong quadratically. The real count comes from `select`.
 ELIGIBLE_FRACTION = 0.118
+# Share of panel targets expected to carry a co-crystal ligand, for the `control` stage's
+# pre-run estimate only. ~37% of the panel is an experimental chain, and the MEASURED label
+# rate on panel-style pockets is 7 of 52 = 13.5%, so 0.37 x 0.135 = 0.05 -- not the 0.18
+# this was set to from rg_calibrate.py's 687, which counts labelled pockets over ALL 8,005
+# experimental net1 pockets rather than over the panel's own targets. On a 482-target panel
+# that is about 24 ligands, not 87. The real count comes from the stage's own labelling.
+COCRYSTAL_FRACTION = 0.05
 HOST_CALIBRATED = ("host-calibrated: DoGSite3 / DoGSiteScorer runs on the host only; calibrate "
                    "with bin/polyphar-dogsite-worker --benchmark --tool <tool> "
                    "(bin/polyphar-docker does it)")
@@ -351,12 +358,12 @@ def run_benchmark(stages, calib, log=print) -> dict:
 # of magnitude cheaper. The stage directory numbers are left as they are — renaming them
 # would invalidate every existing run folder for no gain.
 ORDER = ("ids", "uniprot", "structures", "fix", "pockets", "annotate", "select",
-         "similarity", "ligands", "dock", "stats")
+         "similarity", "ligands", "dock", "control", "stats")
 STAGE_DIRS = {"ids": "00_ids", "uniprot": "01_uniprot", "structures": "02_structures",
               "fix": "03_pdbfixer", "pockets": "04_pockets",
               "annotate": "04_pockets/annotation", "select": "06_targets",
               "similarity": "05_similarity", "ligands": "07_docking/library",
-              "dock": "07_docking", "stats": "08_stats"}
+              "dock": "07_docking", "control": "08_control", "stats": "08_stats"}
 
 
 def completed(layout) -> list[str]:
@@ -508,6 +515,16 @@ def projected_units(stage: str, s: dict) -> WorkUnits | None:
         # the raw count over-projects dock by that much.
         return WorkUnits(round(s["targets"] * s.get("ligands_kept", s["ligands"])),
                          "ligands")
+    if stage == "control":
+        # the co-crystal ligands of the panel's experimental pockets, docked against the
+        # whole panel. The ligand count is not knowable before `select` has run, so it is
+        # projected from the experimental share of the panel; `units()` is exact once the
+        # library exists. The unit basis is spelled exactly as dock's ("ligands"), because
+        # control borrows dock's calibration entry and the basis is printed beside it.
+        from polyphar.stages.control import DEFAULT_REPLICATES
+
+        n = round(s["targets"] * s.get("cocrystal_fraction", COCRYSTAL_FRACTION))
+        return WorkUnits(round(s["targets"] * n * DEFAULT_REPLICATES), "ligands")
     if stage == "stats":
         # one read per target summary plus one per replicate record on disk
         from polyphar.stages.dock import DEFAULT_REPLICATES
@@ -574,10 +591,17 @@ def estimate_rows(layout, nprocs: int, calib) -> tuple[list[dict], list[str]]:
         # estimate must not quote a CPU smina rate for a GPU run (or the reverse). The
         # engine here is this host's (bench_engine); `polyphar dock --engine ...` uses the
         # flag, through cli.gate -> dock.calibration_tool.
+        #
+        # `control` is in this branch because it IS dock: it runs dock's units through
+        # dock's engine. Left out, it fell through to `calib.cost("dock", None)` -- tool
+        # None accepts a dock entry measured with ANY engine -- and to the engine-blind
+        # PARALLEL_EFFICIENCY table, so the same table that correctly said dock was
+        # "uncalibrated for unidock (calibration.json has smina)" said control was
+        # "~19 min, calibrated, 8 slots" and halved it again at --nprocs 16.
         stage_tool, tpj, slots = None, 1, None
         if stage == "pockets":
             stage_tool = tool
-        elif stage == "dock":
+        elif stage in ("dock", "control"):
             from polyphar.stages import dock as _dock
 
             engine = bench_engine()

@@ -313,6 +313,21 @@ def test_surface_rows_count_what_the_field_reports():
 
 # --- the positive-control gate --------------------------------------------------------
 
+def _pc(**over):
+    """A complete, passing positive_control.json. The gate now needs the three readouts,
+    their n, and the panel-coverage pair: a partial file is `unknown`, which is the point
+    of the minimum-n and coverage rules, so every test that wants to exercise ONE
+    threshold starts from a passing whole and overrides it."""
+    base = {"median_self_rank_percentile": 0.01,
+            "redock_rmsd_success_fraction": 0.80,
+            "library_top_decile_fraction": 0.80,
+            "pose_in_pocket_fraction": 0.9,
+            "n_redocked": 24, "n_redock_rmsd": 24, "n_library_percentile": 24,
+            "panel_targets_scored": 482, "panel_targets_total": 482}
+    base.update(over)
+    return base
+
+
 def test_a_missing_positive_control_is_not_a_pass(tmp_path):
     verdict, detail = stats.positive_control_verdict(tmp_path / "absent.json")
     assert verdict.startswith("unknown") and "NOT interpretable" in verdict and detail == {}
@@ -320,24 +335,31 @@ def test_a_missing_positive_control_is_not_a_pass(tmp_path):
 
 def test_a_failing_positive_control_makes_the_result_uninterpretable(tmp_path):
     p = tmp_path / "pc.json"
-    p.write_text(json.dumps({"median_self_rank_percentile": 0.4,
-                             "pose_in_pocket_fraction": 0.2}))
+    p.write_text(json.dumps(_pc(median_self_rank_percentile=0.4,
+                                redock_rmsd_success_fraction=0.2,
+                                library_top_decile_fraction=0.1)))
     verdict, _ = stats.positive_control_verdict(p)
     assert verdict.startswith("no:") and "UNINTERPRETABLE" in verdict
-    assert "self-rank" in verdict and "pose-in-pocket" in verdict
+    assert "self-rank" in verdict and "redocking success" in verdict
+    assert "top decile" in verdict
 
 
 def test_a_passing_positive_control_says_yes(tmp_path):
     p = tmp_path / "pc.json"
-    p.write_text(json.dumps({"median_self_rank_percentile": 0.01,
-                             "pose_in_pocket_fraction": 0.9}))
+    p.write_text(json.dumps(_pc()))
     assert stats.positive_control_verdict(p)[0] == "yes"
 
 
 def test_the_preregistered_thresholds_are_the_spec_ones():
     """Every constant the pre-registration pins, pinned here too. Each of these could be
     changed, departing from the pre-registration, with an otherwise green suite."""
-    assert stats.SELF_RANK_MAX == 0.05 and stats.POSE_IN_POCKET_MIN == 0.70
+    assert stats.SELF_RANK_MAX == 0.05
+    assert stats.REDOCK_RMSD_MAX == 2.0 and stats.REDOCK_SUCCESS_MIN == 0.50
+    assert stats.LIBRARY_TOP_DECILE_MIN == 0.50
+    assert (stats.MIN_SELF_RANK_N, stats.MIN_REDOCK_N, stats.MIN_LIBRARY_N) == (10, 10, 10)
+    assert stats.MIN_PANEL_SCORED_FRACTION == 0.98
+    assert not hasattr(stats, "POSE_IN_POCKET_MIN"), (
+        "pose-in-pocket is descriptive now: its null is above the old 0.70 gate")
     assert stats.N_PERMUTATIONS == 10000
     assert stats.SEED == 42
     assert stats.MIN_COVERAGE == 0.98
@@ -353,17 +375,30 @@ def test_the_preregistered_thresholds_are_the_spec_ones():
 
 @pytest.mark.parametrize("data", [
     {"median_self_rank_percentile": -1.0, "pose_in_pocket_fraction": 99.0},
-    {"median_self_rank_percentile": "0.0", "pose_in_pocket_fraction": "1e9"},
-    {"median_self_rank_percentile": False, "pose_in_pocket_fraction": True},
-    {"median_self_rank_percentile": "-Infinity", "pose_in_pocket_fraction": "Infinity"},
-    {"median_self_rank_percentile": "NaN", "pose_in_pocket_fraction": "NaN"},
-    {"median_self_rank_percentile": 1.5, "pose_in_pocket_fraction": 0.9},
+    {"median_self_rank_percentile": "0.0", "redock_rmsd_success_fraction": "1e9"},
+    {"median_self_rank_percentile": False, "redock_rmsd_success_fraction": True},
+    {"median_self_rank_percentile": "-Infinity", "library_top_decile_fraction": "Infinity"},
+    {"median_self_rank_percentile": "NaN", "redock_rmsd_success_fraction": "NaN"},
+    {"median_self_rank_percentile": 1.5},
+    {"library_top_decile_fraction": 1.5},
+    {"redock_rmsd_success_fraction": -0.5},
+    # a readout that is simply absent is not a pass either
+    {"redock_rmsd_success_fraction": None},
+    {"library_top_decile_fraction": None},
+    # ... and neither is one over too few observations, or a half-scored panel
+    {"n_redocked": 9}, {"n_redock_rmsd": 1}, {"n_library_percentile": 0},
+    {"n_redocked": None}, {"panel_targets_scored": 382, "panel_targets_total": 482},
+    {"panel_targets_total": None},
 ])
 def test_an_invalid_positive_control_is_never_a_pass(tmp_path, data):
     """`yes` means the redocking was run and passed. A negative rank, a pose fraction of
     99, a boolean or a non-finite value is not a near-miss: it must land in `unknown`."""
     p = tmp_path / "pc.json"
-    p.write_text(json.dumps(data))
+    full = _pc(**data)
+    for k, v in data.items():
+        if v is None:
+            full.pop(k)
+    p.write_text(json.dumps(full))
     verdict, _ = stats.positive_control_verdict(p)
     assert verdict.startswith("unknown"), verdict
     assert not verdict.startswith("yes")
@@ -372,8 +407,7 @@ def test_an_invalid_positive_control_is_never_a_pass(tmp_path, data):
 def test_the_positive_control_failure_message_does_not_round_the_number_away(tmp_path):
     """0.0500001 fails, and the message must not print it as "0.05 is not within 0.05"."""
     p = tmp_path / "pc.json"
-    p.write_text(json.dumps({"median_self_rank_percentile": 0.0500001,
-                             "pose_in_pocket_fraction": 0.9}))
+    p.write_text(json.dumps(_pc(median_self_rank_percentile=0.0500001)))
     verdict, _ = stats.positive_control_verdict(p)
     assert verdict.startswith("no:") and "0.0500001" in verdict
 
@@ -659,7 +693,8 @@ def test_the_positive_control_verdict_reaches_every_primary_row(tmp_path):
     _positive_set(run)
     (run / "inputs").mkdir(parents=True, exist_ok=True)
     (run / "inputs" / "positive_control.json").write_text(json.dumps(
-        {"median_self_rank_percentile": 0.6, "pose_in_pocket_fraction": 0.1}))
+        _pc(median_self_rank_percentile=0.6, redock_rmsd_success_fraction=0.1,
+            library_top_decile_fraction=0.1)))
     stats.run(RunLayout(run), _args(run), _Progress())
     rows = _rows(run / "08_stats" / stats.RESULTS)
     for r in rows:
@@ -804,11 +839,15 @@ def test_the_preregistration_exists_and_states_what_it_must():
     assert "Holm" in text and "two primary tests" in text.lower()
     assert "HCC-on-HCC > HCC-on-AD" in text                     # direction, stated
     assert "top 5 %" in text or "top 5%" in text
-    assert ">= 70 %" in text or ">= 70%" in text
+    assert ">= 50 % within 2.0" in text          # the redocking-RMSD gate
+    assert "top decile" in text                  # the library-percentile gate
+    assert "minimum n" in text.lower()
     assert "UNINTERPRETABLE" in text
     assert "absent positive control is not a pass" in text.lower()
     # the code's thresholds are the document's
-    assert f"{stats.SELF_RANK_MAX}" in text and f"{stats.POSE_IN_POCKET_MIN}" in text
+    assert f"{stats.SELF_RANK_MAX}" in text
+    assert f"{stats.MIN_PANEL_SCORED_FRACTION:g}" in text
+    assert f"{stats.REDOCK_RMSD_MAX:g}" in text
     # the statistic, exactly, and the pieces that make it what it is
     assert "mid-rank" in text.lower()                            # the tie rule
     assert "max over that protein's targets" in text
@@ -1089,10 +1128,10 @@ def test_the_summary_arms_table_carries_the_interpretable_verdict(tmp_path):
     byte-identical for pass, fail and absent positive control."""
     tables = {}
     for name, pc in (("absent", None),
-                     ("pass", {"median_self_rank_percentile": 0.01,
-                               "pose_in_pocket_fraction": 0.9}),
-                     ("fail", {"median_self_rank_percentile": 0.6,
-                               "pose_in_pocket_fraction": 0.1})):
+                     ("pass", _pc()),
+                     ("fail", _pc(median_self_rank_percentile=0.6,
+                                  redock_rmsd_success_fraction=0.1,
+                                  library_top_decile_fraction=0.1))):
         run, _ = _run_folder(tmp_path / name)
         _positive_set(run)
         if pc is not None:

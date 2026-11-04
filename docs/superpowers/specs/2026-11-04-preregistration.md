@@ -245,13 +245,72 @@ that cannot fail.
 
 The receptors are 63 % AlphaFold models and the engine carries an uncharacterised
 +0.33 kcal/mol offset from smina. Nothing otherwise anchors a score to real binding, so a
-percentile means nothing until the following two readouts are produced by redocking the
-687 co-crystallised, drug-like ligands labelled from the experimental pockets:
+percentile means nothing until the following readouts are produced by redocking the
+co-crystallised ligands labelled from the panel's own experimental pockets.
 
-| readout | **pass threshold** |
-|---|---|
-| **self-recovery rank** — each labelled ligand docked against the whole panel, the rank of its own pocket | **median self-rank within the top 5 %** of the panel |
-| **pose-in-pocket** — replicate 0's best-scoring poses whose centroid lies inside the DoGSiteScorer cavity rather than on a surface patch at the box edge | **>= 70 %** |
+**How many ligands to expect.** An earlier draft of this section said **687**. That is the
+count of labelled pockets over **all 8,005 experimental net1 pockets**, which is not what
+is redocked: only a **panel** pocket can have a self-rank, so the stage labels the
+**panel's targets**. Measured label rate on panel-style pockets is **7 of 52 = 13.5 %**;
+with 482 targets of which about 37 % are experimental chains (~178), the realistic
+expectation is **about 24 labelled ligands**, one per physical ligand (a ligand filling a
+pocket and its nested subpocket is counted once — it was being counted twice, which
+inflated n without adding information). Minimum-n rules below exist because of that.
+
+| readout | **pass threshold** | **minimum n** |
+|---|---|---|
+| **self-recovery rank** — each labelled ligand docked against the whole panel, the rank of its own pocket | **median self-rank within the top 5 %** of the panel | **10 ligands** |
+| **redocking RMSD** — for the self pairs, the symmetry-insensitive RMSD between replicate 0's best pose and the ligand's deposited coordinates, in place, no superposition | **>= 50 % within 2.0 Å** | **10 self pairs** |
+| **library percentile at home** — the co-crystal ligand's score percentile among the production library at its own target, same receptor, box and engine | **>= 50 % in the top decile** (chance 0.10) | **10 ligands** |
+| **panel coverage** — panel targets that produced a score, over the panel's targets | **>= 0.98** | — |
+
+**Why pose-in-pocket is no longer a gate.** It was pre-registered at **>= 70 %** on the
+framing "the centroid is inside the cavity rather than on a surface patch at the box edge".
+That framing presupposed a *padded* box. `dock.pocket_box` is the **unpadded bounding box
+of the pocket's own lining atoms**, and the engine keeps the ligand inside it, so there is
+no edge to park at and the criterion nearly restates a constraint the engine already
+enforces. Measured on real net2 pockets, random **non-clashing** centroids confined to that
+box pass **about 79 %** of the time (0.30 / 0.59 / 0.76 at insets of 2 / 4 / 6 Å) against
+**about 85 %** for the true deposited poses: **the gate sat below its own null**, and an
+engine placing ligands at random among non-clashing positions in its own box passed it. The
+asymmetry criterion itself is sound — a centroid in van der Waals contact with real lining
+passes only 17.5 % — but the engine cannot produce the geometry it rejects. It is therefore
+**reported descriptively, for every (ligand, target) pair, and gates nothing.**
+
+**Why RMSD <= 2 Å replaces it.** The stage already holds the deposited ligand's
+coordinates (it is what the redocked SDF is built from), so the self pairs admit a real
+**redocking-success rate** with a published base rate — Vina-family cognate redocking is
+usually reported at 60–80 % — and a null of **0.0 %**: random non-clashing *rigid
+placements* of the same ligand in the same box passed 0 of 1,871 draws. The threshold is
+set at **0.50**, below published cognate performance, because this is a sanity check and
+not a benchmark to be optimised against.
+
+**Why a third readout.** `M` is built from **within-target, across-ligand** percentiles.
+The self-rank is **within-ligand, across-target**. Those are rows and columns of the same
+matrix and one does not imply the other, so the axis `M` rests on was never validated. The
+third readout costs nothing — `07_docking/df_results_<home>.csv` and
+`08_control/docking/df_results_<home>.csv` are the same receptor, box and engine, differing
+only in the ligand set — and it states exactly what `M` needs: a known binder reaches the
+top decile of the production library at the pocket it was crystallised in.
+
+**Why a minimum n, and why `unknown` below it.** Without one, a single labelled ligand
+ranking first on a 20-target panel reads `median 0.025` and passes. A readout over fewer
+than 10 observations is reported as **`unknown`, not `yes` and not `no`**: it is not
+evidence either way, and the spec already treats `unknown` as not-interpretable.
+
+**Why a panel-coverage rule.** A ligand missing from any scored target is dropped (§ 2's
+logic, applied per ligand). An incomplete **target**, however, is excluded from *every*
+ligand's denominator. Simulated on a ligand genuinely ranked 30th of 482 (true 0.0613,
+correctly failing): 100 targets failing **at random** gives 0.0589 and still fails; the
+same 100 failing because they were **the best-scoring ones** gives **0.0013 and passes**.
+The correlation is plausible in exactly that direction — the most generous pockets are the
+largest, the largest have the biggest boxes, and the biggest boxes are likeliest to hit
+`--unit-timeout` or OOM. At coverage 0.98 the worst case (every unscored target having
+beaten the home pocket) can move the median by at most 0.0207 on a 482-target panel,
+against 0.21 at the 0.79 coverage of that simulation. **The residual is stated, not
+removed:** a true 0.0613 could still be read as 0.0406 under fully adversarial attrition at
+0.98 coverage. The worst-case median is therefore reported alongside the estimate as
+`self_rank.median_percentile_adversarial`, descriptively.
 
 **The consequence, fixed now:**
 
@@ -266,30 +325,71 @@ And:
 
 This is enforced in code, not left to prose: `polyphar stats` reads the verdict from
 `inputs/positive_control.json`
-(`{"median_self_rank_percentile": ..., "pose_in_pocket_fraction": ...}`) and writes an
-`interpretable` verdict onto **every primary and subgroup row** of `results.csv` and into
-`summary.md` — `yes`, `no: <which threshold failed> — the primary result is reported as
-UNINTERPRETABLE, not reinterpreted`, or `unknown: positive control not run`. The thresholds
-live in `stats.SELF_RANK_MAX = 0.05` and `stats.POSE_IN_POCKET_MIN = 0.70`; changing either
-is an amendment to this document.
+(`{"median_self_rank_percentile": ..., "redock_rmsd_success_fraction": ...,
+"library_top_decile_fraction": ..., "n_redocked": ..., "n_redock_rmsd": ...,
+"n_library_percentile": ..., "panel_targets_scored": ..., "panel_targets_total": ...}`) and
+writes an `interpretable` verdict onto **every primary and subgroup row** of `results.csv`
+and into `summary.md` — `yes`, `no: <which threshold failed> — the primary result is
+reported as UNINTERPRETABLE, not reinterpreted`, or `unknown: positive control not run` /
+`unknown: <it does not support a verdict>`. The thresholds live in `stats.THRESHOLDS`
+(`SELF_RANK_MAX`, `REDOCK_RMSD_MAX`, `REDOCK_SUCCESS_MIN`, `LIBRARY_TOP_DECILE_MIN`,
+`MIN_SELF_RANK_N`, `MIN_REDOCK_N`, `MIN_LIBRARY_N`, `MIN_PANEL_SCORED_FRACTION`); changing
+any of them is an amendment to this document.
 
-**The gate validates its input.** Both readouts are fractions and must be a real number in
+**The gate validates its input.** Every readout is a fraction and must be a real number in
 `[0, 1]`. A boolean, a string that parses to a number outside that range, a non-finite
-value, a negative self-rank or a `pose_in_pocket_fraction` of 99 is **not** a pass and
-**not** a near-miss: the verdict is `unknown: <path> is out of range`, because an invalid
-positive control must land in `unknown` and never in `yes`. A `source` key describing how
-the two numbers were produced is expected; its absence does not change the verdict but is
+value, a negative self-rank or a fraction of 99 is **not** a pass and **not** a near-miss:
+the verdict is `unknown: <path> is out of range`, because an invalid positive control must
+land in `unknown` and never in `yes`. The descriptive `pose_in_pocket_fraction` is
+range-checked on the same terms although it gates nothing. A `source` key describing how
+the numbers were produced is expected; its absence does not change the verdict but is
 written to `failed.tsv`.
+
+**A non-finite score cannot produce a passing rank.** `NaN` compares false against
+everything, so a `NaN` *home* score would be counted as beaten by nothing and tied with
+itself — percentile **0.0**, better than the best achievable `0.5/N` — and an all-`NaN`
+score matrix would read as a perfect control. The control reads its own `df_results`
+through the same reader the main analysis uses, which rejects non-finite values and names
+them, and the ranking function refuses a non-finite score outright.
 
 Where the verdict is not `yes`, every primary, subgroup and contrast p-value in the
 `summary.md` arms table is printed with the suffix `(UNINTERPRETABLE)`. The numbers are
 still printed — hiding a number invites recomputing it somewhere without the label — but
 the label travels with them, because that table is what gets pasted into a Methods draft.
 
-The label's biases are stated wherever the control is reported: the absence of a
-co-crystal ligand does not mean a pocket is undruggable (most such structures were solved
-apo), and the label skews toward large pockets and well-studied proteins. It is a sanity
-check, not an optimisation target.
+### 6b. What a pass licenses, and what it does not
+
+The label's biases are stated wherever the control is reported, in the `caveat` key of the
+result itself and in `08_control/summary.md`, because the numbers are quoted by people who
+will not read this document:
+
+1. **The home pocket is the holo conformation, induced-fit around this very ligand.**
+   DoGSiteScorer runs on the pdbfixer structure, i.e. the holo backbone with the heterogens
+   stripped, so the control self-docks into a receptor whose side chains are already
+   arranged for the ligand it is recovering. **This is the easiest benchmark in the field
+   and it is the largest bias in this section.** It says nothing about cross-docking or
+   about the ~63 % of the panel that is AlphaFold.
+2. The absence of a co-crystal ligand does not mean a pocket is undruggable (most such
+   structures were solved apo), and the label skews toward **large** pockets and
+   **well-studied** proteins.
+3. **"Drug-like ligand" overstates the criterion**, which is only a 12–60 heavy-atom
+   non-solvent HETATM residue in contact with the lining. Across 1,142 net2 chains the
+   commonest labelled codes are **PSU 49** (pseudouridine), **7PE 22** (a PEG oligomer the
+   `SKIP` list misses), **NAP 20**, **OMG 19**, **FAD 18**, **ATP 12**, **ADP 10** — about
+   14 % modified RNA residues and about 10 % nucleotide cofactors, neither of which is a
+   drug.
+4. **The self-rank cannot detect the defect its own rationale names.** It is a relative
+   within-ligand comparison and is therefore invariant to any monotone transform applied
+   uniformly across targets — **including the +0.33 kcal/mol smina offset, which cancels
+   exactly.**
+
+A pass licenses exactly this: *within this panel and this engine, a molecule scores better
+at the site it is known to occupy than at ~95 % of other panel sites, recovers that site's
+deposited pose, and outranks the production library there — so a within-target percentile
+carries site-discriminative content.* Nothing about absolute affinity, and nothing that
+calibrates the `score_threshold x min_targets` surface of § 8.
+
+It is a sanity check, not an optimisation target.
 
 ## 7. Replicate spread (no analytic standard error)
 
@@ -371,3 +471,43 @@ number.
 * **§ 9** "every guideline drug dropped is named" now covers coverage drops, not only
   undockability.
 * This document's sha256 is pinned in code (header).
+
+### 2026-11-04 (second) — the positive control, after two reviews of the `control` stage
+
+Written **before `dock` has run**: no v2 run folder exists on this machine, no co-crystal
+ligand has been redocked, and no value of any readout in § 6 exists. Two independent
+reviews of the `polyphar control` implementation found that the control **as pre-registered
+could not fail**. Everything below is § 6 and § 6b only; §§ 1–5 and 7–10 are unchanged, and
+the primary test is untouched.
+
+* **§ 6 the expected n: 687 → about 24.** 687 counts labelled pockets over all 8,005
+  experimental net1 pockets; the stage labels the **panel's** targets, because only a panel
+  pocket can have a self-rank. Measured label rate on panel-style pockets 7/52 = 13.5 %,
+  over ~178 experimental targets of 482. The reason for the change is an arithmetic
+  correction, not a result.
+* **§ 6 pose-in-pocket is no longer a gate.** `POSE_IN_POCKET_MIN = 0.70` sat **below its
+  own null**: the docking box is the pocket's unpadded lining bounding box, the engine
+  keeps the ligand inside it, and random non-clashing centroids in that box pass ~79 %
+  against ~85 % for true deposited poses. It is now reported descriptively.
+* **§ 6 a redocking-RMSD gate replaces it:** `>= 50 %` of the self pairs within
+  **2.0 Å**, symmetry-insensitive, in place. Field-standard criterion, published base rate
+  60–80 %, measured null 0 of 1,871 random non-clashing rigid placements.
+* **§ 6 a third gated readout:** the co-crystal ligand's percentile among the production
+  library **at its own target**, `>= 50 %` in the top decile (chance 0.10). The first two
+  readouts validate the transpose of the axis `M` is built on; this one validates that
+  axis.
+* **§ 6 minimum n per readout (10), returning `unknown` below it.** Without one, a single
+  ligand ranking first on a 20-target panel passed.
+* **§ 6 a panel-coverage gate (>= 0.98)**, with `panel_targets_scored` and
+  `panel_targets_total` now in the result JSON rather than only in the manifest, and the
+  adversarial worst-case median reported beside the estimate. Score-correlated **target**
+  attrition turned a genuine failure (true self-rank 0.0613) into a comfortable pass
+  (0.0013) when the 100 best-scoring of 482 targets dropped out.
+* **§ 6 a non-finite score is refused** rather than ranked. A `NaN` home score produced
+  percentile 0.0 — better than best-of-N — and an all-`NaN` matrix produced the verdict
+  `yes`.
+* **§ 6b added**, stating what a pass licenses and the four biases that travel with the
+  number, chief among them that **the home pocket is the holo conformation induced-fit
+  around this very ligand**, which is the easiest benchmark in the field and was not
+  previously stated anywhere.
+* The thresholds now live in one `stats.THRESHOLDS` dict rather than two constants.

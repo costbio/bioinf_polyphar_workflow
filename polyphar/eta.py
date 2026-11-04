@@ -40,6 +40,8 @@ PARALLEL_EFFICIENCY = {
     # have no stage object (projected estimates for a stage not yet selected).
     "dock": lambda nprocs, tpj=1: max(1, nprocs // max(1, tpj)),
     "dock-worker": lambda nprocs, tpj=1: max(1, nprocs // max(1, tpj)),
+    # fallback only: `control` reports its own slots() (dock's) through cli.gate
+    "control": lambda nprocs, tpj=1: max(1, nprocs // max(1, tpj)),
     "dock-export": lambda nprocs, tpj=1: 1,
     "dock-merge": None,
     # reading the panel's result files is I/O bound; the permutation itself is one seeded
@@ -96,14 +98,20 @@ LEGACY_TOOLS = {"pockets": "dogsite2", "dock": "smina", "dock-worker": "smina"}
 
 # How to re-measure a stage for a tool it has no calibration for. pockets is the exception:
 # DoGSiteScorer runs on the host, not through `polyphar benchmark`.
-RECALIBRATE_HINT = {"pockets": "bin/polyphar-dogsite-worker --benchmark --tool {tool}"}
+# A stage whose own name `polyphar benchmark --stages` does not accept needs the name it
+# IS calibrated under, or the hint prints a command argparse rejects.
+RECALIBRATE_HINT = {"pockets": "bin/polyphar-dogsite-worker --benchmark --tool {tool}",
+                    "control": "polyphar benchmark --stages dock",
+                    "dock-worker": "polyphar benchmark --stages dock"}
 
 # Stages that are calibrated under another stage's name. `dock-worker` runs exactly the
 # engine calls `dock` does, on the same unit basis (ligands), so it uses dock's measured
 # rate instead of printing "uncalibrated" on the very host where the engine runs.
 # `dock-export` is deliberately NOT here: it copies files, so dock's per-ligand rate would
 # be nonsense for it.
-CALIBRATION_ALIAS = {"dock-worker": "dock"}
+# `control` runs exactly the same engine calls on the same unit basis (one ligand through
+# the engine), only over a different ligand set, so it uses dock's measured rate too.
+CALIBRATION_ALIAS = {"dock-worker": "dock", "control": "dock"}
 
 
 class Calibration:
@@ -355,7 +363,11 @@ class Progress:
         self._notify(f"{self.stage} done", msg, priority=1 if flagged else 0)
         if self.calib is not None and self.work_done > 0 and elapsed > 0:
             # seconds per unit on ONE process: elapsed wall time * slots / work
-            self.calib.update(self.stage, elapsed * self.slots / self.work_done, self.tool)
+            # under the ALIAS, not the stage's own name: estimate_stage reads
+            # CALIBRATION_ALIAS[stage], so a rate filed under "control" is written and
+            # never read again.
+            self.calib.update(CALIBRATION_ALIAS.get(self.stage, self.stage),
+                              elapsed * self.slots / self.work_done, self.tool)
             try:
                 self.calib.save()
             except OSError as exc:

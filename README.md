@@ -237,6 +237,8 @@ modified or deleted.
     <run>/07_docking/<label>/replicates/r<i>.sdf  r<i>.log  r<i>.prov.json  r<i>.done
     <run>/07_docking/<label>/poses.sdf  (poses_r<i>.sdf with --poses all)
     <run>/07_docking/df_results_<label>.csv  discarded.tsv  discarded/  export/  obsolete/
+    <run>/08_control/labels.csv  self_rank.csv  pose_in_pocket.csv  library_percentile.csv  summary.md
+                     positive_control.json  docking/ (dock's tree, co-crystal ligands)
     <run>/08_stats/strata.json  m_statistic_<panel>.csv  results.csv  balance.csv
                    per_drug.csv  surface.csv  surface.md  summary.md
     <run>/logs/<stage>.log  run.log  notifications.log
@@ -272,6 +274,8 @@ All stages take `--run-dir` (default `/work` in the container, else the current 
     polyphar dock-export [--bundle DIR] [--max-units N]   # engine on another machine:
     polyphar dock-worker --bundle DIR                     #   export here, run there,
     polyphar dock-merge  --bundle DIR                     #   merge back here
+    polyphar control [--control-replicates 1] [--engine smina]   # the positive control:
+                                                      #   redock the co-crystal ligands
     polyphar stats [--positive-set inputs/positive_sets.csv] [--control-panel ../ad_run] \
                    [--permutations 10000] [--permutation-seed 42] [--min-coverage 0.98] \
                    [--positive-control inputs/positive_control.json]
@@ -692,14 +696,78 @@ changing a parameter.
   denylist let `p-value`, `adj.P.Val`, `Pr(>|t|)`, `pFDR` and a Cyrillic `\u0440_value`
   through). `surface.md` is guarded by the same check.
 - **The positive-control gate.** `inputs/positive_control.json`
-  (`median_self_rank_percentile`, `pose_in_pocket_fraction`, both fractions in `[0, 1]`)
-  must show a median self-rank in the top 5% and pose-in-pocket >= 70%. Failing or absent,
+  (`median_self_rank_percentile`, `redock_rmsd_success_fraction`,
+  `library_top_decile_fraction`, all fractions in `[0, 1]`, each with its own `n` and with
+  `panel_targets_scored` / `panel_targets_total`) must show a median self-rank in the top
+  5%, >= 50% of self pairs redocked within 2.0 A, >= 50% of co-crystal ligands in the top
+  decile of the production library at their own target, and >= 98% of the panel scored --
+  each over at least 10 observations, below which the verdict is `unknown` rather than
+  `yes` or `no`. Failing or absent,
   every primary, subgroup and contrast row is marked uninterpretable -- the pre-registered
   consequence, enforced in code -- and `summary.md`'s arms table prints `(UNINTERPRETABLE)`
   beside each p. An out-of-range or non-numeric value is `unknown`, never `yes`.
 - **The pre-registration is pinned by sha256** (`stats.PREREGISTRATION_SHA256`, recorded in
   every manifest): editing the document fails the test suite until the constant and an
   `## Amendments` entry are updated together.
+
+### The positive control (`polyphar control`)
+
+`stats` enforces a pre-registered gate: a FAILED positive control makes the primary result
+UNINTERPRETABLE rather than reinterpreted, and an ABSENT one is not a pass. `polyphar
+control` is what produces it. The receptors are ~63% AlphaFold models and the engine carries
+an uncharacterised +0.33 kcal/mol offset from smina, so without this nothing anchors a score
+to real binding; the usual anchor (the approved HCC drugs' own targets) is unavailable
+because the subtype gene lists do not contain them.
+
+It labels every panel target that is an experimental chain by the drug-like ligand sitting
+in its pocket -- a HETATM residue of 12-60 heavy atoms, not solvent/ion/buffer/glycan/lipid,
+with at least 70% of its heavy atoms within 4.5 A of the pocket lining; the criterion of
+`docs/superpowers/specs/2026-11-03-panel-selection-spikes/rg_calibrate.py` (whose own 687
+is a lower bound -- it derives the chain file by splitting the pocket name on `_res_P`,
+which misses chimeric chains and every DoGSite3 pocket; `control` uses `Receptor_Path`
+instead). One row per PHYSICAL ligand: a ligand filling a pocket and its nested subpocket
+is counted once. Those ligands are extracted from the deposited
+coordinates (Open Babel perceives the bonds; bond order and protonation may differ from the
+depositor's chemistry) and redocked against the WHOLE panel through the same `dock`
+machinery, writing to `08_control/docking/` so `07_docking` is untouched.
+
+Three gated readouts, all in `08_control/positive_control.json` and installed at
+`inputs/positive_control.json`, which is where `stats` reads them:
+
+| readout | what it says | pass | min n |
+|---|---|---|---|
+| `median_self_rank_percentile` | where a ligand's own pocket ranks among the whole panel (chance 0.5) | <= 0.05 | 10 |
+| `redock_rmsd_success_fraction` | share of self pairs whose best replicate-0 pose is within 2.0 A of the deposited coordinates (symmetry-insensitive, in place) | >= 0.50 | 10 |
+| `library_top_decile_fraction` | share of co-crystal ligands in the top decile of the PRODUCTION library at their own target -- the axis `M` is built on | >= 0.50 | 10 |
+| `panel_targets_scored / panel_targets_total` | how much of the panel carried a score at all | >= 0.98 | - |
+
+`pose_in_pocket_fraction` is still reported, **descriptively, and gates nothing**: the
+docking box is the pocket's own unpadded lining bounding box and the engine keeps the
+ligand inside it, so random non-clashing centroids in that box pass ~79% against ~85% for
+true deposited poses -- the old `>= 0.70` gate sat below its own null. RMSD <= 2 A has a
+null of 0.0% on the same random placements.
+
+Expect about **24** labelled ligands on a 482-target panel, not 687: only panel pockets can
+have a self-rank, and the measured label rate on panel-style pockets is 13.5%.
+
+The JSON also carries `source`, each readout's `n` and the caveat, because the numbers get
+quoted by people who did not read the code:
+
+> **Sanity check, not an optimisation target.** The home pocket is the **holo** conformation,
+> induced-fit around this very ligand (DoGSiteScorer runs on the pdbfixer structure, i.e. the
+> holo backbone with heterogens stripped), so this is the easiest benchmark in the field and
+> says nothing about cross-docking or about the ~63% of the panel that is AlphaFold. Absence
+> of a co-crystal ligand does NOT mean a pocket is undruggable -- most such structures were
+> solved apo. The label is biased toward LARGE pockets and toward WELL-STUDIED proteins, and
+> "drug-like" overstates it: across 1,142 net2 chains the commonest labelled codes include
+> PSU 49 (pseudouridine), 7PE 22 (a PEG oligomer), NAP 20, FAD 18, ATP 12. And the self-rank
+> is invariant to any monotone transform applied uniformly across targets, **including the
+> +0.33 kcal/mol smina offset, which cancels exactly** -- so it cannot detect the defect its
+> own rationale names.
+
+A panel with no labelled pocket writes no JSON at all, and a rerun that can no longer produce
+one deletes the stale file: `stats` must say "unknown: not run" rather than read a pass that
+is no longer true.
 
 ### The positive set is an input, not code
 

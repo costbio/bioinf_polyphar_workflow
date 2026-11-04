@@ -400,12 +400,13 @@ def preflight_problems(layout, args, stages) -> list[str]:
             rdkit = ligands.rdkit_problem()
             if rdkit and (source is None or ligands._finished(layout, source) is None):
                 problems.append(f"ligands: {rdkit}")
-    if "dock" in stages:
+    if {"dock", "control"} & set(stages):
         from polyphar.stages import dock
         from polyphar.stages import dock_unidock as unidock
 
         # engine-aware: demanding smina from a Uni-Dock run would stop a perfectly good
-        # GPU host that has no CPU engine at all.
+        # GPU host that has no CPU engine at all. `control` is in here because it runs the
+        # same engine over its own ligand set (polyphar.stages.control).
         if dock.engine_name(args) == dock.ENGINE_UNIDOCK:
             # a GPU-less host is NOT a preflight failure: `run` does everything up to dock
             # and stops cleanly there (see _gpu_stop). What IS a failure is a GPU host
@@ -492,14 +493,23 @@ def _gpu_stop(args, name: str) -> str | None:
 
     `--engine unidock` needs a CUDA GPU, and POSEIDON -- the host the run folders live on
     -- has none. Everything up to dock is still worth doing there, so the run completes it
-    and stops at dock with the export/worker/merge instructions, rather than failing."""
-    if name != "dock":
+    and stops at dock with the export/worker/merge instructions, rather than failing.
+
+    `control` docks too (the co-crystal ligands), so it stops for the same reason."""
+    if name not in ("dock", "control"):
         return None
     from polyphar.stages import dock
     from polyphar.stages import dock_unidock as unidock
 
     if dock.engine_name(args) != dock.ENGINE_UNIDOCK or unidock.gpu_model() is not None:
         return None
+    if name == "control":
+        # the export/worker/merge path in NO_GPU_MESSAGE is dock's bundle, and there is no
+        # control-export: say what actually applies instead of pointing at the wrong tool.
+        return (unidock.NO_GPU_MESSAGE.split("Run the dock stage")[0]
+                + "`polyphar control` docks too (the co-crystal ligands) and has no "
+                  "export/merge split: run it on the GPU host against the same run folder, "
+                  "or use `--engine smina` for a CPU run.")
     return unidock.NO_GPU_MESSAGE
 
 
@@ -582,10 +592,16 @@ def _run_stages(cli, layout, args, stages, ids_given, notifier) -> int:
     if gpu_stop is not None:
         name, stop = gpu_stop
         print(f"{name}: {stop}", flush=True)
+        # The note leads the Pushover notification, so it has to be the advice that
+        # applies to THIS stage: `control` has no export/worker/merge split (there is no
+        # `polyphar control-export`), and telling its reader to run one contradicts the
+        # line printed immediately above it.
+        note = (f"stopped before {name}: run dock-export / dock-worker / dock-merge to "
+                f"finish" if name == "dock" else
+                f"stopped before {name}: rerun `polyphar {name}` on a GPU host against "
+                f"this run folder, or use --engine smina")
         _finish(layout, rows, notifier,
-                f"run stopped before {name}: this host has no GPU", priority=1,
-                note=f"stopped before {name}: run dock-export / dock-worker / dock-merge "
-                     f"to finish")
+                f"run stopped before {name}: this host has no GPU", priority=1, note=note)
         return EXIT_INCOMPLETE
     _stats_not_run(layout, args, stages, notifier)
     flags = _flags(rows)

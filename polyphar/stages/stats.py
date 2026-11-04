@@ -105,8 +105,12 @@ The positive-control gate
     reported as UNINTERPRETABLE rather than reinterpreted. That is enforced here, not left
     to prose: `--positive-control` (default inputs/positive_control.json) is read and every
     primary/subgroup row gets an `interpretable` verdict -- "yes", "no: ..." or
-    "unknown: positive control not run". The redocking itself (self-rank, pose-in-pocket)
-    is a separate piece of work; this stage only consumes and enforces its verdict.
+    "unknown: positive control not run" / "unknown: ... does not support a verdict". The
+    redocking itself (self-rank, redocking RMSD, library percentile at home) is a separate
+    piece of work -- `polyphar control` -- and this stage only consumes and enforces its
+    verdict. A readout over fewer observations than the pre-registered minimum, or a panel
+    too thinly scored to trust the self-rank denominator, is `unknown`: not a pass, and
+    not a failure either.
 
 PocketMatch note
     Nothing in this stage ranks on, reads or reports PocketMatch similarity. Any ranking
@@ -179,16 +183,60 @@ PREREGISTERED_LIBRARY = "e-Drug3D_2083 (1,960 records surviving the dockability 
 # are updated together (tests/test_stage_stats.py::
 # test_the_preregistration_is_the_one_this_code_was_written_against).
 PREREGISTRATION = "docs/superpowers/specs/2026-11-04-preregistration.md"
-PREREGISTRATION_SHA256 = "9945e151e2fb2f985f4ec2bc5976f39f43567ef3b966e6d85b85d86298a838e9"
+PREREGISTRATION_SHA256 = "4dff92a8c81d7ff8372c3197c30a3d1615c28251c96e58f012e0ba31a6f41747"
 # A ligand must be scored on at least this share of the panel's proteins AND of the panel's
 # targets to carry an M. 0.98, not 0.9: under informative missingness -- a ligand failing
 # where it fits worst, which is the realistic direction -- M is biased by up to
 # 0.5 * (1 - coverage), i.e. +0.051 at 0.90 and +0.011 at 0.98, and the effect this test
 # calls significant is of that order.
 MIN_COVERAGE = 0.98
-# Positive-control pass thresholds, pre-registered. See the module docstring.
+# Positive-control pass thresholds, pre-registered (§ 6). See the module docstring.
 SELF_RANK_MAX = 0.05        # median self-recovery rank within the top 5% of the panel
-POSE_IN_POCKET_MIN = 0.70   # >= 70% of replicate-0 best poses centred inside the cavity
+# Readout 2 is the REDOCKING RMSD, not pose-in-pocket. `dock.pocket_box` is the unpadded
+# bounding box of the pocket's own lining atoms and the engine keeps the ligand inside it,
+# so "centroid inside the box, away from the faces" nearly restates a constraint the engine
+# already enforces: measured on real net2 pockets, random NON-CLASHING centroids pass
+# pose-in-pocket ~79% of the time against ~85% for the true deposited poses, i.e. the old
+# `POSE_IN_POCKET_MIN = 0.70` sat BELOW its own null and an engine placing ligands at
+# random among non-clashing positions in its own box passed it. RMSD <= 2 A is the
+# field-standard redocking-success criterion, its null on the same random placements is
+# 0.0%, and it is the number a reviewer asks for.
+REDOCK_RMSD_MAX = 2.0         # A; what counts as recovering the deposited pose
+REDOCK_SUCCESS_MIN = 0.50     # >= 50% of self pairs within it
+# Readout 3: the axis M is actually built on. M is within-target across ligands; the
+# self-rank is within-ligand across targets -- rows and columns of the same matrix, and one
+# does not imply the other. A known binder that does not reach the top decile of the
+# production library at the pocket it was crystallised in means a within-target percentile
+# carries no site-discriminative content. Chance is 0.10.
+LIBRARY_TOP_DECILE_MIN = 0.50
+# Minimum n per readout. Without one, ONE labelled ligand ranking first on a 20-target
+# panel reads `median 0.025, pose 1.0` and the verdict is `yes`. The realistic n is about
+# 24 (482 targets, ~37% experimental, ~13.5% of panel-style experimental pockets labelled),
+# not the 687 the pre-registration first quoted, so the minimum has to be low enough to be
+# reachable and high enough that one ligand cannot carry it: at n = 10 the binomial
+# standard error on a fraction is 0.16 and the median is not set by a single value.
+MIN_SELF_RANK_N = 10
+MIN_REDOCK_N = 10
+MIN_LIBRARY_N = 10
+# A target that failed is excluded from EVERY ligand's self-rank denominator, so target
+# attrition correlated with score turns a genuine failure into a pass. The same 0.98 as the
+# ligand coverage rule (§ 2), and for the same reason: at 0.98 the worst case -- every
+# unscored target having beaten the home pocket -- moves the median by at most
+# (1 - 0.98) = 0.0207 on a 482-target panel, against 0.21 at 0.79.
+MIN_PANEL_SCORED_FRACTION = 0.98
+
+# What the gate prints, and what every manifest records. One dict so the thresholds cannot
+# drift apart between the verdict, the summary and the provenance.
+THRESHOLDS = {
+    "self_rank_max": SELF_RANK_MAX,
+    "redock_rmsd_max_angstrom": REDOCK_RMSD_MAX,
+    "redock_success_min": REDOCK_SUCCESS_MIN,
+    "library_top_decile_min": LIBRARY_TOP_DECILE_MIN,
+    "min_self_rank_n": MIN_SELF_RANK_N,
+    "min_redock_n": MIN_REDOCK_N,
+    "min_library_n": MIN_LIBRARY_N,
+    "min_panel_scored_fraction": MIN_PANEL_SCORED_FRACTION,
+}
 
 SET_HCC = "hcc"
 SET_AD = "ad"
@@ -1050,16 +1098,27 @@ def positive_control_verdict(path, display=None) -> tuple:
     The spec pre-registers that a FAILED positive control makes the primary result
     UNINTERPRETABLE rather than reinterpreted, and that an absent one is not a pass. Both
     are enforced here. JSON schema:
-        {"median_self_rank_percentile": 0.02,   # <= 0.05 to pass (top 5% of the panel)
-         "pose_in_pocket_fraction": 0.83,       # >= 0.70 to pass
-         "source": "..."}                       # how the two numbers were produced
+        {"median_self_rank_percentile": 0.02,     # <= 0.05 to pass, over >= 10 ligands
+         "redock_rmsd_success_fraction": 0.74,    # >= 0.50 to pass, over >= 10 self pairs
+         "library_top_decile_fraction": 0.80,     # >= 0.50 to pass, over >= 10 ligands
+         "n_redocked": 24, "n_redock_rmsd": 24, "n_library_percentile": 24,
+         "panel_targets_scored": 478, "panel_targets_total": 482,   # ratio >= 0.98
+         "pose_in_pocket_fraction": 0.83,         # DESCRIPTIVE, range-checked, NOT gated
+         "source": "..."}                         # how the numbers were produced
 
-    Both readouts are fractions and both must be a real number in [0, 1]. A boolean, a
-    non-finite value, a negative rank or a `pose_in_pocket_fraction` of 99 is NOT a
-    passing control and NOT a near-miss: it comes back as `unknown: ... is out of range`,
-    because an invalid control must land in `unknown` and never in `yes`. A file with no
-    `source` still passes on its numbers, but the omission is written to failed.tsv (see
-    `run`): the gate cannot check provenance, only say that none was given.
+    Every readout is a fraction and must be a real number in [0, 1]. A boolean, a
+    non-finite value, a negative rank or a fraction of 99 is NOT a passing control and NOT
+    a near-miss: it comes back as `unknown: ... is out of range`, because an invalid
+    control must land in `unknown` and never in `yes`.
+
+    A readout computed over too few observations is `unknown`, not `yes` and not `no`: one
+    labelled ligand ranking first on a 20-target panel is not evidence either way. So is a
+    control whose panel coverage is below MIN_PANEL_SCORED_FRACTION, because an excluded
+    target is excluded from every ligand's denominator and attrition correlated with score
+    moves the median the helpful way.
+
+    A file with no `source` still passes on its numbers, but the omission is written to
+    failed.tsv (see `run`): the gate cannot check provenance, only say that none was given.
 
     `display` is how the file is named in the verdict (the option's own value, so the
     result rows stay readable); it defaults to `path`."""
@@ -1077,7 +1136,8 @@ def positive_control_verdict(path, display=None) -> tuple:
     if not isinstance(data, dict):
         return f"unknown: {path} is not a JSON object", {}
     values = {}
-    for key in ("median_self_rank_percentile", "pose_in_pocket_fraction"):
+    for key in ("median_self_rank_percentile", "redock_rmsd_success_fraction",
+                "library_top_decile_fraction", "pose_in_pocket_fraction"):
         raw = data.get(key, None)
         # `True` is an int in Python and float(True) == 1.0; a boolean is not a measured
         # fraction and must not be read as a passing one.
@@ -1091,18 +1151,52 @@ def positive_control_verdict(path, display=None) -> tuple:
             return (f"unknown: {path} is out of range ({key} = {raw!r} is not finite); "
                     f"an invalid positive control is NOT a pass", detail)
         if not 0.0 <= v <= 1.0:
-            return (f"unknown: {path} is out of range ({key} = {v:.6g}, and both readouts "
-                    f"are fractions in [0, 1]); an invalid positive control is NOT a pass",
+            return (f"unknown: {path} is out of range ({key} = {v:.6g}, and every readout "
+                    f"is a fraction in [0, 1]); an invalid positive control is NOT a pass",
                     detail)
         values[key] = v
+    # Too little to judge on: `unknown`, which the spec already treats as not-interpretable
+    # rather than as a pass or a failure.
+    thin = []
+    for key, minimum, what in (
+            ("n_redocked", MIN_SELF_RANK_N, "self-rank"),
+            ("n_redock_rmsd", MIN_REDOCK_N, "redocking RMSD"),
+            ("n_library_percentile", MIN_LIBRARY_N, "library percentile")):
+        n = data.get(key, None)
+        if n is None or isinstance(n, bool) or not isinstance(n, (int, float)):
+            thin.append(f"{key} is missing, so the {what} readout cannot be sized")
+        elif n < minimum:
+            thin.append(f"{what} is over {n:g} observation(s), below the pre-registered "
+                        f"minimum of {minimum}")
+    total = data.get("panel_targets_total", None)
+    scored = data.get("panel_targets_scored", None)
+    if not all(isinstance(v, (int, float)) and not isinstance(v, bool)
+               for v in (total, scored)) or not total:
+        thin.append("panel_targets_scored / panel_targets_total are missing, so the "
+                    "self-rank denominator cannot be checked for target attrition")
+    elif scored / total < MIN_PANEL_SCORED_FRACTION:
+        thin.append(f"only {scored:g} of {total:g} panel targets were scored "
+                    f"({scored / total:.4g}), below the pre-registered minimum "
+                    f"{MIN_PANEL_SCORED_FRACTION:g}; an excluded target is excluded from "
+                    f"every ligand's denominator")
+    if thin:
+        return (f"unknown: {shown} does not support a verdict ({'; '.join(thin)}); the "
+                f"primary result is NOT interpretable until it does"), detail
+
     rank = values["median_self_rank_percentile"]
-    pose = values["pose_in_pocket_fraction"]
+    redock = values["redock_rmsd_success_fraction"]
+    lib = values["library_top_decile_fraction"]
     fails = []
     if not rank <= SELF_RANK_MAX:
         fails.append(f"median self-rank {rank:.6g} is not within the top "
                      f"{SELF_RANK_MAX:g}")
-    if not pose >= POSE_IN_POCKET_MIN:
-        fails.append(f"pose-in-pocket {pose:.6g} is below {POSE_IN_POCKET_MIN:g}")
+    if not redock >= REDOCK_SUCCESS_MIN:
+        fails.append(f"redocking success (RMSD <= {REDOCK_RMSD_MAX:g} A) {redock:.6g} is "
+                     f"below {REDOCK_SUCCESS_MIN:g}")
+    if not lib >= LIBRARY_TOP_DECILE_MIN:
+        fails.append(f"only {lib:.6g} of the co-crystal ligands reach the top decile of "
+                     f"the production library at their own target, below "
+                     f"{LIBRARY_TOP_DECILE_MIN:g}")
     if fails:
         return ("no: " + "; ".join(fails) + " -- the primary result is reported as "
                 "UNINTERPRETABLE, not reinterpreted (pre-registered)"), detail
@@ -1233,7 +1327,7 @@ def _params(args) -> dict:
             "percentile": "mid-rank; 1 = most negative score_mean",
             "direction": DIRECTION,
             "control_panel": str(getattr(args, "control_panel", None) or ""),
-            "self_rank_max": SELF_RANK_MAX, "pose_in_pocket_min": POSE_IN_POCKET_MIN}
+            **THRESHOLDS}
 
 
 def _signature(layout, args, jobs_meta) -> str:
@@ -1551,9 +1645,9 @@ def run(layout, args, progress) -> dict:
 
     if verdict == "yes" and "source" not in control_detail:
         logged.append((str(inputs["positive_control"]),
-                       "the positive control passes on its two numbers but states no "
-                       "`source`: nothing records how the self-rank and pose-in-pocket "
-                       "figures were produced"))
+                       "the positive control passes on its numbers but states no "
+                       "`source`: nothing records how the self-rank, redocking-RMSD and "
+                       "library-percentile figures were produced"))
 
     min_coverage = float(getattr(args, "min_coverage", MIN_COVERAGE))
     sizes = {r["ID"]: r["heavy_atoms"] for r in library}
@@ -1834,9 +1928,17 @@ def _summary(panels, sets, strata, result_rows, verdict, unresolved, args,
            "## Positive control (pre-registered gate)", "",
            f"**{verdict}**", "",
            f"Pass thresholds: median self-recovery rank within the top "
-           f"{SELF_RANK_MAX:g} of the panel, pose-in-pocket >= {POSE_IN_POCKET_MIN:g}. "
-           f"If they fail, the primary result is reported as uninterpretable rather than "
-           f"reinterpreted.", "",
+           f"{SELF_RANK_MAX:g} of the panel over at least {MIN_SELF_RANK_N} ligands; "
+           f"redocking success (RMSD <= {REDOCK_RMSD_MAX:g} A) >= "
+           f"{REDOCK_SUCCESS_MIN:g} over at least {MIN_REDOCK_N} self pairs; at least "
+           f"{LIBRARY_TOP_DECILE_MIN:g} of the co-crystal ligands in the top decile of "
+           f"the production library at their own target, over at least "
+           f"{MIN_LIBRARY_N} ligands; and at least "
+           f"{MIN_PANEL_SCORED_FRACTION:g} of the panel's targets scored. "
+           f"Pose-in-pocket is reported descriptively and is NOT a gate: its null on "
+           f"random non-clashing centroids in the engine's own box is about 0.79. "
+           f"If a gate fails, the primary result is reported as uninterpretable rather "
+           f"than reinterpreted.", "",
            "## Panels", ""]
     for panel in panels:
         out.append(f"* **{panel.name}** ({panel.run_dir}): {panel.n_targets} targets / "

@@ -1,0 +1,99 @@
+#!/usr/bin/env python3
+"""Stand-in for smina that writes POSES WITH COORDINATES, which `fake_smina` does not.
+
+`fake_smina` emits an empty V2000 molblock (0 atoms), which is enough for every score-based
+test but not for `polyphar control`'s geometric readouts, which measure where a pose IS.
+
+Two modes:
+
+* default -- each ligand's pose is four carbons at the centre of the box it was given
+  (--center_x/y/z), i.e. in the pocket. Enough for pose-in-pocket, not for a redocking
+  RMSD: four carbons are not the composition of the input ligand.
+* $FAKE_POSE_ECHO=1 -- the pose is the INPUT LIGAND'S OWN atom block, displaced by
+  $FAKE_POSE_RMSD (default 0) A along x. That is what a real engine returns (the same
+  molecule, moved), so it is the only mode in which a redocking RMSD means anything: the
+  RMSD of the best pose is then exactly $FAKE_POSE_RMSD, on either side of the 2 A gate as
+  the test chooses.
+
+In both modes the ligand IDs in $FAKE_POSE_OUTSIDE_IDS are placed
+$FAKE_POSE_OUTSIDE_SHIFT (default 1000) A away on x -- far outside the box and far from any
+lining atom, the "pose on a surface patch / at the box edge" case.
+
+Scores: -9.0 when the receptor path contains $FAKE_POSE_BEST_RECEPTOR, else -1.0, minus
+pose/100 so pose 1 is the best, minus a per-ligand 1e-4 tie-break on the ligand's order in
+the input, so no two ligands tie and a self-rank is well defined. A further -2.0 for the
+ligand IDs in $FAKE_POSE_STRONG_IDS, so a control ligand can be made to beat (or not beat)
+the production library at its own target.
+"""
+import os
+import sys
+
+argv = sys.argv[1:]
+if "--version" in argv:
+    print("smina fake-posed 0.0")
+    sys.exit(0)
+opt = {argv[i]: argv[i + 1] for i in range(0, len(argv) - 1) if argv[i].startswith("-")}
+
+
+def records(path):
+    """[(title, [atom block lines])] of an SDF, V2000."""
+    out, cur = [], []
+    for line in open(path):
+        if line.rstrip("\r\n") == "$$$$":
+            out.append(cur)
+            cur = []
+        else:
+            cur.append(line.rstrip("\n"))
+    if cur:
+        out.append(cur)
+    got = []
+    for rec in out:
+        if not rec:
+            continue
+        try:
+            n = int(rec[3][0:3])
+        except (ValueError, IndexError):
+            n = 0
+        got.append((rec[0].strip(), rec[4:4 + n]))
+    return got
+
+
+centre = tuple(float(opt[f"--center_{a}"]) for a in "xyz")
+outside = set(filter(None, os.environ.get("FAKE_POSE_OUTSIDE_IDS", "").split(",")))
+strong = set(filter(None, os.environ.get("FAKE_POSE_STRONG_IDS", "").split(",")))
+shift = float(os.environ.get("FAKE_POSE_OUTSIDE_SHIFT", "1000"))
+echo = os.environ.get("FAKE_POSE_ECHO") == "1"
+rmsd = float(os.environ.get("FAKE_POSE_RMSD", "0"))
+best = os.environ.get("FAKE_POSE_BEST_RECEPTOR", "")
+base = -9.0 if best and best in opt["-r"] else -1.0
+
+OFFSETS = ((0.4, 0.0, 0.0), (-0.4, 0.0, 0.0), (0.0, 0.4, 0.0), (0.0, -0.4, 0.0))
+
+out = []
+for i, (title, atom_lines) in enumerate(records(opt["-l"])):
+    lid = title.split("_", 1)[1] if "_" in title else title
+    dx = shift if lid in outside else 0.0
+    if echo and atom_lines:
+        block = []
+        for line in atom_lines:
+            x, y, z = float(line[0:10]), float(line[10:20]), float(line[20:30])
+            block.append(f"{x + dx + rmsd:10.4f}{y:10.4f}{z:10.4f}{line[30:]}")
+        atoms = "".join(l + "\n" for l in block)
+        natoms = len(block)
+    else:
+        c = (centre[0] + dx, centre[1], centre[2])
+        atoms = "".join(
+            f"{c[0] + ox:10.4f}{c[1] + oy:10.4f}{c[2] + oz:10.4f} C   0  0  0  0  0  0\n"
+            for ox, oy, oz in OFFSETS)
+        natoms = len(OFFSETS)
+    bonus = -2.0 if lid in strong else 0.0
+    for pose in (1, 2):
+        out.append(f"{title}\n fake-posed\n\n"
+                   f"{natoms:3d}  0  0  0  0  0  0  0  0  0999 V2000\n"
+                   f"{atoms}M  END\n"
+                   f"> <minimizedAffinity>\n"
+                   f"{base + bonus - pose / 100 - i * 1e-4:.5f}\n\n$$$$\n")
+with open(opt["--out"], "w") as fh:
+    fh.write("".join(out))
+with open(opt["--log"], "w") as fh:
+    fh.write(f"Using random seed: {opt['--seed']}\n")
