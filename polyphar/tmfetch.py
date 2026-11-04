@@ -22,7 +22,12 @@ from polyphar.common import http_session
 TM_TSV = "tm.tsv"
 BATCH = 80
 FIELDS = "accession,ft_transmem"
-URL = "https://rest.uniprot.org/uniprotkb/search"
+# The purpose-built accessions endpoint, not /search with an "accession:A OR accession:B"
+# query. UniProt's search endpoint began returning HTTP 500 for OR-queries of 20 terms or
+# more on 2026-11-04 (10 still worked, 20/40/80 did not), which killed the `select` stage
+# mid-run. /uniprotkb/accessions takes the same accessions as a comma-separated list, is
+# documented for up to 100 per call, and returns the identical TSV columns.
+URL = "https://rest.uniprot.org/uniprotkb/accessions"
 COLUMNS = ["accession", "tm_count", "segments"]
 
 
@@ -43,9 +48,8 @@ def fetch(accessions, session=None) -> dict[str, list[tuple[int, int]]]:
     accs = sorted(set(accessions))
     for i in range(0, len(accs), BATCH):
         batch = accs[i:i + BATCH]
-        query = " OR ".join(f"accession:{a}" for a in batch)
-        r = session.get(URL, params={"query": query, "fields": FIELDS,
-                                     "format": "tsv", "size": "500"}, timeout=120)
+        r = session.get(URL, params={"accessions": ",".join(batch), "fields": FIELDS,
+                                     "format": "tsv"}, timeout=120)
         r.raise_for_status()
         got = set()
         for row in csv.DictReader(r.text.splitlines(), delimiter="\t"):
