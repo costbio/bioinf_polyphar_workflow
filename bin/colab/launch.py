@@ -8,8 +8,11 @@ Detaching is the point. The kernel websocket is fragile -- the validation sessio
 a child of the kernel. Progress is read afterwards with short `poll.py` execs, which
 double as the liveness ping that stops Colab reclaiming the VM.
 """
+import hashlib
 import os
+import pathlib
 import shlex
+import shutil
 import subprocess
 import time
 
@@ -59,17 +62,51 @@ else:
 if not os.path.exists(BUNDLE_TGZ):
     raise SystemExit(f"{BUNDLE_TGZ} not found - upload it first")
 
-# NEVER wipe the bundle first. A relaunch on the same VM -- after a dropped session, or
-# to retry failed units -- must keep what is already finished: the worker's resume reads
-# results/*.done and skips those units. bundle.tgz ships an EMPTY results/, so plain
-# extraction refreshes the inputs and leaves completed draws untouched. Wiping here cost
-# a finished 1,960-ligand unit on 2026-11-04.
+# Refuse to start a second worker on this bundle. The VM is reused when the session is
+# reused, and on 2026-11-04 an earlier worker was still running when a NEW bundle was
+# uploaded over it: two workers then docked into one results/ tree, the older one working
+# a units.tsv that no longer existed, writing draws whose keys match nothing. Never two.
+def _alive(pid):
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except (OSError, ValueError):
+        return False
+
+running = subprocess.run(["bash", "-c", "pgrep -f 'polyphar dock-worker' || true"],
+                         capture_output=True, text=True).stdout.split()
+running = [q for q in running if _alive(q)]
+if running:
+    raise SystemExit(
+        f"a dock-worker is already running on this VM (pid {', '.join(running)}).\n"
+        f"Starting a second one would put two workers in {BUNDLE}/results with different\n"
+        f"unit keys. Either let it finish, or stop this session and start a fresh one:\n"
+        f"    colab stop -s <session>")
+
+# Keep finished units across a RELAUNCH OF THE SAME BUNDLE -- that is the resume path, and
+# wiping it cost a finished 1,960-ligand unit on 2026-11-04. But a DIFFERENT bundle's
+# results are not ours: their unit keys belong to a plan this bundle does not contain, and
+# dock-merge would reject them one opaque rejection at a time.
+def _bundle_id():
+    try:
+        return hashlib.sha256(
+            pathlib.Path(BUNDLE, "run_key.json").read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+was = _bundle_id()
 os.makedirs(BUNDLE, exist_ok=True)
 p = subprocess.run(["tar", "xzf", BUNDLE_TGZ, "-C", BUNDLE, "--strip-components=1"],
                    capture_output=True, text=True)
 if p.returncode:
     raise SystemExit(f"untar failed: {p.stderr[-2000:]}")
 print("extracted:", sorted(os.listdir(BUNDLE)), flush=True)
+
+now = _bundle_id()
+if was is not None and was != now:
+    shutil.rmtree(os.path.join(BUNDLE, "results"), ignore_errors=True)
+    print("a different bundle was here: cleared its results/", flush=True)
+os.makedirs(os.path.join(BUNDLE, "results"), exist_ok=True)
 
 for need in ("units.tsv", "run_key.json", "library.sdf", "receptors"):
     if not os.path.exists(os.path.join(BUNDLE, need)):

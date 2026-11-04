@@ -142,7 +142,9 @@ colab exec -f "$repo/bin/colab/setup.py" --env "POLYPHAR_COMMIT=$commit" --timeo
 push "dock: worker starting" "$n_units units on a $gpu. Progress every ${poll_s}s."
 say "launching the detached worker"
 colab exec -f "$repo/bin/colab/launch.py" --timeout 600 -s "$session" \
-    ${ALLOW_SILENT:+--env "ALLOW_SILENT=$ALLOW_SILENT"}
+    ${ALLOW_SILENT:+--env "ALLOW_SILENT=$ALLOW_SILENT"} \
+    || die "the worker did not start (see the message above). Nothing was lost: the
+     bundle is at $rel and the units are still outstanding."
 
 say "polling every ${poll_s}s (the poll is also the keep-alive)"
 # Every poll prints a line, including a failed one. Swallowing the failure and grepping
@@ -152,7 +154,9 @@ say "polling every ${poll_s}s (the poll is also the keep-alive)"
 fails=0
 while true; do
     sleep "$poll_s"
-    if out="$(colab exec -f "$repo/bin/colab/poll.py" --timeout 120 -s "$session" 2>&1)"; then
+    # tr -d '\000': the exec output can carry a null byte, and bash then warns
+    # "command substitution: ignored null byte in input" on every single poll
+    if out="$(colab exec -f "$repo/bin/colab/poll.py" --timeout 120 -s "$session" 2>&1 | tr -d '\000')"; then
         line="$(printf '%s\n' "$out" | grep -m1 -E '^STATE=' || true)"
         if [ -n "$line" ]; then
             fails=0
