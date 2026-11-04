@@ -585,8 +585,11 @@ def test_cli_dry_run_and_library_outside_inputs(run_folder, tmp_path, capsys):
     layout, _ = run_folder
     outside = tmp_path / "elsewhere.sdf"
     shutil.copyfile(HEAD20, outside)
+    # --engine smina: this goes through the real CLI parser, so it takes the real default
+    # (unidock), and the assertions here are about --dry-run and copying a library from
+    # outside inputs/ -- not about the engine.
     argv = ["dock", "--run-dir", str(layout.run_dir), "--nprocs", "4", "--no-notify",
-            "--library", str(outside), "--replicates", "2"]
+            "--engine", "smina", "--library", str(outside), "--replicates", "2"]
     assert cli.main(argv + ["--dry-run"]) == 0
     assert "dock: 80 units (ligand)" in capsys.readouterr().out
     assert not (layout.inputs / "elsewhere.sdf").exists()   # dry-run writes nothing
