@@ -1626,3 +1626,4 @@ def test_an_empty_target_list_sweeps_nothing(run_folder, capsys):
     counts = dock.run(layout, _args(), Prog())
     assert counts["obsoleted"] == 0
     assert sorted(p.name for p in layout.docking.iterdir()) == before
+

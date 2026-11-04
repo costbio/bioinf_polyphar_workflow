@@ -168,7 +168,15 @@ SCORE_FIELD_OF = {"smina": "minimizedAffinity", "unidock": "docking_score"}
 ENGINE_SMINA = "smina"
 ENGINE_UNIDOCK = "unidock"
 ENGINES = (ENGINE_SMINA, ENGINE_UNIDOCK)
-DEFAULT_ENGINE = ENGINE_SMINA   # the single-host / development path
+# Uni-Dock on a GPU is the production route: 0.176 s/ligand measured on a Colab L4 and
+# flat across a 5x box range, against ~200 core-seconds on 64 CPU cores for smina. smina
+# stays available with --engine smina as the single-host / development path.
+#
+# `control` inherits this default, and must: its library-percentile readout compares the
+# co-crystal ligand against the PRODUCTION library at the same target, so a control run on
+# a different engine than `dock` compares two score scales (Uni-Dock reads +0.326 kcal/mol
+# less negative than smina) and biases the percentile.
+DEFAULT_ENGINE = ENGINE_UNIDOCK
 
 POSES_NONE, POSES_FIRST, POSES_ALL = "none", "first", "all"
 POSE_POLICIES = (POSES_NONE, POSES_FIRST, POSES_ALL)

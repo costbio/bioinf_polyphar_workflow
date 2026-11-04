@@ -115,7 +115,7 @@ def test_runs_all_stages_in_order_through_the_gate(fake, capsys):
     _calibrate_all(fake.home)
     (fake.run / "inputs").mkdir()
     (fake.run / "inputs" / "ids.txt").write_text("P25815\n")
-    assert _main(fake, "--txt", "inputs/ids.txt") == 0
+    assert _main(fake, "--txt", "inputs/ids.txt", "--engine", "smina") == 0
     # --to defaults to `dock`, not ORDER[-1]: `stats` needs a guideline positive set and
     # `control` a docking run of its own, so neither is in the default range
     assert _runs(fake.events) == list(DEFAULT_RANGE)
@@ -186,7 +186,7 @@ def test_failed_units_and_incomplete_targets_are_flagged_not_fatal(fake, capsys)
     _calibrate_all(fake.home)
     fake.state["counts"] = {"structures": {"failed": 3},
                             "dock": {"failed": 0, "incomplete_targets": 2}}
-    assert _main(fake, "--from", "uniprot") == 3
+    assert _main(fake, "--from", "uniprot", "--engine", "smina") == 3
     assert _runs(fake.events)[-1] == "dock"
     title, msg, prio = fake.notes[-1]
     assert "failures" in title.lower() and prio == 1
@@ -198,7 +198,7 @@ def test_failed_units_and_incomplete_targets_are_flagged_not_fatal(fake, capsys)
 
 def test_clean_run_says_no_failures(fake):
     _calibrate_all(fake.home)
-    assert _main(fake, "--from", "uniprot") == 0
+    assert _main(fake, "--from", "uniprot", "--engine", "smina") == 0
     title, msg, _ = fake.notes[-1]
     assert title == "run done" and "failures: none" in msg
 
@@ -290,7 +290,7 @@ def test_resume_skips_finished_stages_and_estimates_only_remaining_units(fake, c
     fake.notes.clear()
     fake.state["fail"] = None
 
-    assert _main(fake) == 0     # no ids options: 00_ids/ids.txt exists
+    assert _main(fake, "--engine", "smina") == 0   # no ids options: ids.txt exists
     assert _runs(fake.events) == ["fix", "pockets", "annotate", "select",
                                   "similarity", "ligands", "dock"]
     out = capsys.readouterr().out
@@ -469,7 +469,10 @@ def test_preflight_checks_library_smina_and_pocketmatch(fake, tmp_path, monkeypa
 
     check = fake.state["real_preflight"]
     layout = RunLayout(fake.run)
-    args = argparse.Namespace(library="inputs/missing.sdf", pm_bin_dir=str(tmp_path / "nopm"))
+    # explicitly the smina path: the default engine is unidock, whose preflight
+    # checks a GPU toolchain instead
+    args = argparse.Namespace(library="inputs/missing.sdf", engine="smina",
+                              pm_bin_dir=str(tmp_path / "nopm"))
     monkeypatch.setattr(dock, "smina_version", lambda: "unavailable")
     problems = check(layout, args, ["similarity", "select", "dock"])
     text = "\n".join(problems)
@@ -494,7 +497,7 @@ def test_too_many_failed_units_stop_the_run(fake, capsys):
 def test_keep_going_overrides_the_failed_fraction(fake):
     _calibrate_all(fake.home)
     fake.state["counts"]["pockets"] = {"failed": 3, "models": 10}
-    assert _main(fake, "--from", "pockets", "--keep-going") == 3
+    assert _main(fake, "--from", "pockets", "--keep-going", "--engine", "smina") == 3
     assert _runs(fake.events) == ["pockets", "annotate", "select", "similarity",
                                   "ligands", "dock"]
 
