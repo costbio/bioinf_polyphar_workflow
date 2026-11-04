@@ -10,7 +10,6 @@ double as the liveness ping that stops Colab reclaiming the VM.
 """
 import os
 import shlex
-import shutil
 import subprocess
 import time
 
@@ -23,7 +22,11 @@ UD_BIN = "/content/ud/bin"
 if not os.path.exists(BUNDLE_TGZ):
     raise SystemExit(f"{BUNDLE_TGZ} not found - upload it first")
 
-shutil.rmtree(BUNDLE, ignore_errors=True)
+# NEVER wipe the bundle first. A relaunch on the same VM -- after a dropped session, or
+# to retry failed units -- must keep what is already finished: the worker's resume reads
+# results/*.done and skips those units. bundle.tgz ships an EMPTY results/, so plain
+# extraction refreshes the inputs and leaves completed draws untouched. Wiping here cost
+# a finished 1,960-ligand unit on 2026-11-04.
 os.makedirs(BUNDLE, exist_ok=True)
 p = subprocess.run(["tar", "xzf", BUNDLE_TGZ, "-C", BUNDLE, "--strip-components=1"],
                    capture_output=True, text=True)
