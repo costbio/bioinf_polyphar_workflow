@@ -167,8 +167,12 @@ class Prog:
 
 
 def _args(**kw):
+    # engine="smina" explicitly: the default is unidock, which requires a CUDA GPU, and the
+    # run_folder fixture builds a FAKE SMINA environment -- these tests exercise the dock
+    # stage's mechanics (planning, replicates, resume, merge, sweeps), not engine selection.
+    # Tests that mean unidock pass engine="unidock" themselves.
     base = dict(nprocs=2, library="inputs/lib.sdf", seed=42, replicates=3,
-                threads_per_job=1, dry_run=False)
+                threads_per_job=1, dry_run=False, engine="smina")
     base.update(kw)
     return SimpleNamespace(**base)
 
