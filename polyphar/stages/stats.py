@@ -2,7 +2,7 @@
 
 Implements `docs/superpowers/specs/2026-11-03-statistics-design.md` (items 3-5 of its
 implementation order) and is pre-registered by
-`docs/superpowers/specs/2026-11-04-preregistration.md`. Read the spec before changing
+`polyphar/data/preregistration.md`. Read the spec before changing
 anything here: every step below exists to make ONE guarantee hold -- that **ligand size
 and pocket generosity cannot produce the result** -- and simplifying a step away usually
 removes exactly that guarantee.
@@ -172,7 +172,7 @@ HA_QUANTILES_FINE = (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9)
 # imbalance that could by itself produce the result (see balance_rows / P2 in summary.md).
 BALANCE_FLAG_SD = 0.6
 # Computed from e-Drug3D_2083's 1,960 dockable records on 2026-11-04, before any docking
-# score existed, and recorded in docs/superpowers/specs/2026-11-04-preregistration.md.
+# score existed, and recorded in polyphar/data/preregistration.md.
 # The stage recomputes them from the run's own library and reports a mismatch loudly
 # (counts["strata_edges_preregistered"]), it does not silently adopt new edges.
 PREREGISTERED_EDGES = {"heavy_atoms": [17.0, 22.0, 26.0, 32.0],
@@ -182,7 +182,7 @@ PREREGISTERED_LIBRARY = "e-Drug3D_2083 (1,960 records surviving the dockability 
 # a number is known fails the test suite until the constant and an `## Amendments` entry
 # are updated together (tests/test_stage_stats.py::
 # test_the_preregistration_is_the_one_this_code_was_written_against).
-PREREGISTRATION = "docs/superpowers/specs/2026-11-04-preregistration.md"
+PREREGISTRATION = "data/preregistration.md"
 PREREGISTRATION_SHA256 = "4dff92a8c81d7ff8372c3197c30a3d1615c28251c96e58f012e0ba31a6f41747"
 # A ligand must be scored on at least this share of the panel's proteins AND of the panel's
 # targets to carry an M. 0.98, not 0.9: under informative missingness -- a ligand failing
@@ -373,19 +373,36 @@ def add_arguments(parser) -> None:
 
 
 def preregistration_path() -> Path:
-    """The pre-registration document, beside this repo's `polyphar/` package."""
-    return Path(__file__).resolve().parents[2] / PREREGISTRATION
+    """The pre-registration document. It is **package data**, not a docs/ file, so it ships
+    inside the image: `docker/Dockerfile` copies `polyphar/` and `tests/` only, and a run in
+    the container is the production case."""
+    return Path(__file__).resolve().parents[1] / PREREGISTRATION
 
 
 def preregistration_sha256() -> str:
-    """The document's sha256 as it is on disk now, or "" if it is not there (the installed
-    image carries the package, not the docs tree).
+    """The document's sha256 as it is on disk now. Raises if it is missing or if it does not
+    match PREREGISTRATION_SHA256.
 
-    Recorded in every manifest next to PREREGISTRATION_SHA256, so a run's outputs say which
-    text of the pre-registration produced them. An edit without an `## Amendments` entry
-    and a matching constant fails the test suite."""
+    Recorded in every manifest, so a run's outputs say which text of the pre-registration
+    produced them. This used to return "" when the file was absent, which meant a
+    containerised run -- the production case -- wrote an empty provenance field and nobody
+    noticed. The document's whole value is being fixed before the numbers exist; an empty or
+    unverified field destroys that silently, so both are now errors. An edit needs an
+    `## Amendments` entry and a matching constant."""
     p = preregistration_path()
-    return sha256_file(p) if p.is_file() else ""
+    if not p.is_file():
+        raise FileNotFoundError(
+            f"the pre-registration is missing: {p}. It is package data (polyphar/data/) so it "
+            "ships with the code; a build that drops it cannot record which text produced a "
+            "result. Reinstall the package or rebuild the image.")
+    got = sha256_file(p)
+    if got != PREREGISTRATION_SHA256:
+        raise ValueError(
+            f"the pre-registration does not match the code: {p}\n  on disk: {got}\n  "
+            f"expected: {PREREGISTRATION_SHA256}\nAn edit requires an `## Amendments` entry "
+            "and an updated stats.PREREGISTRATION_SHA256, so that a result always names the "
+            "text it was produced under.")
+    return got
 
 
 # --- step 1: within-target percentiles -------------------------------------------------

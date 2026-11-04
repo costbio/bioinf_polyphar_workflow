@@ -81,6 +81,7 @@ def test_dock_calibration_carries_the_library_mix_correction(tmp_path, monkeypat
     assert "71.5" in e["library_mix_source"]
 
 
+@pytest.mark.repo_files
 def test_bench_data_is_packaged():
     assert benchmark.FIX_CHAINS[1] == "2mjw_B.pdb"
     for name in (*benchmark.FIX_CHAINS, benchmark.DOCK_RECEPTOR, benchmark.DOCK_POCKET,

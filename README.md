@@ -642,7 +642,7 @@ here.
 The last stage tests the study's claim -- *approved HCC drugs bind more of the HCC panel,
 at a useful level, than comparable molecules do* -- in a comparison where **ligand size and
 pocket generosity cannot produce the result**. It is pre-registered in
-`docs/superpowers/specs/2026-11-04-preregistration.md` and designed in
+`polyphar/data/preregistration.md` and designed in
 `docs/superpowers/specs/2026-11-03-statistics-design.md`; read the pre-registration before
 changing a parameter.
 

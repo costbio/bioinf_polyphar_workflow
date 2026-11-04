@@ -15,4 +15,4 @@ polyphar = "polyphar.cli:main"
 include = ["polyphar*"]
 
 [tool.setuptools.package-data]
-polyphar = ["data/bench/*", "data/bench/sample_pockets/*"]
+polyphar = ["data/*.md", "data/bench/*", "data/bench/sample_pockets/*"]

@@ -1,6 +1,7 @@
 import os
 import shutil
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -21,6 +22,14 @@ def _openbabel_ok() -> bool:
     return True
 
 
+def _repo_files_ok() -> bool:
+    """The image ships polyphar/ and tests/ only (docker/Dockerfile), not docs/ or bin/.
+    Tests that assert on a document or on the host wrapper are repo-hygiene checks: they
+    belong to a checkout, not to the container, and must skip rather than fail there."""
+    root = Path(__file__).resolve().parents[1]
+    return (root / "docs").is_dir() and (root / "bin").is_dir()
+
+
 def _docker_ok() -> bool:
     if shutil.which("docker") is None:
         return False
@@ -39,6 +48,7 @@ _REQUIREMENTS = {
     "docker": (_docker_ok, "docker CLI not available"),
     "rdkit": (_rdkit_ok, "rdkit not importable"),
     "openbabel": (_openbabel_ok, "openbabel not importable"),
+    "repo_files": (_repo_files_ok, "docs/ and bin/ are not in the image, only a checkout"),
     "pushover": (
         lambda: bool(os.environ.get("PUSHOVER_APP_TOKEN") and os.environ.get("PUSHOVER_USER_KEY")),
         "PUSHOVER_APP_TOKEN / PUSHOVER_USER_KEY not set",

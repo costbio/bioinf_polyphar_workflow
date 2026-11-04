@@ -896,7 +896,7 @@ def test_the_manifest_records_the_preregistration_hash(tmp_path):
 
 def test_the_code_points_at_the_preregistration():
     source = Path(stats.__file__).read_text()
-    assert "2026-11-04-preregistration.md" in source
+    assert "preregistration.md" in source
     assert stats.PREREGISTERED_EDGES["heavy_atoms"] == [17.0, 22.0, 26.0, 32.0]
 
 
@@ -1211,6 +1211,7 @@ def test_run_stops_at_dock_by_default_but_stats_stays_a_stage():
     assert cli.build_parser().parse_args(["run", "--from", "stats"]).from_stage == "stats"
 
 
+@pytest.mark.repo_files
 def test_the_runbook_documents_the_stats_stage():
     text = (Path(__file__).resolve().parents[1] / "docs" / "RUNBOOK.md").read_text()
     assert "stats" in text

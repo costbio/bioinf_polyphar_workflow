@@ -107,6 +107,7 @@ def test_rotatable_bond_count_matches_the_spike(record, expected):
     assert ligands.profile(_lines(record))["rotatable_bonds"] == expected
 
 
+@pytest.mark.repo_files
 def test_rotatable_bonds_match_ligsize_on_every_fixture():
     """Run the spike's own code over the same records and require identical numbers."""
     import importlib.util
@@ -898,6 +899,7 @@ def test_real_isosorbide_dinitrate_is_flagged_not_dropped():
     assert got["text"].count("$$$$") == 1       # passed through, not dropped
 
 
+@pytest.mark.repo_files
 def test_the_docker_wrapper_knows_every_stage():
     """bin/polyphar-docker's stage_index() knew only the 2023 eight stages. An unknown
     name produced an empty string, `${from:-0}` / `${to:-N}` substituted the full range,
