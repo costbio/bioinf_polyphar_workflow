@@ -351,12 +351,12 @@ def run_benchmark(stages, calib, log=print) -> dict:
 # of magnitude cheaper. The stage directory numbers are left as they are — renaming them
 # would invalidate every existing run folder for no gain.
 ORDER = ("ids", "uniprot", "structures", "fix", "pockets", "annotate", "select",
-         "similarity", "ligands", "dock")
+         "similarity", "ligands", "dock", "stats")
 STAGE_DIRS = {"ids": "00_ids", "uniprot": "01_uniprot", "structures": "02_structures",
               "fix": "03_pdbfixer", "pockets": "04_pockets",
               "annotate": "04_pockets/annotation", "select": "06_targets",
               "similarity": "05_similarity", "ligands": "07_docking/library",
-              "dock": "07_docking"}
+              "dock": "07_docking", "stats": "08_stats"}
 
 
 def completed(layout) -> list[str]:
@@ -508,6 +508,11 @@ def projected_units(stage: str, s: dict) -> WorkUnits | None:
         # the raw count over-projects dock by that much.
         return WorkUnits(round(s["targets"] * s.get("ligands_kept", s["ligands"])),
                          "ligands")
+    if stage == "stats":
+        # one read per target summary plus one per replicate record on disk
+        from polyphar.stages.dock import DEFAULT_REPLICATES
+
+        return WorkUnits(round(s["targets"] * (1 + DEFAULT_REPLICATES)), "target reads")
     raise KeyError(stage)
 
 

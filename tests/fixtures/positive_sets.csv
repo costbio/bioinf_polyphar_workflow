@@ -1,0 +1,8 @@
+set,ID,name,subgroup,source
+hcc,1,SORAFENIB,targeted,"NCCN 2026 / EASL 2025 / ESMO 2025: first-line systemic"
+hcc,,LENVATINIB,targeted,"NCCN 2026 / EASL 2025: first-line systemic"
+hcc,3,REGORAFENIB,targeted,"NCCN 2026: second-line after sorafenib"
+hcc,4,DOXORUBICIN,cytotoxic,"legacy systemic / TACE agent"
+ad,5,DONEPEZIL,,"guideline AD therapy (exploratory arm)"
+ad,6,MEMANTINE,,"guideline AD therapy (exploratory arm)"
+hcc,999,RAMUCIRUMAB,targeted,"NCCN 2026: antibody, expected to be unresolvable here"

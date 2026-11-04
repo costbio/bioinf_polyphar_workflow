@@ -110,9 +110,10 @@ def test_runs_all_stages_in_order_through_the_gate(fake, capsys):
     (fake.run / "inputs").mkdir()
     (fake.run / "inputs" / "ids.txt").write_text("P25815\n")
     assert _main(fake, "--txt", "inputs/ids.txt") == 0
-    assert _runs(fake.events) == list(ORDER)
+    # --to defaults to `dock`, not ORDER[-1]: `stats` needs a guideline positive set
+    assert _runs(fake.events) == list(ORDER[:-1])
     # per stage: units -> "<stage> starting" notification -> run (the single-stage gate)
-    for name in ORDER:
+    for name in ORDER[:-1]:
         i_units = fake.events.index(("units", name))
         i_start = fake.events.index(("notify", f"{name} starting"))
         i_run = fake.events.index(("run", name))
@@ -124,7 +125,7 @@ def test_runs_all_stages_in_order_through_the_gate(fake, capsys):
     # final summary: printed and notified, one row per stage
     title, msg, prio = fake.notes[-1]
     assert title.startswith("run done") and prio == 0
-    for name in ORDER:
+    for name in ORDER[:-1]:
         assert name in msg
     assert "run summary" in out
     assert (fake.run / "logs" / "run.log").read_text().count("run summary") == 1
@@ -290,8 +291,7 @@ def test_resume_skips_finished_stages_and_estimates_only_remaining_units(fake, c
     assert "fix: 1 units (things) - ETA" in out
     starts = [t for t, _, _ in fake.notes if t.endswith(" starting")]
     assert starts == [f"{s} starting" for s in ("fix", "pockets", "annotate", "select",
-                                                       "similarity", "ligands",
-                                                 "dock")]
+                                                "similarity", "ligands", "dock")]
     summary = fake.notes[-1][1]
     for s in ("ids", "uniprot", "structures"):
         line = next(l for l in summary.splitlines() if l.startswith(s + " "))
@@ -313,7 +313,7 @@ def test_skipped_stage_with_flagged_manifest_counts_is_still_flagged(fake):
     (d / "manifest.json").write_text(json.dumps({"counts": {"failed": 0,
                                                             "incomplete_targets": 1}}))
     fake.state["remaining"]["dock"] = 0
-    assert _main(fake, "--from", "dock") == 3
+    assert _main(fake, "--from", "dock", "--to", "dock") == 3
     assert _runs(fake.events) == []
     title, msg, prio = fake.notes[-1]
     assert prio == 1 and msg.splitlines()[0] == "failures: dock incomplete_targets=1"

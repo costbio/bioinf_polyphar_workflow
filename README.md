@@ -237,6 +237,8 @@ modified or deleted.
     <run>/07_docking/<label>/replicates/r<i>.sdf  r<i>.log  r<i>.prov.json  r<i>.done
     <run>/07_docking/<label>/poses.sdf  (poses_r<i>.sdf with --poses all)
     <run>/07_docking/df_results_<label>.csv  discarded.tsv  discarded/  export/  obsolete/
+    <run>/08_stats/strata.json  m_statistic_<panel>.csv  results.csv  balance.csv
+                   per_drug.csv  surface.csv  surface.md  summary.md
     <run>/logs/<stage>.log  run.log  notifications.log
 
 Every stage directory gets `manifest.json` (written last; its presence marks the stage as
@@ -270,6 +272,9 @@ All stages take `--run-dir` (default `/work` in the container, else the current 
     polyphar dock-export [--bundle DIR] [--max-units N]   # engine on another machine:
     polyphar dock-worker --bundle DIR                     #   export here, run there,
     polyphar dock-merge  --bundle DIR                     #   merge back here
+    polyphar stats [--positive-set inputs/positive_sets.csv] [--control-panel ../ad_run] \
+                   [--permutations 10000] [--permutation-seed 42] [--min-coverage 0.98] \
+                   [--positive-control inputs/positive_control.json]
     polyphar run [--from STAGE] [--to STAGE] [stage options...]
     polyphar estimate                                 # ETA table, next stage exact
     polyphar benchmark [--stages uniprot fix dock]    # per-machine calibration
@@ -300,6 +305,7 @@ exits 3, like `run`, and sends its `done` notification at priority 1.
 | `Gene_Disease_Association/target_selection_analysis.py` | `polyphar select` |
 | (none: the 2023 runs docked the raw library) | `polyphar ligands` |
 | per-folder smina scripts (`smina_screen_*.py`) | `polyphar dock` |
+| (none: the 2023 analysis had no size-matched test) | `polyphar stats` |
 
 ### Methods-relevant changes vs 2023
 
@@ -626,6 +632,99 @@ here.
   binary (dogsite3 mode when `--writeSiteResiduesPDB` is given). It copies real outputs
   (three DoGSite3 1.3.0 output sets, or single net2 DoGSiteScorer 2 pockets), so its pocket
   geometry is not a prediction for the model it is given.
+
+## Statistics (`polyphar stats`)
+
+The last stage tests the study's claim -- *approved HCC drugs bind more of the HCC panel,
+at a useful level, than comparable molecules do* -- in a comparison where **ligand size and
+pocket generosity cannot produce the result**. It is pre-registered in
+`docs/superpowers/specs/2026-11-04-preregistration.md` and designed in
+`docs/superpowers/specs/2026-11-03-statistics-design.md`; read the pre-registration before
+changing a parameter.
+
+- **Within-target percentile.** Every target's ligands are ranked by `score_mean`
+  (mid-ranks; more negative = better = percentile near 1), so every target's percentiles
+  have mean 0.5. Pocket generosity is *removed*, not adjusted for.
+- **The statistic** is `M = mean over PROTEINS of (max over that protein's targets of the
+  percentile)` -- per protein, best pocket, so a protein contributing two pockets does not
+  count twice.
+- **Size matching** is quintile bins of heavy-atom count x tertile bins of rotatable-bond
+  count, with the rotatable-bond count taken from `ligands.csv` (the pinned non-standard
+  definition, amides included -- never RDKit's). The edges are computed from the library
+  and written to `08_stats/strata.json` **before any docking score is read**, and compared
+  against the pre-registered ones.
+- **The test** is a one-sided within-stratum label permutation (10,000 draws, seeded):
+  mean `M` over the positive set minus mean `M` over the matched controls.
+- **The pre-registered prediction -- HCC-on-HCC > HCC-on-AD -- is tested, not inferred.**
+  The two primary arms are each tested against *their own* controls, so reading the
+  prediction off "one is significant and the other is not" is the difference-of-significance
+  error. The `contrast` arm is a **paired within-stratum permutation on
+  `M_primary - M_control`** over the ligands carrying an `M` on both panels. It carries no
+  Holm correction. Note also that Holm makes the negative control *harder* to reject, which
+  is backwards for an arm one wants to fail: both its raw and adjusted p are reported and
+  the raw one is named as the honest figure.
+- **Coverage.** A ligand needs `--min-coverage` (0.98) of the panel's proteins **and** of
+  its targets. Both halves matter: at 0.90 an informatively-missing ligand's `M` is biased
+  by up to +0.051, and `E[max of k uniforms] = k/(k+1)` means losing one pocket of a
+  two-pocket protein moves `M` while protein coverage stays 1.000. Positives dropped for
+  coverage are named in `failed.tsv` and `summary.md`.
+- **Stratification removes the BETWEEN-stratum size confound, not the within-stratum one.**
+  A within-stratum heavy-atom imbalance of ~0.6 sd can produce p < 0.05 from size alone.
+  The test is not changed for that; `balance.csv` reports the positives' size against their
+  controls' per stratum, the arm rows carry `balance_sd` / `balance_flag`, and a
+  pre-registered `sensitivity` arm repeats the primary test on heavy-atom **deciles**.
+- **The controls are already other approved drugs of the same size**: e-Drug3D is a
+  library of approved and withdrawn drugs, not a generic screening set. That sentence is
+  written into `results.csv`, `surface.md` and `summary.md` because it is load-bearing.
+- **Replicate spread**: `M` is recomputed from each replicate's raw poses and reported per
+  replicate (`stat_r0..2`). No analytic SE is derived for `M`, and `mean |delta|/sqrt(N)`
+  is not one (`E|X-Y| = 1.128 sigma`).
+- **Arms**: HCC drugs on this panel and HCC drugs on `--control-panel` are the two
+  **primary** tests and are Holm-corrected; `contrast` is the prediction's own test;
+  the targeted / cytotoxic split is a pre-planned subgroup, Holm within its own family;
+  `sensitivity` is the deciles rerun; AD-drug arms are exploratory with `n` on the row.
+  Per-drug elevation (`per_drug.csv`) is exploratory with Benjamini-Hochberg FDR over the
+  resolvable subset.
+- **`surface.csv` / `surface.md`** are the `score_threshold x min_targets` grid,
+  descriptively, with **no p-values**. This is an **allowlist**, not a denylist: only the
+  fields of `stats.SURFACE_COLUMNS` may be written, in the column list or smuggled through
+  a row dict, and any other name is refused whether or not it looks like a p-value (a
+  denylist let `p-value`, `adj.P.Val`, `Pr(>|t|)`, `pFDR` and a Cyrillic `\u0440_value`
+  through). `surface.md` is guarded by the same check.
+- **The positive-control gate.** `inputs/positive_control.json`
+  (`median_self_rank_percentile`, `pose_in_pocket_fraction`, both fractions in `[0, 1]`)
+  must show a median self-rank in the top 5% and pose-in-pocket >= 70%. Failing or absent,
+  every primary, subgroup and contrast row is marked uninterpretable -- the pre-registered
+  consequence, enforced in code -- and `summary.md`'s arms table prints `(UNINTERPRETABLE)`
+  beside each p. An out-of-range or non-numeric value is `unknown`, never `yes`.
+- **The pre-registration is pinned by sha256** (`stats.PREREGISTRATION_SHA256`, recorded in
+  every manifest): editing the document fails the test suite until the constant and an
+  `## Amendments` entry are updated together.
+
+### The positive set is an input, not code
+
+Building it is clinical-guideline reading (EASL / NCCN / ESMO), so the stage requires
+`inputs/positive_sets.csv` and fails with instructions when it is absent (`polyphar run`
+stops in the preflight, before anything starts):
+
+    set,ID,name,subgroup,source
+    hcc,1234,SORAFENIB,targeted,NCCN 2026 / EASL 2025
+    hcc,,LENVATINIB,targeted,NCCN 2026
+    ad,2001,DONEPEZIL,,guideline AD therapy
+
+`set` is `hcc` or `ad`; `ID` is the e-Drug3D library ID, or leave it empty and the `name`
+is matched case-insensitively against the library; `subgroup` is `targeted` or `cytotoxic`;
+`source` is free text. A row that does not resolve to a **dockable** library record is
+never dropped silently: it is named in `failed.tsv` and in `summary.md`, because the
+Methods must say which guideline drug was lost to undockability. The same is true of a
+drug that resolves but does not clear the coverage rule.
+
+`polyphar run` stops at **`dock`** by default for the same reason: the positive set will be
+absent for most of the project's life, and the everyday command must not refuse the nine
+stages it can do. `--to stats` includes the analysis, `--from stats` runs it afterwards,
+and a run that ends at `dock` without a positive set prints and notifies one line saying
+so.
+`tests/fixtures/positive_sets.csv` is a worked example.
 
 ## Outputs and failures
 

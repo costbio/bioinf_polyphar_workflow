@@ -91,12 +91,12 @@ stage_index() {
     case "$1" in
         ids) echo 0 ;; uniprot) echo 1 ;; structures) echo 2 ;; fix) echo 3 ;;
         pockets) echo 4 ;; annotate) echo 5 ;; select) echo 6 ;; similarity) echo 7 ;;
-        ligands) echo 8 ;; dock) echo 9 ;;
+        ligands) echo 8 ;; dock) echo 9 ;; stats) echo 10 ;;
         *) echo "" ;;
     esac
 }
 pockets_index=4
-last_index=9
+last_index=10
 set_stage() {   # $1 = from|to, $2 = stage name
     _i="$(stage_index "$2")"
     [ -n "$_i" ] || return 0

@@ -42,6 +42,10 @@ PARALLEL_EFFICIENCY = {
     "dock-worker": lambda nprocs, tpj=1: max(1, nprocs // max(1, tpj)),
     "dock-export": lambda nprocs, tpj=1: 1,
     "dock-merge": None,
+    # reading the panel's result files is I/O bound; the permutation itself is one seeded
+    # stream in this process and does not parallelise (it must not: --nprocs cannot change
+    # a result).
+    "stats": lambda nprocs, tpj=1: min(nprocs, 8),
 }
 
 

@@ -117,7 +117,8 @@ def test_estimate_table_marks_projection(tmp_path, monkeypatch):
     rows, observed = benchmark.estimate_rows(layout, 4, calib)
     by = {r["stage"]: r for r in rows}
     assert [r["stage"] for r in rows] == ["structures", "fix", "pockets", "annotate",
-                                          "select", "similarity", "ligands", "dock"]
+                                          "select", "similarity", "ligands", "dock",
+                                          "stats"]
     assert by["structures"]["kind"] == "exact" and by["structures"]["seconds"] > 0
     assert by["dock"]["kind"] == "projected" and by["fix"]["kind"] == "projected"
     assert by["select"]["kind"] == "trivial"

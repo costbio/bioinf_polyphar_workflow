@@ -73,8 +73,29 @@ Start with **HCC net1**. Then the other subtypes, in whatever order suits you.
     $POLYPHAR ligands          # prepares inputs/e-Drug3D_2083.sdf once, for every target
     $POLYPHAR dock             # 1960 prepared ligands (2083 source records, 123 excluded)
 
+`$POLYPHAR run` stops after `dock`: that is the default `--to`. The analysis stage is not
+in the default range because it needs a positive set that is clinical-guideline reading
+(below), and a run that would otherwise do nine stages must not refuse because the tenth
+cannot start. A run that ends at `dock` without one prints and pushes a single line saying
+so.
+
+    # the analysis, once inputs/positive_sets.csv exists
+    $POLYPHAR stats --control-panel $DATA/Alzhemier/Cluster3
+    # or, in one go:
+    $POLYPHAR run --to stats
+    # or, after a finished dock:
+    $POLYPHAR run --from stats
+
 Each stage can be rerun safely: it skips what is already done. Add `--dry-run` to any stage
 to see its units and ETA first.
+
+### What `stats` needs that nothing else does
+
+| File (in the run folder) | What it is |
+|---|---|
+| `inputs/positive_sets.csv` | **required.** The clinical-guideline (EASL / NCCN / ESMO) systemic-therapy list, intersected with the dockable e-Drug3D records. Columns `set,ID,name,subgroup,source`; `set` is `hcc` or `ad`; `subgroup` is `targeted` or `cytotoxic`. Building it is guideline reading, not code — `polyphar stats` will not invent it, and `polyphar run` with `stats` in range stops in preflight without it. `tests/fixtures/positive_sets.csv` is a worked example. |
+| `inputs/positive_control.json` | optional, but **an absent one is not a pass.** `{"median_self_rank_percentile": ..., "pose_in_pocket_fraction": ..., "source": "..."}`, both fractions in `[0, 1]`, from the redocking of the co-crystallised ligands. Without it every primary, subgroup and contrast result is reported as `unknown` and marked UNINTERPRETABLE. |
+| `--control-panel <other run folder>` | the pre-registered negative control: the same drug sets on the other disease's panel. Without it only one of the two primary tests runs, the contrast arm is not produced, and every output says so. Pointing it at this run folder is refused. |
 
 ## 3. What to check after each stage
 
@@ -97,6 +118,7 @@ are also printed and pushed to Pushover.
 | `similarity` | `05_similarity/` | `Pocketsim.csv` pair count; `PocketMatch_score.txt` |
 | `ligands` | `07_docking/library/` | `counts.kept` / `excluded`; `stereo_inversions` and `implausible_formal_charge` must be explainable; `ligands.csv` |
 | `dock` | `07_docking/` | per-target results; `incomplete_targets` must be 0; `library_prepared` must be `true` |
+| `stats` | `08_stats/` | `summary.md` first. `counts.positive_control` must be `yes` or the result is UNINTERPRETABLE; `counts.strata_edges_preregistered` must be `true`; `counts.positives_unresolved` and `positives_below_coverage` name every guideline drug dropped (in `failed.tsv`); `counts.balance_flagged` must be 0, or read the within-stratum size balance in `balance.csv`; `counts.contrast_tests` must be 1 or the pre-registered prediction was not tested |
 
 ### Expected numbers at `ids` / `uniprot`
 

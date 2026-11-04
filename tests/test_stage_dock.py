@@ -1121,6 +1121,9 @@ def test_run_reports_a_finished_dock_as_done_not_as_not_run(gpu_run_folder, monk
     out = capsys.readouterr().out
     assert rc == 0
     assert run_stage.SKIPPED in out
+    # (`stats not run: ...` is the separate end-of-run notice about the positive set; it
+    # is not dock's status, so it does not count here)
+    out = out.replace("stats not run", "stats-notice")
     assert "no CUDA GPU found" not in out and "not run" not in out
 
 

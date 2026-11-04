@@ -1,6 +1,10 @@
 """`polyphar run`: the stages ids -> uniprot -> structures -> fix -> pockets -> annotate ->
-select -> similarity -> ligands -> dock in order (or the contiguous range --from .. --to;
-benchmark.ORDER is the authority), each through the same ETA gate as its single-stage
+select -> similarity -> ligands -> dock in order, and `stats` after them on request (or the
+contiguous range --from .. --to; benchmark.ORDER is the authority and ends at stats, but
+--to defaults to **dock**, because `stats` needs a clinical-guideline positive set that
+will be absent for most of this project's life -- `--to stats` includes it, and a run that
+ends at dock without one says, in one line, what would unblock it). Each stage runs through
+the same ETA gate as its single-stage
 subcommand (cli.gate): exact units, ETA printed and notified before the first unit,
 milestone progress, done / FAILED.
 
@@ -11,7 +15,8 @@ milestone progress, done / FAILED.
 * Before the first stage, a preflight checks what later stages need: with ligands or dock
   in range the ligand library exists (and, for ligands with work left, RDKit imports);
   with dock in range `smina --version` works; with similarity in range the PocketMatch
-  binaries are there. A problem exits 2 before anything starts.
+  binaries are there; with stats in range the positive set is there. A problem exits 2
+  before anything starts.
 * Every stage's units() is computed first. A stage with 0 units and a manifest.json whose
   recorded inputs all still have their recorded sha256 is "skipped (done)": not
   benchmarked, not run, no notifications (its manifest counts still feed the failure
@@ -72,6 +77,9 @@ EXIT_STOPPED = 1
 EXIT_INCOMPLETE = 4
 SKIPPED = "skipped (done)"
 DEFAULT_MAX_FAILED_FRACTION = 0.2
+# `stats` is a real pipeline stage and stays in benchmark.ORDER, but it is not in the
+# default range: see --to in add_arguments.
+DEFAULT_TO_STAGE = "dock"
 FRACTION_STAGES = ("structures", "fix", "pockets")
 
 
@@ -132,8 +140,16 @@ def add_arguments(parser) -> None:
     parser.add_argument("--from", dest="from_stage", choices=ORDER, default=ORDER[0],
                         metavar="STAGE", help=f"first stage (default {ORDER[0]}); one of "
                                               f"{', '.join(ORDER)}")
-    parser.add_argument("--to", dest="to_stage", choices=ORDER, default=ORDER[-1],
-                        metavar="STAGE", help=f"last stage (default {ORDER[-1]})")
+    # NOT ORDER[-1]. `stats` needs inputs/positive_sets.csv, which is clinical-guideline
+    # reading and will be absent for most of this project's life; making the everyday
+    # command refuse to do the eight stages it CAN do inverts the cost asymmetry. Same
+    # shape as _gpu_stop: finish what is possible, stop cleanly, say what is missing.
+    # `--to stats` and `--from stats` still work, and the preflight check stays fatal when
+    # the user puts `stats` in range explicitly.
+    parser.add_argument("--to", dest="to_stage", choices=ORDER, default=DEFAULT_TO_STAGE,
+                        metavar="STAGE",
+                        help=f"last stage (default {DEFAULT_TO_STAGE}; pass --to stats to "
+                             f"include the analysis)")
     parser.add_argument("--max-failed-fraction", type=_fraction,
                         default=DEFAULT_MAX_FAILED_FRACTION, metavar="F",
                         help="stop the run when structures, fix or pockets fails more than "
@@ -364,7 +380,7 @@ def failed_fraction(stage: str, counts) -> tuple[int, int] | None:
 def preflight_problems(layout, args, stages) -> list[str]:
     """What the stages in range need from outside the run folder's earlier stages: the
     ligand library (ligands and dock), a working smina (dock), RDKit (ligands), the
-    PocketMatch binaries (similarity)."""
+    PocketMatch binaries (similarity), the positive set (stats)."""
     problems = []
     wants_library = {"dock", "ligands"} & set(stages)
     if wants_library:
@@ -402,6 +418,17 @@ def preflight_problems(layout, args, stages) -> list[str]:
         elif dock.smina_version() == "unavailable":
             problems.append(f"dock: smina ({dock.smina_bin()}) not runnable "
                             "(`smina --version` failed)")
+    if "stats" in stages:
+        from polyphar.stages import stats
+
+        # the positive set is guideline reading, not code: a run that would reach `stats`
+        # without one stops here rather than after docking the whole library.
+        path = stats._path(layout, getattr(args, "positive_set", stats.POSITIVE_SETS))
+        if not path.is_file():
+            # `stats` is only in range because the user asked for it (--to stats /
+            # --from stats): --to defaults to dock. So this is fatal, as it should be.
+            problems.append("stats: " + stats.POSITIVE_SET_MISSING.format(path=path)
+                            + " (or drop --to stats: `run` stops after dock by default)")
     if "similarity" in stages:
         from polyphar.stages import similarity
 
@@ -476,6 +503,26 @@ def _gpu_stop(args, name: str) -> str | None:
     return unidock.NO_GPU_MESSAGE
 
 
+def _stats_not_run(layout, args, stages, notifier) -> None:
+    """One line, printed and notified, when a run ends at `dock` with no positive set.
+
+    `--to` defaults to dock because the positive set is clinical-guideline reading and will
+    be absent for most of this project's life. That is the right default, but it must not
+    be silent: a run that stops one stage short of the analysis has to say so, and say what
+    would unblock it."""
+    if stages[-1] != "dock" or "stats" in stages:
+        return
+    from polyphar.stages import stats
+
+    path = stats._path(layout, getattr(args, "positive_set", stats.POSITIVE_SETS))
+    if path.is_file():
+        return
+    msg = (f"stats not run: supply {path} (guideline reading) and run "
+           f"polyphar run --from stats")
+    print(msg, flush=True)
+    _notify_quietly(notifier, "run: stats not run", msg)
+
+
 def _run_stages(cli, layout, args, stages, ids_given, notifier) -> int:
     rows = []
     gpu_stop = None
@@ -540,6 +587,7 @@ def _run_stages(cli, layout, args, stages, ids_given, notifier) -> int:
                 note=f"stopped before {name}: run dock-export / dock-worker / dock-merge "
                      f"to finish")
         return EXIT_INCOMPLETE
+    _stats_not_run(layout, args, stages, notifier)
     flags = _flags(rows)
     if flags:
         _finish(layout, rows, notifier, f"run done with failures ({len(flags)} flagged)",
