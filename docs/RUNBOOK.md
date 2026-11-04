@@ -100,44 +100,90 @@ Start with **HCC net1**. Then the other subtypes, in whatever order suits you.
     $POLYPHAR select
     $POLYPHAR similarity       # AFTER select: it runs on the panel's eligible pockets
     $POLYPHAR ligands          # prepares inputs/e-Drug3D_2083.sdf once, for every target
-    $POLYPHAR dock             # 1960 prepared ligands (2083 source records, 123 excluded)
-    $POLYPHAR control          # redocks the co-crystal ligands -> inputs/positive_control.json
 
-`$POLYPHAR run` stops after `dock`: that is the default `--to`. The analysis stage is not
+    # dock needs a GPU and POSEIDON has none, so `run` stops here and exits 4.
+    # One command does the whole round trip; repeat until nothing is outstanding:
+    bin/polyphar-colab --max-units 200
+    bin/polyphar-docker dock --dry-run     # what is still outstanding
+
+    $POLYPHAR control          # labels targets, writes the co-crystal library, stops
+    bin/polyphar-colab --control           # its docking, same round trip
+    $POLYPHAR control          # -> inputs/positive_control.json
+
+`$POLYPHAR run` stops after `dock`: that is the default `--to`. On POSEIDON it stops *at*
+`dock` with exit 4, because the engine is on a GPU elsewhere — see below. The analysis stage is not
 in the default range because it needs a positive set that is clinical-guideline reading
 (below), and a run that would otherwise do nine stages must not refuse because the tenth
 cannot start. A run that ends at `dock` without one prints and pushes a single line saying
 so.
 
-### Docking on a host with no GPU
+### Docking: POSEIDON has no GPU, so the work travels
 
-POSEIDON has no GPU. With the default `--engine smina` everything runs in place and `dock`
-simply takes a long time. With `--engine unidock`, `polyphar dock` **fails fast** rather than
-starting, and `polyphar run` completes every stage up to `dock`, stops cleanly and **exits 4**
+`dock` defaults to **Uni-Dock on a GPU**. POSEIDON has none, so `polyphar dock` fails fast
+and `polyphar run` completes every stage up to `dock`, stops cleanly and **exits 4**
 (`EXIT_INCOMPLETE`) — not 0, so a wrapper or `&&` chain cannot read it as a finished run.
+That is the expected end of `run` on this machine.
 
-To use the GPU engine, move the work to a GPU host and bring the results back:
+**Use one command for the whole round trip:**
 
-    $POLYPHAR dock-export --bundle 07_docking/export/<name> --max-units 60
-    #  copy the bundle to the GPU host, then there:
-    #      polyphar dock-worker --bundle <bundle>
-    #  copy it back, then here:
-    $POLYPHAR dock-merge  --bundle 07_docking/export/<name>
+    bin/polyphar-colab --max-units 200
 
-Size each export to what one session can finish: a dropped session loses at most the units in
-flight, and the next export recomputes what is outstanding. **Do not export a second bundle
-before merging the first** — both would contain the same units, both would be worked, and the
-second merge's draws are dropped (logged in `discarded.tsv`, but the GPU time is spent).
+It does all of it: `dock-export` here, creates or reuses a Colab session, uploads the
+bundle and your Pushover credentials, installs Uni-Dock pinned to the repo's current
+commit, launches the worker detached, polls until it finishes, packs, downloads, and runs
+`dock-merge` here. Then it stops the session.
 
-    # the analysis, once inputs/positive_sets.csv exists
-    $POLYPHAR stats --control-panel $DATA/Alzhemier/Cluster3
-    # or, in one go:
-    $POLYPHAR run --to stats
-    # or, after a finished dock:
-    $POLYPHAR run --from stats
+**Re-run it until `dock` reports nothing outstanding.** Every stage underneath resumes, so
+each run exports only what is still missing, and a dropped session costs at most the units
+in flight. Check what remains at any time with:
 
-Each stage can be rerun safely: it skips what is already done. Add `--dry-run` to any stage
-to see its units and ETA first.
+    bin/polyphar-docker dock --dry-run
+
+Options: `--session NAME` (default `dock`), `--gpu L4|A100|T4|G4` (default `L4`),
+`--max-units N`, `--keep` (leave the session running), `--control` (see below).
+
+Sizing `--max-units`: one unit is one (target, replicate) — 1,960 ligands, about 6 GPU
+minutes. ~200 units is a ~20 hour session. The number is truncated **down to a whole
+number of targets**, because a target whose replicates are split across sessions can be
+drawn on two different GPU models, and that difference would land inside the replicate
+spread that exists to measure the engine's own jitter.
+
+What the wrapper refuses to do, and why:
+
+- **A second bundle while an earlier one is unmerged.** Both would hold the same units,
+  both would be worked, and the second merge's draws are discarded with the GPU time
+  already spent. Merge or delete the old bundle first.
+- **Start with uncommitted changes under `polyphar/`.** The worker installs polyphar from
+  the commit it pins, so the GPU would run different code than this host planned the unit
+  keys with.
+- **Start a worker that cannot notify you.** Without `~/.polyphar/pushover.env` the worker
+  would run up to 20 hours in silence. `ALLOW_SILENT=1` overrides.
+
+`dock-merge` exiting 3 is normal: it means this bundle merged and other units are still
+outstanding. The wrapper reports that and exits 0; anything else is a real failure and the
+bundle is left in place to retry.
+
+Driving the steps by hand (another GPU host, debugging a session) is documented in
+[`bin/colab/README.md`](../bin/colab/README.md), which also records what was measured on
+the L4 on 2026-11-03 and why the worker is detached.
+
+### The control's docking goes the same way
+
+`control` redocks the co-crystal ligands, and it **must** use the same engine as `dock`:
+its library-percentile readout scores the co-crystal ligand against the production library
+at the same target, so a control run on smina beside a Uni-Dock `dock` compares two score
+scales (Uni-Dock reads +0.326 kcal/mol less negative) and biases the percentile silently.
+
+So `control` needs the GPU too. It is not a separate stage triple — the same commands take
+`--control`:
+
+    bin/polyphar-docker control        # labels targets, writes the co-crystal library, stops
+    bin/polyphar-colab --control       # exports, works and merges 08_control/docking
+    bin/polyphar-docker control        # units now recorded -> computes the readouts
+
+The first `control` stops with a message rather than failing: the library it writes is the
+input the export needs. The last one finds every unit recorded and goes straight to the
+readouts.
 
 ### What `stats` needs that nothing else does
 
@@ -242,6 +288,20 @@ Two things in that table are worth knowing before reading your own:
 
 ## 4. Things that will bite
 
+- **Check `docker ps` before rebuilding the image.** A running container keeps the image it
+  started with, so a rebuild cannot disturb a live run — but a job started after it gets
+  different code than one started before, and nothing in the run folder records which. On
+  2026-11-04 a net2 docking run was found still on a pre-rebuild image, running smina after
+  the default had changed to Uni-Dock.
+- **Run the test suite inside the image before trusting a rebuild.** On the development
+  machine 71 tests skip for missing openbabel and rdkit, and that is where two defects hid
+  on 2026-11-04 (41 failures in `test_stage_dock.py` that the local run called green):
+
+      docker run --rm --user 1000:1000 -v $PWD:/src -w /src --entrypoint python \
+          polyphar:1.1 -m pytest tests -q -m 'not repo_files and not docker'
+
+  `repo_files` and `docker` are deselected because the image has neither `bin/` nor a
+  docker CLI; mounting the checkout makes those tests run and then fail on missing `pgrep`.
 - **One stage at a time means the ETA is per stage.** `run --dry-run` prints the whole table.
 - **`pockets` needs the DoGSiteScorer licence.** The current evaluation activation on this
   machine expires **2026-11-16**. Get the pocket stages of all seven subtypes done inside

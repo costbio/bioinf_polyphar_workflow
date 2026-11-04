@@ -1,0 +1,149 @@
+#!/usr/bin/env bash
+# Host wrapper: one docking round trip on a Colab Pro+ GPU, end to end.
+#
+#   bin/polyphar-colab [--max-units N] [--session NAME] [--gpu L4] [--control] [--keep]
+#
+# Does, in order: dock-export here -> create/reuse a Colab session -> upload the bundle
+# and the Pushover credentials -> install the engine -> launch the detached worker -> poll
+# until it finishes -> pack -> download -> dock-merge here.
+#
+# Re-run it until `dock` reports nothing outstanding: every stage underneath resumes, so a
+# second run exports only what is still missing. A dropped session costs at most the units
+# in flight.
+#
+# Environment:
+#   POLYPHAR_RUN_DIR   run folder on the host (default: current directory)
+#   POLYPHAR_HOME      calibration / pushover.env dir (default: ~/.polyphar)
+#   POLYPHAR_VERSION   image tag, passed to polyphar-docker
+#   POLYPHAR_REPO      checkout holding bin/colab (default: this script's repo)
+#   COLAB_POLL_SECONDS seconds between progress polls (default 300)
+#   ALLOW_SILENT=1     start the worker even without Pushover credentials
+#
+# Exits non-zero on any failure, so `&&` chains and tmux wrappers cannot mistake a dropped
+# session for a finished one.
+set -euo pipefail
+
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+repo="${POLYPHAR_REPO:-$(cd "$here/.." && pwd)}"
+run_dir="$(realpath "${POLYPHAR_RUN_DIR:-$PWD}")"
+home_dir="$(realpath "${POLYPHAR_HOME:-$HOME/.polyphar}")"
+poll_s="${COLAB_POLL_SECONDS:-300}"
+
+max_units=""; session="dock"; gpu="L4"; control=""; keep=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --max-units) max_units="$2"; shift 2 ;;
+        --session)   session="$2";   shift 2 ;;
+        --gpu)       gpu="$2";       shift 2 ;;
+        --control)   control="--control"; shift ;;
+        --keep)      keep="1"; shift ;;
+        -h|--help)   sed -n '2,24p' "${BASH_SOURCE[0]}"; exit 0 ;;
+        *) echo "polyphar-colab: unknown option $1" >&2; exit 2 ;;
+    esac
+done
+
+say() { printf '\n== %s\n' "$*"; }
+die() { printf 'polyphar-colab: %s\n' "$*" >&2; exit 1; }
+
+command -v colab >/dev/null 2>&1 || die "the colab CLI is not on PATH (pip install google-colab-cli)"
+[ -d "$run_dir" ] || die "run dir $run_dir does not exist"
+[ -d "$repo/bin/colab" ] || die "$repo/bin/colab not found; set POLYPHAR_REPO"
+
+commit="$(cd "$repo" && git rev-parse HEAD)"
+if ! (cd "$repo" && git diff --quiet HEAD -- polyphar); then
+    die "the polyphar package has uncommitted changes. The worker installs polyphar from
+     the commit you pin, so the GPU would run different code than this host planned.
+     Commit and push first."
+fi
+
+# --- 1. export ------------------------------------------------------------------------
+# A second bundle exported before the first is merged contains the SAME units: both get
+# worked and the second merge's draws are discarded, with the GPU time already spent.
+export_root="$run_dir/07_docking/export"
+[ -n "$control" ] && export_root="$run_dir/08_control/docking/export"
+if [ -d "$export_root" ]; then
+    for b in "$export_root"/*/; do
+        [ -d "$b" ] || continue
+        if [ -f "$b/units.tsv" ] && [ ! -f "$b/.merged" ]; then
+            die "bundle $b was exported but not merged. Merge it first:
+     bin/polyphar-docker dock-merge --bundle ${b#$run_dir/} $control
+   or delete it if it was never worked."
+        fi
+    done
+fi
+
+name="$(date +%Y%m%dT%H%M%S)"
+rel="${export_root#$run_dir/}/$name"
+say "dock-export -> $rel"
+"$here/polyphar-docker" dock-export --bundle "$rel" $control \
+    ${max_units:+--max-units "$max_units"} --engine-version 'Uni-Dock 1.2.0'
+
+bundle="$export_root/$name"
+[ -f "$bundle/units.tsv" ] || die "export wrote no units.tsv"
+n_units="$(( $(wc -l < "$bundle/units.tsv") - 1 ))"
+[ "$n_units" -gt 0 ] || { say "nothing outstanding; removing the empty bundle"; rm -rf "$bundle"; exit 0; }
+say "$n_units unit(s) to work"
+
+tgz="$(mktemp -t polyphar-bundle-XXXXXX.tgz)"
+tar czf "$tgz" -C "$export_root" "$name"
+
+# --- 2. session -----------------------------------------------------------------------
+if colab sessions 2>/dev/null | grep -q "^\[$session\]"; then
+    say "reusing Colab session '$session'"
+else
+    say "creating Colab session '$session' on a $gpu"
+    colab new -s "$session" --gpu "$gpu"
+fi
+
+say "uploading bundle ($(du -h "$tgz" | cut -f1))"
+colab upload "$tgz" /content/bundle.tgz -s "$session"
+if [ -f "$home_dir/pushover.env" ]; then
+    colab upload "$home_dir/pushover.env" /content/pushover.env -s "$session"
+else
+    say "WARNING: $home_dir/pushover.env not found; launch will refuse unless ALLOW_SILENT=1"
+fi
+
+# --- 3. run ---------------------------------------------------------------------------
+say "installing the engine (pinned to $commit)"
+colab exec -f "$repo/bin/colab/setup.py" --env "POLYPHAR_COMMIT=$commit" --timeout 3600 -s "$session"
+
+say "launching the detached worker"
+colab exec -f "$repo/bin/colab/launch.py" --timeout 600 -s "$session" \
+    ${ALLOW_SILENT:+--env "ALLOW_SILENT=$ALLOW_SILENT"}
+
+say "polling every ${poll_s}s (the poll is also the keep-alive)"
+while true; do
+    sleep "$poll_s"
+    out="$(colab exec -f "$repo/bin/colab/poll.py" --timeout 120 -s "$session" 2>&1 || true)"
+    printf '%s\n' "$out" | grep -E '^STATE=' || true
+    case "$out" in
+        *STATE=GONE*|*STATE=NO-PIDFILE*) break ;;
+    esac
+done
+
+# --- 4. bring it home -----------------------------------------------------------------
+say "packing results"
+colab exec -f "$repo/bin/colab/pack.py" --timeout 600 -s "$session"
+res="$(mktemp -t polyphar-results-XXXXXX.tgz)"
+colab download /content/results.tgz "$res" -s "$session"
+tar xzf "$res" -C "$bundle"
+
+say "dock-merge"
+merge_rc=0
+"$here/polyphar-docker" dock-merge --bundle "$rel" $control || merge_rc=$?
+
+# exit 3 is `incomplete_targets`, which is the NORMAL state until the last bundle lands:
+# this run merged its units and others remain outstanding. Treating it as failure would
+# make every intermediate round trip look broken and break `&&` chains. Anything else is
+# a real failure and the bundle is left unmerged so it can be retried.
+case "$merge_rc" in
+    0) touch "$bundle/.merged" ;;
+    3) touch "$bundle/.merged"; say "merged; work still outstanding (exit 3 from dock-merge)" ;;
+    *) die "dock-merge failed (exit $merge_rc). The bundle is kept at $rel; results are in
+     $bundle/results. Fix the cause and re-run `polyphar-docker dock-merge --bundle $rel`." ;;
+esac
+
+[ -n "$keep" ] || colab stop -s "$session" || true
+rm -f "$tgz" "$res"
+
+say "done: bundle $rel merged. Re-run until dock reports nothing outstanding."
