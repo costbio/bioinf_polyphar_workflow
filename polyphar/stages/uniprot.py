@@ -48,7 +48,12 @@ def parse_uniprot_tsv(text):
     if "PDB" in df.columns:
         df["PDB"] = df["PDB"].str.rstrip(";")
     if "Organism (ID)" in df.columns:
-        df["Organism (ID)"] = df["Organism (ID)"].astype("int64")
+        # `search` answers for an INACTIVE entry (deleted, or demerged into others) with a
+        # stub row: accession and entry name only, every other field empty. int64 raised
+        # ValueError on the empty string and took the whole stage down -- 14 of Cluster1's
+        # 131 accessions are deleted TrEMBL entries. They parse as NA here and classify()
+        # reports them as inactive.
+        df["Organism (ID)"] = pd.to_numeric(df["Organism (ID)"], errors="coerce").astype("Int64")
     return df
 
 
@@ -145,10 +150,14 @@ def requery_primary(session, accession):
 def classify(requested, df, requery=None):
     """Split `requested` accessions by outcome.
 
-    Returns dict(kept: DataFrame, not_found: [acc], unreviewed: [acc],
+    Returns dict(kept: DataFrame, not_found: [acc], inactive: [acc], unreviewed: [acc],
     non_human: [acc], renamed: {requested: primary}). Requested IDs absent from
     df['Entry'] are re-queried one at a time with `requery(acc) -> primary|None`;
-    without `requery` they are all not_found."""
+    without `requery` they are all not_found.
+
+    An inactive entry (deleted, or demerged into others) comes back as a stub row with no
+    organism, so it is reported as inactive rather than re-queried: UniProt does return it
+    for its own accession, so a re-query would "rename" it to itself."""
     returned = set(df["Entry"])
     renamed, not_found = {}, []
     for acc in dict.fromkeys(requested):
@@ -159,13 +168,15 @@ def classify(requested, df, requery=None):
             not_found.append(acc)
         else:
             renamed[acc] = primary
+    live = df["Organism (ID)"].notna()
     reviewed = df["Reviewed"] == "reviewed"
-    human = df["Organism (ID)"] == HUMAN_TAXID
-    unreviewed = df.loc[~reviewed, "Entry"].tolist()
-    non_human = df.loc[reviewed & ~human, "Entry"].tolist()
-    kept = df[reviewed & human].reset_index(drop=True)
-    return {"kept": kept, "not_found": not_found, "unreviewed": unreviewed,
-            "non_human": non_human, "renamed": renamed}
+    human = (df["Organism (ID)"] == HUMAN_TAXID).fillna(False)
+    inactive = df.loc[~live, "Entry"].tolist()
+    unreviewed = df.loc[live & ~reviewed, "Entry"].tolist()
+    non_human = df.loc[live & reviewed & ~human, "Entry"].tolist()
+    kept = df[live & reviewed & human].reset_index(drop=True)
+    return {"kept": kept, "not_found": not_found, "inactive": inactive,
+            "unreviewed": unreviewed, "non_human": non_human, "renamed": renamed}
 
 
 # --- one protein per workbook row ----------------------------------------------
@@ -280,6 +291,7 @@ def run(layout, args, progress) -> dict:
     _atomic_write(d / "renamed.tsv", "requested\tprimary\n" + "".join(
         f"{k}\t{v}\n" for k, v in res["renamed"].items()))
     _atomic_write(d / "excluded.tsv", "accession\treason\n"
+                  + "".join(f"{a}\tinactive\n" for a in res["inactive"])
                   + "".join(f"{a}\tunreviewed\n" for a in res["unreviewed"])
                   + "".join(f"{a}\tnon_human\n" for a in res["non_human"])
                   + "".join(f"{a}\t{why}\n" for a, why in collapsed.items()))
@@ -289,7 +301,8 @@ def run(layout, args, progress) -> dict:
     tmp.replace(layout.uniprot_csv)
 
     counts = {"requested": len(ids), "kept": len(res["kept"]),
-              "not_found": len(res["not_found"]), "unreviewed": len(res["unreviewed"]),
+              "not_found": len(res["not_found"]), "inactive": len(res["inactive"]),
+              "unreviewed": len(res["unreviewed"]),
               "non_human": len(res["non_human"]), "renamed": len(res["renamed"]),
               "failed": 0}
     if layout.rows_tsv.is_file():

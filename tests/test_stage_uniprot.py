@@ -231,8 +231,8 @@ def test_run_writes_all_outputs_and_manifest(tmp_path, monkeypatch):
     assert m["stage"] == "uniprot"
     assert m["versions"] == {"uniprot": "2026_03"}
     assert m["inputs"][0]["sha256"] == sha256_file(layout.ids_txt)
-    assert m["counts"] == {"requested": 6, "kept": 2, "not_found": 1, "unreviewed": 1,
-                           "non_human": 1, "renamed": 1, "failed": 0}
+    assert m["counts"] == {"requested": 6, "kept": 2, "not_found": 1, "inactive": 0,
+                           "unreviewed": 1, "non_human": 1, "renamed": 1, "failed": 0}
 
 
 def test_run_is_resumable_and_refetches_when_ids_change(tmp_path, monkeypatch):
@@ -414,3 +414,37 @@ def test_ad_cluster_kept_matches_2023(n, ad_workbook, tmp_path, monkeypatch):
     # the v7 workbook has the full P85299. This is the one explained difference.
     known = {3: ({"P85299"}, {"P8529"})}.get(n, (set(), set()))
     assert (got - ref, ref - got) == known
+
+
+# --- inactive (deleted or demerged) entries ---------------------------------
+
+INACTIVE_TSV = (
+    "Entry\tEntry Name\tGene Names (primary)\tReviewed\tOrganism (ID)\tPDB\n"
+    "P25815\tS100P_HUMAN\tS100P\treviewed\t9606\t1J55;\n"
+    "A0A024QYU9\tA0A024QYU9_HUMAN\t\t\t\t\n"
+)
+
+
+def test_parse_keeps_inactive_stub_row_as_na_organism():
+    """UniProt answers for a deleted entry with accession and entry name only. int64 on
+    the empty organism raised ValueError and took the whole stage down."""
+    df = parse_uniprot_tsv(INACTIVE_TSV)
+    assert df["Entry"].tolist() == ["P25815", "A0A024QYU9"]
+    assert df["Organism (ID)"].tolist()[0] == 9606
+    assert df["Organism (ID)"].isna().tolist() == [False, True]
+
+
+def test_classify_reports_inactive_entries_and_does_not_requery_them():
+    df = parse_uniprot_tsv(INACTIVE_TSV)
+    calls = []
+
+    def requery(acc):
+        calls.append(acc)
+        return None
+
+    res = classify(["P25815", "A0A024QYU9", "NOPE01"], df, requery=requery)
+    assert res["kept"]["Entry"].tolist() == ["P25815"]
+    assert res["inactive"] == ["A0A024QYU9"]
+    assert res["not_found"] == ["NOPE01"]
+    assert res["unreviewed"] == [] and res["non_human"] == []
+    assert calls == ["NOPE01"]      # the inactive entry was returned, so never re-queried
