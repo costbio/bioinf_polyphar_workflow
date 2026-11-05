@@ -81,6 +81,8 @@ def run(layout, args, progress) -> dict:
     layout, control_lib = dock.control_view(layout, args)
     plan, lib, engine = dock.plan_for(layout, args, library=control_lib)
     rows: list[tuple[str, str]] = list(plan.missing)
+    # the same count units() announced, taken before the work that satisfies it
+    todo = sum(1 for t in plan.usable if not dock.receptor_is_prepared(layout, t))
     prepared = dock.prepare_receptors(layout, plan, rows)
     ligands_sdf = dock.titled_library(layout, lib, plan)
     dest = _bundle_dir(layout, args)
@@ -92,7 +94,11 @@ def run(layout, args, progress) -> dict:
 
         append_failure(dest, item, STAGE, reason)
     print(f"{STAGE}: bundle {dest}", flush=True)
-    progress.advance(len(written) * plan.n_ligands)
+    # In RECEPTORS, because that is what units() counts. Advancing by units x ligands --
+    # a number from a stage that docks nothing -- printed "36/4 units (900%)" on Cluster4
+    # and crossed every ETA milestone in the same second, so the stage's progress line and
+    # its ETA said nothing at all.
+    progress.advance(todo)
     return {"units": len(written), "outstanding": len(plan.outstanding(layout)),
             "targets": len(prepared), "ligands": plan.n_ligands,
             "engine": engine, "bundle": str(dest), "failed": len(rows)}

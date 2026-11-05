@@ -211,3 +211,29 @@ def test_the_wrapper_stops_after_dock_like_the_cli_does():
         f"the wrapper defaults --to {names[str(index)]}, the CLI defaults to "
         f"{DEFAULT_TO_STAGE}")
     assert "to=\"$last_index\"" not in text, "the old last-stage default is back"
+
+
+def test_export_reports_progress_in_the_unit_it_announced():
+    """units() counts RECEPTORS; run() advanced by units x ligands.
+
+    On Cluster4 that printed `dock-export: 36/4 units (900%)` and crossed the 5/25/50/75 %
+    ETA milestones inside the same second, so both the progress line and the ETA were
+    noise. The two numbers have to be the same quantity, and the one taken before the work
+    is the one units() promised.
+    """
+    import inspect
+
+    from polyphar.stages import dock_export
+
+    run_src = inspect.getsource(dock_export.run)
+    units_src = inspect.getsource(dock_export.units)
+
+    assert "progress.advance(todo)" in run_src, "advance must be in receptors"
+    assert "n_ligands" not in run_src.split("progress.advance")[0].split("todo =")[1], \
+        "the advance count must not be derived from the ligand count"
+    # and it is the same expression units() returns
+    expr = "sum(1 for t in plan.usable if not dock.receptor_is_prepared(layout, t))"
+    assert expr in units_src and expr in run_src
+
+    # taken BEFORE prepare_receptors, or it would always be zero
+    assert run_src.index("todo =") < run_src.index("prepare_receptors")
