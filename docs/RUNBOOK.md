@@ -62,6 +62,34 @@ than failing 2,083 records one at a time:
     docker build --build-arg POLYPHAR_GIT_COMMIT=$(git rev-parse HEAD) \
         -f docker/Dockerfile -t polyphar:1.2 -t polyphar:dev .
 
+### 2026-11-05 (later): image 1.3, unmodelled pockets and the PocketMatch hang
+
+`export POLYPHAR_VERSION=1.3`. Two further defects, both found when AD Cluster1's
+`similarity` appeared to hang:
+
+- **PocketMatch does not fail on an input it cannot handle, it SPINS** — 100 % CPU, ~1 MB
+  RSS, no output, no error. One pocket of `UNK` residues stalled 11 of Cluster1's 66 jobs
+  for 2.5 h. A single UNK residue is enough. `similarity` now drops such a pocket before
+  PocketMatch sees it, and `--pm-timeout` (default 3600 s) bounds every job.
+- **Pockets lined by unmodelled backbone reached the panel.** A traced main chain with no
+  side chains (`UNK`, or a poly-ALA stub) has no chemistry: docking it scores a backbone
+  groove. `pockets` now drops a pocket whose lining is mostly unmodelled, so it reaches
+  neither `select`, nor `similarity`, nor `dock`, and `structures` rejects a chain that is
+  unmodelled throughout (> 95 %).
+
+Measured over the 6,124 eligible pockets of Cluster1 and net1/net2/net3: 6,118 have no
+unmodelled residue and 6 are 100 % unmodelled (all 6BQ1 chain A). Only Cluster1 is
+affected — **net1, net2 and net3 need no pocket re-run.** Chains are a continuum, no chain
+is entirely unmodelled, and the heavily traced ones still give fully modelled pockets, so
+the chain guard is deliberately set where it discards nothing on this data.
+
+To re-apply the pocket filter to a run folder whose DoGSiteScorer output already exists,
+delete the stage manifest and re-run `pockets`: the queue re-uses every existing result,
+so nothing is sent to DoGSiteScorer again.
+
+    rm 04_pockets/manifest.json
+    $POLYPHAR pockets
+
 ### 2026-11-05: image 1.2, and why `select` and `ligands` must be re-run
 
 Three defects were found while investigating why no net1 target could complete. All three
@@ -292,7 +320,7 @@ The first full v2 subtype, as a sanity check for the other six. Run on POSEIDON 
 | `annotate` | 11606 annotated (3589 AlphaFold / 8017 experimental), 1127 grid_illegal | 0 |
 | `select` | 2371 eligible pockets, **panel 269 proteins / 479 targets** (172 AF / 97 exp) | 0 |
 | `similarity` | 2802528 pairs → 2754032 rows | 3 |
-| `ligands` | 2083 records → **1960 kept**, 123 excluded | 0 |
+| `ligands` | 2083 records → **1954 kept**, 129 excluded | 0 |
 
 Two things in that table are worth knowing before reading your own:
 
