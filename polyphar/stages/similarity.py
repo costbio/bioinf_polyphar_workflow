@@ -6,6 +6,10 @@ without that column, drugScore >= 0.5 (so the 2023 net2 regression still applies
 pocket file is 04_pockets/<UniProt ID>/<Pocket Filename>, found by its exact on-disk name.
 The pocket list is ordered by (UniProt ID, Pocket Filename) so every run sees the same order. A
 listed file that is missing is recorded in failed.tsv (`pocket file missing`) and dropped.
+A pocket holding an UNK residue is dropped too (`REASON_UNTYPABLE`): PocketMatch types
+atoms by residue and SPINS FOREVER on one it cannot type -- a single UNK residue is
+enough -- so such a pocket must never reach it. `--pm-timeout` bounds every job as the
+general guard behind that one.
 PocketMatch records a file's base name truncated to 32 characters, so names longer than
 32 or colliding fail the stage before PocketMatch runs (also in --dry-run), listed in
 failed.tsv.
@@ -77,11 +81,29 @@ POCKETSIM_COLUMNS = ["UniProt ID", "Gene Name", "Protein", "Pocket", "Pocket_Pat
                      "UniProt ID_2", "Gene Name_2", "Protein_2", "Pocket_2", "Pocket_Path_2",
                      "Pmin", "Pmax"]
 REASON_MISSING = "pocket file missing"
+# PocketMatch types every atom by its residue, and an UNK residue (unmodelled sequence,
+# common in cryo-EM entries) has no type: Step3-PM_serial then SPINS FOREVER on it at
+# 100% CPU with no output and no error. Measured 2026-11-05: a single UNK residue in an
+# otherwise healthy 32-residue pocket is enough. AD Cluster1 had 6 such pockets, all from
+# 6BQ1 chain A, and they stalled the 11 of 66 jobs that held them for 2.5 hours before
+# the stage was killed. A pocket PocketMatch cannot type is not comparable anyway, so it
+# is dropped here with a reason rather than left to hang the stage.
+REASON_UNTYPABLE = "pocket contains UNK residue(s); PocketMatch cannot type them"
+UNTYPABLE_RESIDUES = frozenset({"UNK"})
+# Per-job wall clock for Step3-PM_serial. The guard above removes the cause we know of;
+# this bounds every cause we do not, so a hang becomes a recorded failure in minutes
+# instead of an unbounded silence. 0 disables it.
+PM_JOB_TIMEOUT = 3600
 
 
 def add_arguments(parser) -> None:
     parser.add_argument("--pm-bin-dir", default=None,
                         help="directory holding the PocketMatch binaries (default: $PM_BIN_DIR)")
+    parser.add_argument("--pm-timeout", type=float, default=PM_JOB_TIMEOUT, metavar="S",
+                        help="seconds a single PocketMatch job may take before it is "
+                             f"killed and recorded as failed (default {PM_JOB_TIMEOUT}; "
+                             "0 = no limit). PocketMatch spins rather than failing on an "
+                             "input it cannot type.")
 
 
 class PocketMatchError(TaskError):
@@ -269,7 +291,7 @@ def cabbage_record(pocket, pm_bin_dir, out) -> None:
     _check(proc, f"{CABBAGE} ./{p.name}")
 
 
-def run_pocketmatch(pockets, pm_bin_dir, work_dir, records=None) -> Path:
+def run_pocketmatch(pockets, pm_bin_dir, work_dir, records=None, timeout=None) -> Path:
     """Upstream PocketMatch all-vs-all on `pockets` (in that order) inside work_dir:
     Step0-cabbage-core per pocket into outfile.cabbage, Step0-END-FILE, Step3-PM_serial.
     `records`, if given, are the pockets' cabbage-core outputs computed earlier (by
@@ -293,8 +315,16 @@ def run_pocketmatch(pockets, pm_bin_dir, work_dir, records=None) -> Path:
     os.symlink(os.devnull, pairs)
     score = work / SCORE_FILE
     score.unlink(missing_ok=True)
-    proc = subprocess.run([str(pm / PM_SERIAL), cabbage.name], cwd=work,
-                          stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    try:
+        proc = subprocess.run([str(pm / PM_SERIAL), cabbage.name], cwd=work,
+                              stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                              timeout=timeout or None)
+    except subprocess.TimeoutExpired:
+        raise PocketMatchError(
+            f"{PM_SERIAL} did not finish within {timeout:g}s over {len(pockets)} pocket(s) "
+            f"and was killed. It does not fail on an input it cannot handle, it spins: "
+            f"check the pockets for residues it cannot type (see {REASON_UNTYPABLE!r}), "
+            f"or raise --pm-timeout if the job really is this slow.", None) from None
     _check(proc, PM_SERIAL)
     if not score.is_file():
         raise PocketMatchError(f"{PM_SERIAL} wrote no {SCORE_FILE}")
@@ -474,17 +504,19 @@ def _cabbage(pocket: Path, pm_bin_dir, record: Path, failed: Path) -> str | None
 
 
 def _job_worker(paths: list[str], records: list[str], block_of: list[int], job: Job,
-                pm_bin_dir: str, jobs_dir: str, fingerprint: str) -> int:
-    return _task(lambda: _job(paths, records, block_of, job, pm_bin_dir, jobs_dir, fingerprint))
+                pm_bin_dir: str, jobs_dir: str, fingerprint: str, timeout=None) -> int:
+    return _task(lambda: _job(paths, records, block_of, job, pm_bin_dir, jobs_dir,
+                              fingerprint, timeout))
 
 
-def _job(paths, records, block_of, job, pm_bin_dir, jobs_dir, fingerprint) -> int:
+def _job(paths, records, block_of, job, pm_bin_dir, jobs_dir, fingerprint,
+         timeout=None) -> int:
     t0 = time.monotonic()
     paths = [Path(p) for p in paths]
     names = [p.name for p in paths]
     jobs_dir = Path(jobs_dir)
     with tempfile.TemporaryDirectory(prefix=f"polyphar_pm_{job.tag}_") as tmp:
-        score = run_pocketmatch(paths, pm_bin_dir, tmp, records=records)
+        score = run_pocketmatch(paths, pm_bin_dir, tmp, records=records, timeout=timeout)
         kept = 0
 
         def counted():
@@ -563,7 +595,7 @@ def _cabbage_phase(paths, digests, pm: Path, bins: dict, work: Path, nprocs: int
 
 
 def _run_jobs(plan: _Plan, records: list[Path], pm_bin_dir: Path, jobs_dir: Path,
-              nprocs: int, progress) -> None:
+              nprocs: int, progress, timeout=None) -> None:
     """Phase 2: the block-pair jobs not done yet; any failure is fatal (JobsFailed)."""
     todo = [j for j in plan.jobs if j.tag not in plan.done]
     if not todo:
@@ -575,7 +607,7 @@ def _run_jobs(plan: _Plan, records: list[Path], pm_bin_dir: Path, jobs_dir: Path
         tasks.append((job.tag, _job_worker,
                       ([str(plan.paths[a]) for a in members], [str(records[a]) for a in members],
                        [block_of[a] for a in members], job, str(pm_bin_dir),
-                       str(jobs_dir), plan.fingerprints[job.tag])))
+                       str(jobs_dir), plan.fingerprints[job.tag], timeout)))
 
     def advance(item, kept):
         if progress is not None:
@@ -622,7 +654,8 @@ class _Result:
     digests: list[str]           # sha256 of plan.paths
 
 
-def _similarity(pockets, pm_bin_dir, work_dir, nprocs, progress=None, digests=None) -> _Result:
+def _similarity(pockets, pm_bin_dir, work_dir, nprocs, progress=None, digests=None,
+                timeout=None) -> _Result:
     work, pm = Path(work_dir), Path(pm_bin_dir)
     paths = [Path(p) for p in pockets]
     bins = _bin_hashes(pm)
@@ -636,7 +669,7 @@ def _similarity(pockets, pm_bin_dir, work_dir, nprocs, progress=None, digests=No
     for f in jobs_dir.iterdir():   # job files of another plan (other nprocs or pockets)
         if f.suffix in (".txt", ".done") and f.name not in current:
             f.unlink(missing_ok=True)
-    _run_jobs(plan, [records[i] for i in keep], pm, jobs_dir, nprocs, progress)
+    _run_jobs(plan, [records[i] for i in keep], pm, jobs_dir, nprocs, progress, timeout)
     out = work / SCORE_FILE
     if plan.jobs:
         _merge(plan, jobs_dir, out)
@@ -794,7 +827,30 @@ def _inputs(layout):
         keep = {(r["UniProt_ID"], r["Pocket Filename"]) for r in _csv.DictReader(fh)}
     mask = [(a, f) in keep for a, f in zip(table["UniProt ID"], table["Pocket Filename"])]
     table = table[mask].reset_index(drop=True)
-    return table, _paths(layout.pockets, table), missing
+    paths = _paths(layout.pockets, table)
+    # dropped BEFORE PocketMatch sees them: one of these hangs Step3-PM_serial forever
+    bad = {p.resolve() for p in untypable_pockets(paths)}
+    if bad:
+        live = [p.resolve() not in bad for p in paths]
+        table = table[live].reset_index(drop=True)
+        paths = [p for p, ok in zip(paths, live) if ok]
+    return table, paths, missing, sorted(f"{p.parent.name}/{p.name}" for p in bad)
+
+
+def untypable_pockets(paths) -> list[Path]:
+    """The pockets holding a residue PocketMatch cannot type (see REASON_UNTYPABLE)."""
+    out = []
+    for p in paths:
+        try:
+            with open(p, encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    if (line.startswith(("ATOM", "HETATM"))
+                            and line[17:20].strip().upper() in UNTYPABLE_RESIDUES):
+                        out.append(Path(p))
+                        break
+        except OSError:
+            continue        # a missing file is already reported as REASON_MISSING
+    return out
 
 
 def _guard(layout, paths, record: bool, fresh: bool = True) -> None:
@@ -886,7 +942,7 @@ def units(layout, args) -> WorkUnits:
     cabbage-core rejects, minus finished jobs. Fails on the name guard (in --dry-run too;
     otherwise the findings are written to failed.tsv). Without the PocketMatch binaries
     no job can be matched, so every pair counts."""
-    _, paths, _ = _inputs(layout)
+    _, paths, _, _ = _inputs(layout)
     _guard(layout, paths, record=not getattr(args, "dry_run", False))
     pm = _pm_or_none(args)
     bins = _bin_hashes(pm) if pm is not None else None
@@ -907,7 +963,7 @@ def _versions(pm: Path) -> dict:
 
 def run(layout, args, progress) -> dict:
     d = layout.similarity
-    table, paths, missing = _inputs(layout)
+    table, paths, missing, untypable = _inputs(layout)
     digests = None
     if not _name_problems(paths)[1]:
         digests = [sha256_file(p) for p in paths]
@@ -919,13 +975,16 @@ def run(layout, args, progress) -> dict:
     (d / "failed.tsv").write_text("item\tstage\treason\n")
     for item in missing:
         append_failure(d, item, STAGE, REASON_MISSING)
+    for item in untypable:
+        append_failure(d, item, STAGE, REASON_UNTYPABLE)
     _guard(layout, paths, record=True, fresh=False)   # before anything touches PocketMatch
     pm = _pm_bin_dir(args)
     (d / SCORE_FILE).unlink(missing_ok=True)
     (d / "Pocketsim.csv").unlink(missing_ok=True)
 
     try:
-        res = _similarity(paths, pm, d, args.nprocs, progress, digests)
+        res = _similarity(paths, pm, d, args.nprocs, progress, digests,
+                          timeout=getattr(args, "pm_timeout", PM_JOB_TIMEOUT))
     except JobsFailed as exc:
         for item, reason in exc.failures:
             append_failure(d, item, STAGE, reason)

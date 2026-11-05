@@ -829,3 +829,83 @@ def test_reproduces_net2_2023(net2_run, tmp_path, nprocs):
     print(f"net2 similarity nprocs={nprocs} second invocation (units + run): "
           f"{time.monotonic() - t0:.1f} s")
     assert {p: p.stat().st_mtime_ns for p in layout.similarity.rglob("*")} == files
+
+
+# --- pockets PocketMatch cannot type --------------------------------------------------
+
+def _pocket(path, n_residues=6, residue="ALA"):
+    """A small pocket PDB: `n_residues` residues of N/CA/C/O atoms."""
+    lines = ["HEADER File contains complete residues of binding site atoms\n"]
+    i = 0
+    for r in range(n_residues):
+        for atom, el in (("N", "N"), ("CA", "C"), ("C", "C"), ("O", "O")):
+            i += 1
+            lines.append(
+                f"ATOM  {i:5d}  {atom:<3} {residue} A{r + 1:4d}    "
+                f"{r * 3.0:8.3f}{i * 0.5:8.3f}{r * 1.5:8.3f}  1.00  0.00           {el}\n")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("".join(lines) + "END\n")
+    return path
+
+
+def _with_unk(src, dst, n_residues=1):
+    """`src` with the first `n_residues` residues renamed UNK."""
+    seen, out = [], []
+    for line in src.read_text().splitlines(keepends=True):
+        if line.startswith(("ATOM", "HETATM")):
+            key = line[21:27]
+            if key not in seen:
+                seen.append(key)
+            if seen.index(key) < n_residues:
+                line = line[:17] + "UNK" + line[20:]
+        out.append(line)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    dst.write_text("".join(out))
+    return dst
+
+
+def test_untypable_pockets_finds_a_single_unk_residue(tmp_path):
+    """One UNK residue is enough: measured 2026-11-05, Step3-PM_serial then spins
+    forever on the pocket at 100% CPU instead of failing."""
+    good = _pocket(tmp_path / "src" / "good.pdb", n_residues=6)
+    one = _with_unk(good, tmp_path / "P1" / "one_unk.pdb", n_residues=1)
+    allunk = _with_unk(good, tmp_path / "P1" / "all_unk.pdb", n_residues=10_000)
+    found = {p.name for p in sim.untypable_pockets([good, one, allunk])}
+    assert found == {"one_unk.pdb", "all_unk.pdb"}
+
+
+def test_untypable_pockets_ignores_a_file_it_cannot_read(tmp_path):
+    """A missing file is the business of REASON_MISSING, not of this check."""
+    assert sim.untypable_pockets([tmp_path / "nope.pdb"]) == []
+
+
+def test_an_unk_pocket_is_dropped_and_reported_not_handed_to_pocketmatch(tmp_path):
+    """It must never reach PocketMatch: there it would hang the whole stage."""
+    src = _pocket(tmp_path / "src" / "good.pdb")
+    files = {("P1", "a.pdb"): src, ("P2", "b.pdb"): src, ("P3", "unk.pdb"): src}
+    layout = _run_folder(tmp_path / "run", files)
+    _with_unk(src, layout.pockets / "P3" / "unk.pdb", n_residues=1)
+
+    _table, paths, _missing, untypable = sim._inputs(layout)
+    assert untypable == ["P3/unk.pdb"]
+    assert "unk.pdb" not in {p.name for p in paths}
+    assert {p.name for p in paths} == {"a.pdb", "b.pdb"}
+
+
+def test_a_pocketmatch_job_that_will_not_finish_is_killed_and_explained(tmp_path):
+    """The general guard behind the UNK one: PocketMatch spins rather than failing, so a
+    job must be bounded or the stage waits on it for ever."""
+    src = _pocket(tmp_path / "src" / "good.pdb")
+    fake = tmp_path / "bin"
+    fake.mkdir()
+    for name in (sim.CABBAGE, sim.END_FILE):
+        (fake / name).write_text("#!/bin/sh\nexit 0\n")
+    (fake / sim.PM_SERIAL).write_text("#!/bin/sh\nsleep 30\n")
+    for name in sim.PM_BINARIES:
+        (fake / name).chmod(0o755)
+
+    with pytest.raises(sim.PocketMatchError) as exc:
+        sim.run_pocketmatch([src, src], fake, tmp_path / "work",
+                            records=[src, src], timeout=1)
+    msg = str(exc.value)
+    assert "did not finish within 1s" in msg and "spins" in msg
