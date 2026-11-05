@@ -62,6 +62,41 @@ than failing 2,083 records one at a time:
     docker build --build-arg POLYPHAR_GIT_COMMIT=$(git rev-parse HEAD) \
         -f docker/Dockerfile -t polyphar:1.2 -t polyphar:dev .
 
+### 2026-11-06 (later): five ways the wrapper behaved differently from the tool
+
+Running the seven subtypes through the REAL Colab/Uni-Dock path -- rather than a local
+engine -- turned up five defects in `bin/polyphar-docker` and `bin/polyphar-colab`. All
+five share one shape: **the host wrapper quietly doing something other than what
+`polyphar` itself does**, and none was reachable by any test that existed before, because
+those two scripts had no tests at all.
+
+| what | why it mattered |
+|---|---|
+| `--library` was dropped at the round trip | `dock-export`/`dock-merge` fell back to the DEFAULT library. On a run folder that has one, the GPU would dock a **different library than the run planned**, with the wrong sha in every unit key. |
+| `colab exec` exits 0 even when the remote script raised | A refused `launch.py` looked like a started worker: poll, `NO-PIDFILE`, merge **0 units**, report "done". On a real subtype that is 200 units you believe are running. |
+| `import_bundle` copied non-atomically | An interrupted merge left a partial SDF that the next merge archived as a discarded draw. No draw lost, but the discard log fills with debris. |
+| the drop-dedup was a substring scan | O(log size) per unit, and loose enough that two units could satisfy it between them without either having been logged. |
+| the wrapper's `--to` defaulted to the LAST stage | `polyphar run` stops after `dock`; the wrapper ran `control` and `stats` **unasked** and died in stats' preflight. |
+
+Both execs now require the script's own last line as proof -- `worker pid=... RUNNING`,
+and a new `setup: ready` -- rather than the exit status. `tests/test_dock_defaults.py`
+fails if the wrapper's default stage ever diverges from `run.DEFAULT_TO_STAGE` again.
+
+**Running the seven subtypes.** They dock through real Colab Uni-Dock, which is the point:
+
+    DOGSITE_BIN=$PWD/tests/fixtures/fake_dogsite2 POLYPHAR_VERSION=1.4 \
+        pytest tests/test_subtypes_e2e.py
+
+Three traps worth knowing, each of which cost a run:
+- **`fake_dogsite2`, not `fake_dogsite`.** Same file; under its plain name it answers
+  `--help` as DoGSite3, which conflicts with the default `--pocket-tool dogsite2`.
+- **The commit must be pushed.** The VM pip-installs polyphar from it.
+- **`ALLOW_SILENT=1`** unless `$POLYPHAR_HOME/pushover.env` exists -- `launch.py` refuses
+  to start a worker that cannot notify you, which is right for a real run.
+
+`POLYPHAR_COLAB_KEEP=1` holds one session across several run folders, so the engine
+install is paid once instead of once per bundle. Useful for a night of subtypes too.
+
 ### 2026-11-06: results come home continuously, not once at the end
 
 The Colab round trip used to pack and download **only after the worker finished**. A VM
