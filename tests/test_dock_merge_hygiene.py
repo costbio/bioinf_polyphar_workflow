@@ -86,3 +86,38 @@ def test_a_reason_containing_tabs_cannot_shift_the_columns(tmp_path):
     move the archived path and the dedup would silently stop matching."""
     dock.log_discard(tmp_path, _unit(key="key-aaa"), "dropped\ton\tmerge", "/b/A/r0.sdf")
     assert dock._logged_drops(tmp_path) == {("key-aaa", "/b/A/r0.sdf")}
+
+
+# --- a refusal must outlive the next merge --------------------------------------------
+
+def test_a_rejection_is_recorded_where_the_next_merge_cannot_wipe_it(tmp_path):
+    """dock.run truncates failed.tsv at the start of every call and dock_merge appends its
+    rejections after, so a second merge wiped the first merge's. A rejected unit is GPU
+    time spent on a draw that did not count; that fact belongs in the append-only log."""
+    rejected = []
+    logged = set()
+    layout = dock._ArchiveLayout(tmp_path) if hasattr(dock, "_ArchiveLayout") else None
+    if layout is None:
+        pytest.skip("no archive layout helper")
+
+    class _BL:
+        pass
+
+    unit = _unit(label="A", replicate=0, key="key-aaa")
+    bl = _BL()
+    bl.docking = tmp_path / "bundle_results"
+    (bl.docking / "A" / "replicates").mkdir(parents=True)
+
+    dock._reject(rejected, layout, unit, bl, "unit key differs from this run's",
+                 tmp_path / "bundle", logged)
+
+    assert rejected == [("A/r0", "unit key differs from this run's")]
+    rows = (tmp_path / dock.DISCARD_LOG).read_text().splitlines()
+    assert len(rows) == 2, rows          # header + one refusal
+    assert "rejected on merge" in rows[1]
+    assert "key-aaa" in rows[1]
+
+    # re-merging the same bundle must not log the refusal twice
+    dock._reject(rejected, layout, unit, bl, "unit key differs from this run's",
+                 tmp_path / "bundle", logged)
+    assert len((tmp_path / dock.DISCARD_LOG).read_text().splitlines()) == 2

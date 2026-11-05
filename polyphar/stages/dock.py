@@ -2209,12 +2209,12 @@ def import_bundle(layout, plan: _Plan, bundle):
         u = b.unit
         mine = want.get((u.label, u.replicate))
         if mine is None:
-            rejected.append((f"{u.label}/{u.name}", "not a unit of this run"))
+            _reject(rejected, layout, u, bl, "not a unit of this run", bundle, logged)
             continue
         if mine.key != u.key:
-            rejected.append((f"{u.label}/{u.name}",
-                             "unit key differs from this run's: the bundle was made under "
-                             "different settings and its draws are not these draws"))
+            _reject(rejected, layout, u, bl,
+                    "unit key differs from this run's: the bundle was made under "
+                    "different settings and its draws are not these draws", bundle, logged)
             continue
         if unit_state(bl, u) != STATE_DONE:
             continue   # not drawn yet in the bundle; a later worker pass will
@@ -2224,7 +2224,7 @@ def import_bundle(layout, plan: _Plan, bundle):
         # that no longer matches it is not the draw that was made.
         tampered = verify_result_digest(bl, u)
         if tampered:
-            rejected.append((f"{u.label}/{u.name}", tampered))
+            _reject(rejected, layout, u, bl, tampered, bundle, logged)
             continue
         src_sdf, src_log, src_done = unit_paths(bl, u)
         dst_sdf, dst_log, dst_done = unit_paths(layout, mine)
@@ -2259,6 +2259,24 @@ def import_bundle(layout, plan: _Plan, bundle):
         taken.append(mine)
     _carry_discards(bundle, layout)
     return taken, rejected, dropped
+
+
+def _reject(rejected: list, layout, u: Unit, bl, reason: str, bundle, logged: set) -> None:
+    """Refuse a bundle unit, and record the refusal where it will OUTLIVE the next merge.
+
+    `dock.run` truncates failed.tsv at the start of every call, and dock_merge appends its
+    rejections after it, so a second merge wiped the first merge's. A rejected unit is GPU
+    time spent on a draw that did not count -- exactly the kind of fact you want months
+    later when asking why a bundle contributed 40 of 50 units -- so it belongs in the
+    append-only discard log, next to the drops, for the reason log_discard already gives:
+    a draw that was thrown away is a (small) selection effect and the record of it has to
+    outlive the run that did it."""
+    rejected.append((f"{u.label}/{u.name}", reason))
+    src = unit_paths(bl, u)[0]
+    if (u.key, str(src)) not in logged:
+        logged.add((u.key, str(src)))
+        log_discard(layout.docking, u, f"rejected on merge: {reason} (bundle: {bundle})",
+                    str(src))
 
 
 def _logged_drops(stage_dir) -> set:
