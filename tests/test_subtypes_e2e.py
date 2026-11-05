@@ -106,8 +106,19 @@ def test_a_subtype_runs_end_to_end(subtype, tmp_path, home):
     _image_or_skip()
     accessions = SUBTYPES[subtype]
     r = _run(tmp_path / subtype, home, accessions)
-    assert r.returncode == 0, r.stdout[-4000:] + r.stderr[-4000:]
+    # 3 is EXIT_FLAGGED: a stage finished with flagged counts, and for dock that normally
+    # means incomplete_targets -- Uni-Dock does not always pose every ligand (issue #133),
+    # so a replicate can legitimately come back short and the target waits for a redraw.
+    # It is the ordinary state until everything is docked, not a failure. Anything else is.
+    assert r.returncode in (0, 3), r.stdout[-4000:] + r.stderr[-4000:]
     run_dir = tmp_path / subtype
+
+    # ... but an incomplete target must be NAMED, never silently absent. This is the
+    # habit that let six boron drugs make every target permanently incomplete without a
+    # word in any log.
+    if r.returncode == 3:
+        failed = (run_dir / "07_docking" / "failed.tsv").read_text().splitlines()
+        assert len(failed) > 1, f"{subtype}: exit 3 with an empty failed.tsv"
 
     for d in DIRS:
         assert (run_dir / d / "manifest.json").is_file(), f"{subtype}: {d} has no manifest"
@@ -119,7 +130,7 @@ def test_a_subtype_runs_end_to_end(subtype, tmp_path, home):
 
     # docking produced a summary per complete target, over the ligands that survived
     results = list((run_dir / "07_docking").glob("df_results_*.csv"))
-    assert results, f"{subtype}: no df_results"
+    assert results, f"{subtype}: no df_results"   # at least one target came out whole
     assert all(len(p.read_text().splitlines()) > 1 for p in results)
 
     # Uni-Dock on a GPU, not a local fallback. A run that quietly fell back to CPU would
