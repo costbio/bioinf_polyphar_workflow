@@ -51,6 +51,15 @@ keep="${POLYPHAR_COLAB_KEEP:+1}"
 # the run's library, forwarded from polyphar-docker: dock-export and dock-merge must both
 # see the same one, since its sha256 is part of every unit key
 library=""
+# The engine string the unit keys are planned under. It HAS to be fixed here, before the
+# bundle is sent: this host has no GPU to ask, and a key cannot be assigned after the work
+# it identifies. It must match what the VM's binary reports of itself, or dock-merge warns
+# "drawn by X, planned under Y" on every single merge -- it said 'Uni-Dock 1.2.0' against a
+# binary that calls itself 'Uni-Dock v1.2.0', so the one warning that exists to catch a
+# changed engine fired every time and meant nothing. Changing this changes every unit key;
+# it was changed on 2026-11-06 when the v2 run folders held 0 recorded draws, so it cost
+# nothing. Later it would supersede every draw made under the old string.
+engine_version="${POLYPHAR_ENGINE_VERSION:-Uni-Dock v1.2.0}"
 # Every OTHER dock option, forwarded verbatim from polyphar-docker after a `--`.
 # dock-export and dock-merge must see the same ones the user typed: --replicates decides
 # which units are outstanding, and --seed, --search-mode, --batch-size, --threads-per-job
@@ -262,7 +271,7 @@ if [ -z "$attach" ] && [ -z "$merge_only" ]; then
     say "dock-export -> $rel"
     "$here/polyphar-docker" dock-export --bundle "$rel" $control \
         ${library:+--library "$library"} ${dock_args[@]+"${dock_args[@]}"} \
-        ${max_units:+--max-units "$max_units"} --engine-version 'Uni-Dock 1.2.0'
+        ${max_units:+--max-units "$max_units"} --engine-version "$engine_version"
 
     bundle="$export_root/$name"
     [ -f "$bundle/units.tsv" ] || die "export wrote no units.tsv"

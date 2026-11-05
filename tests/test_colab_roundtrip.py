@@ -410,6 +410,30 @@ def test_the_dock_options_reach_both_ends_of_the_round_trip(world):
         assert "--seed 7" in line, (stage, line)
 
 
+def test_the_planned_engine_string_matches_what_the_binary_calls_itself(world):
+    """dock-merge warns when the engine that DREW the units is not the one their keys were
+    planned under. That warning is the only thing standing between a silently changed
+    engine on the VM and a set of results keyed to a version that never ran.
+
+    The wrapper planned under 'Uni-Dock 1.2.0' while the binary reports 'Uni-Dock v1.2.0',
+    so the warning fired on every merge and meant nothing -- a check that always fires is
+    worse than no check, because people learn to scroll past it.
+
+    The string must stay pinned here rather than read from the engine: this host has no
+    GPU to ask, and a unit key cannot be assigned after the work it identifies.
+    """
+    import re as _re
+
+    text = WRAPPER.read_text()
+    assert _re.search(r'engine_version="\$\{POLYPHAR_ENGINE_VERSION:-([^}]+)\}"', text), \
+        "the planned engine string must be one named, overridable value"
+    planned = _re.search(r'engine_version="\$\{POLYPHAR_ENGINE_VERSION:-([^}]+)\}"',
+                         text).group(1)
+    # what bin/colab/setup.py installs and the binary then reports of itself
+    assert planned == "Uni-Dock v1.2.0", planned
+    assert "--engine-version \"$engine_version\"" in text
+
+
 def test_a_refused_launch_is_still_fatal(world):
     """The probe only covers a lost connection. A refusal exits 0 with a reason, and the
     worker really is not running -- that must still stop the run."""

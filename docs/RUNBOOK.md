@@ -156,6 +156,25 @@ answers:
   and the run dies with a worker on the VM burning GPU units nobody is watching. The
   wrapper polls instead: `STATE=RUNNING` means the launch landed.
 
+#### The engine string the keys are planned under
+
+`bin/polyphar-colab` passes `--engine-version` to `dock-export` as a fixed string. It has
+to be fixed there: the host has no GPU to ask, and a unit key cannot be assigned after the
+work it identifies. It said `Uni-Dock 1.2.0` while the VM's binary calls itself
+`Uni-Dock v1.2.0`, so `dock-merge`'s *drawn by X, planned under Y* warning — the only
+thing standing between a silently changed engine and results keyed to a version that never
+ran — fired on **every** merge and meant nothing.
+
+Corrected to `Uni-Dock v1.2.0` on 2026-11-06, when the `disease_subtypes_v2` run folders
+held **0 recorded draws** (net1's docking had already been set aside as
+`superseded_mispaired_*`), so it cost nothing. **Changing it again supersedes every draw
+made under the old string**, so it is `POLYPHAR_ENGINE_VERSION` now rather than a literal:
+change the VM's engine and the override, together, between runs and never during one.
+
+The gap that remains, by construction: a different engine on the VM is *recorded* (per-unit
+`prov.json` carries what actually ran) and *warned about*, but does not supersede the
+units, because the key was fixed before the work was sent.
+
 ### 2026-11-05 (later): image 1.3, unmodelled pockets and the PocketMatch hang
 
 `export POLYPHAR_VERSION=1.3`. Two further defects, both found when AD Cluster1's
