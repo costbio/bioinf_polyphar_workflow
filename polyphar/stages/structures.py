@@ -40,6 +40,7 @@ from pathlib import Path
 
 import requests
 
+from polyphar import modelling
 from polyphar.common import WorkUnits, append_failure, http_session, write_manifest
 
 STAGE = "structures"
@@ -395,13 +396,36 @@ def _write_chain(cif, chain, out_pdb) -> None:
     os.replace(tmp, out_pdb)
 
 
+# A chain that is nothing but traced main chain carries no chemistry at all: no side
+# chains to line a pocket, nothing PocketMatch can type, nothing to dock against. It is
+# rejected here so it never reaches pdbfixer or DoGSiteScorer.
+#
+# The bar is deliberately at "the whole chain", because partial tracing is ordinary and
+# useful. Measured over the 7,505 extracted chains of AD Cluster1 and HCC net1/net2/net3
+# (2026-11-05): NO chain is entirely unmodelled, the most extreme is 90.8 %, and the
+# 25-99 % band is the single largest group (1,263 of net1's 3,132). Those chains still
+# yield good pockets -- 6T7B_K at 90.8 %, 3J8B_C and 3J8C_C at 90.5 %, 4UXY_C at 88.6 %
+# together contribute 19 eligible pockets, every one of them fully modelled, because the
+# pocket sits on the part that was resolved. A threshold low enough to drop 6BQ1 chain A
+# (32 % unmodelled) would throw all of those away for nothing. The unmodelled POCKET
+# filter in the pockets stage is what actually removes the bad sites; this is the guard
+# for a chain with nothing usable in it at all.
+MAX_UNMODELLED_CHAIN = 0.95
+
+
 def extract_chain(cif, chain, out_pdb) -> dict:
     """Write author chain `chain` of `cif` (all models) to `out_pdb`.
 
     A multi-character chain ID is written as `A` (the PDB format has one column).
     Returns cif_header(cif). Raises ChainRejected (a ValueError), writing nothing,
-    when the chain has no atoms or only HETATM records."""
+    when the chain has no atoms, only HETATM records, or is unmodelled throughout."""
     _write_chain(cif, chain, out_pdb)
+    frac, bad, total = modelling.unmodelled_fraction(out_pdb)
+    if total and frac > MAX_UNMODELLED_CHAIN:
+        Path(out_pdb).unlink(missing_ok=True)
+        raise ChainRejected(
+            f"chain is unmodelled throughout: {bad} of {total} residues are traced main "
+            f"chain with no side chains, so it has no chemistry to dock or compare")
     return cif_header(cif)
 
 

@@ -612,3 +612,46 @@ def test_run_maps_empty_pdb_bounds_through_the_cif_seqres(tmp_path, monkeypatch)
     assert info[info["AlphaFold"] == "True"].iloc[0]["SIFTS segments source"] == ""
     m = json.loads((layout.structures / "manifest.json").read_text())
     assert m["counts"]["segments_from_seqres"] == 1 and m["counts"]["segments_unverified"] == 0
+
+
+# --- a chain with no chemistry in it ---------------------------------------------------
+
+def test_a_chain_that_is_unmodelled_throughout_is_rejected(tmp_path, monkeypatch):
+    """Traced main chain and nothing else: no side chains to line a pocket, nothing to
+    dock. The bar is the WHOLE chain -- partial tracing is ordinary and still useful."""
+    out = tmp_path / "chain.pdb"
+
+    def fake_write(cif, chain, out_pdb):
+        lines, i = [], 0
+        for r in range(1, 21):
+            for atom in ("N", "CA", "C", "O", "CB"):
+                i += 1
+                lines.append(f"ATOM  {i:5d}  {atom:<3} UNK A{r:4d}    "
+                             f"{r:8.3f}{i:8.3f}{r:8.3f}  1.00  0.00           {atom[0]}\n")
+        Path(out_pdb).write_text("".join(lines) + "END\n")
+
+    monkeypatch.setattr(structures, "_write_chain", fake_write)
+    with pytest.raises(structures.ChainRejected, match="unmodelled throughout"):
+        structures.extract_chain("x.cif", "A", out)
+    assert not out.exists()      # nothing is left behind for pdbfixer to pick up
+
+
+def test_a_partly_traced_chain_is_kept(tmp_path, monkeypatch):
+    """6T7B_K is 90.8 % unmodelled and still yields a fully modelled eligible pocket."""
+    out = tmp_path / "chain.pdb"
+
+    def fake_write(cif, chain, out_pdb):
+        lines, i = [], 0
+        for r in range(1, 21):
+            name, atoms = (("UNK", ("N", "CA", "C", "O", "CB")) if r > 2
+                           else ("LEU", ("N", "CA", "C", "O", "CB", "CG", "CD1")))
+            for atom in atoms:
+                i += 1
+                lines.append(f"ATOM  {i:5d}  {atom:<3} {name} A{r:4d}    "
+                             f"{r:8.3f}{i:8.3f}{r:8.3f}  1.00  0.00           {atom[0]}\n")
+        Path(out_pdb).write_text("".join(lines) + "END\n")
+
+    monkeypatch.setattr(structures, "_write_chain", fake_write)
+    monkeypatch.setattr(structures, "cif_header", lambda cif: {"ok": True})
+    assert structures.extract_chain("x.cif", "A", out) == {"ok": True}
+    assert out.exists()

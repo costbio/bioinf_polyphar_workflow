@@ -60,6 +60,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from polyphar import modelling
 from polyphar.common import WorkUnits, append_failure, write_manifest
 
 STAGE = "pockets"
@@ -516,6 +517,21 @@ def parse_pockets(pockets_dir, protein_info, tool: str = DEFAULT_TOOL):
 SEGMENT_COLUMNS = ("SIFTS segments", "SIFTS other accessions")
 MAX_OUTSIDE = 0.5
 REASON_OUTSIDE = "pocket outside target segment"
+
+# --- unmodelled pockets ------------------------------------------------------------------
+# A pocket whose lining residues are traced main chain with no side chains (UNK, or a
+# poly-ALA stub) is not a binding site: the chemistry that would line it was never
+# modelled. Docking there scores a backbone groove, and PocketMatch SPINS FOREVER on one
+# (a single UNK residue is enough). Dropped here, where DrugScore.csv is written, so it
+# reaches neither `select`, nor `similarity`, nor `dock`.
+#
+# Measured over the 6,124 eligible pockets of AD Cluster1 and HCC net1/net2/net3
+# (2026-11-05): the split is total. 6,118 have NO unmodelled residue at all, and 6 are
+# 100 % unmodelled -- all of them 6BQ1 chain A, the entry that hung similarity. Nothing
+# lies in between, so any threshold in (0, 1] selects the same six; a majority is used
+# because a site whose lining is mostly unmodelled is already not a site.
+MAX_UNMODELLED = 0.5
+REASON_UNMODELLED = "pocket lining is unmodelled backbone (no side chains)"
 _BOUND = re.compile(r"^(-?\d+)([A-Za-z]?)$")
 
 
@@ -658,6 +674,30 @@ def filter_segments(layout, df, info, tool: str = DEFAULT_TOOL):
 
 # --- run -----------------------------------------------------------------------------
 
+def filter_unmodelled(layout, df):
+    """(df without pockets whose lining is unmodelled, [(item, reason)]).
+
+    Applies to every pocket, AlphaFold models included -- a predicted model has side
+    chains everywhere, so it simply never matches."""
+    if df.empty:
+        return df, []
+    keep, dropped = [], []
+    for acc, fname in zip(df["UniProt ID"], df["Pocket Filename"]):
+        path = layout.pockets / str(acc) / str(fname)
+        try:
+            frac, bad, total = modelling.unmodelled_fraction(path)
+        except OSError:
+            keep.append(True)      # unreadable here is the parse step's business
+            continue
+        if total and frac > MAX_UNMODELLED:
+            keep.append(False)
+            dropped.append((f"{acc}/{fname}",
+                            f"{REASON_UNMODELLED}: {bad} of {total} residues"))
+        else:
+            keep.append(True)
+    return df[keep].reset_index(drop=True), dropped
+
+
 def _dogsite_versions(layout, models: list[Model], tool: str) -> tuple[str | None, str | None]:
     """(binary sha256, tool version) recorded by the worker for the current outputs.
     Raises when outputs come from different binaries or from another tool."""
@@ -706,6 +746,9 @@ def run(layout, args, progress) -> dict:
     df, outside, unverified = filter_segments(layout, df, info, tool)
     for item, reason in outside:
         append_failure(d, item, STAGE, reason)
+    df, unmodelled = filter_unmodelled(layout, df)
+    for item, reason in unmodelled:
+        append_failure(d, item, STAGE, reason)
     df["Tool"] = tool
     if rule["column"] in df.columns:
         df["Selected"] = pd_numeric(df[rule["column"]]) >= rule["min"]
@@ -729,6 +772,7 @@ def run(layout, args, progress) -> dict:
               "done": res["done"], "skipped_existing": len(models) - len(jobs),
               "pockets": len(df), "selected": int(df["Selected"].sum()),
               "outside_segment": len(outside),
+              "unmodelled_pockets": len(unmodelled),
               "segment_unverified": unverified, "failed": res["failed"] + len(missing)}
     # The manifest is written last: its presence marks the stage as finished.
     write_manifest(d, STAGE, args={"worker_timeout": getattr(args, "worker_timeout", None),

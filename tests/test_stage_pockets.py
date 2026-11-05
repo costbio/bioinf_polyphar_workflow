@@ -782,3 +782,53 @@ def test_stage_fails_on_selected_names_pocketmatch_cannot_keep(tmp_path, monkeyp
     assert "A0A0B4J2F0/A0A0B4J2F0_7a8b_AB_P_12_1_res.pdb\tpockets\tpocket name longer" in failed
     assert "P_13_1" not in failed                    # not selected: never reaches PocketMatch
     assert not (layout.pockets / "manifest.json").exists()
+
+
+# --- pockets whose lining was never modelled -------------------------------------------
+
+def _pocket_pdb(path, residues):
+    """residues = [(resname, [atom names])] -> a pocket PDB."""
+    lines, i = [], 0
+    for r, (name, atoms) in enumerate(residues, start=1):
+        for atom in atoms:
+            i += 1
+            lines.append(f"ATOM  {i:5d}  {atom:<3} {name} A{r:4d}    "
+                         f"{r:8.3f}{i:8.3f}{r:8.3f}  1.00  0.00           {atom[0]}\n")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("".join(lines) + "END\n")
+    return path
+
+
+_REAL = ("LEU", ["N", "CA", "C", "O", "CB", "CG", "CD1"])
+_UNK = ("UNK", ["N", "CA", "C", "O", "CB"])
+
+
+def test_a_pocket_lined_by_unmodelled_backbone_is_dropped_with_a_reason(tmp_path):
+    """The 6BQ1 shape: every lining residue is traced main chain, so there is no
+    chemistry to dock against and PocketMatch hangs on it."""
+    layout = RunLayout(tmp_path)
+    _pocket_pdb(layout.pockets / "P1" / "good_res_P_1.pdb", [_REAL] * 8)
+    _pocket_pdb(layout.pockets / "P2" / "unk_res_P_1.pdb", [_UNK] * 8)
+    df = pd.DataFrame([{"UniProt ID": "P1", "Pocket Filename": "good_res_P_1.pdb"},
+                       {"UniProt ID": "P2", "Pocket Filename": "unk_res_P_1.pdb"}])
+
+    kept, dropped = pockets.filter_unmodelled(layout, df)
+    assert kept["Pocket Filename"].tolist() == ["good_res_P_1.pdb"]
+    assert len(dropped) == 1
+    item, reason = dropped[0]
+    assert item == "P2/unk_res_P_1.pdb"
+    assert pockets.REASON_UNMODELLED in reason and "8 of 8 residues" in reason
+
+
+def test_a_pocket_with_a_minority_of_unmodelled_residues_is_kept(tmp_path):
+    """Partial tracing is ordinary; only a lining that is mostly unmodelled is not a site."""
+    layout = RunLayout(tmp_path)
+    _pocket_pdb(layout.pockets / "P1" / "mixed_res_P_1.pdb", [_REAL] * 6 + [_UNK] * 2)
+    df = pd.DataFrame([{"UniProt ID": "P1", "Pocket Filename": "mixed_res_P_1.pdb"}])
+    kept, dropped = pockets.filter_unmodelled(layout, df)
+    assert len(kept) == 1 and dropped == []
+
+
+def test_filter_unmodelled_on_an_empty_frame_does_nothing(tmp_path):
+    kept, dropped = pockets.filter_unmodelled(RunLayout(tmp_path), pd.DataFrame())
+    assert kept.empty and dropped == []
