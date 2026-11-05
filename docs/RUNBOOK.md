@@ -60,13 +60,41 @@ update added `rdkit`, and `ligands` now fails the whole stage when rdkit is miss
 than failing 2,083 records one at a time:
 
     docker build --build-arg POLYPHAR_GIT_COMMIT=$(git rev-parse HEAD) \
-        -f docker/Dockerfile -t polyphar:1.1 -t polyphar:dev .
+        -f docker/Dockerfile -t polyphar:1.2 -t polyphar:dev .
+
+### 2026-11-05: image 1.2, and why `select` and `ligands` must be re-run
+
+Three defects were found while investigating why no net1 target could complete. All three
+are fixed in **image 1.2**, so `export POLYPHAR_VERSION=1.2`.
+
+- `select` gave every target row of a protein the receptor of its FIRST row, while each
+  row's box came from its own pocket. 83 of net1's 479 rows paired a pocket with a
+  receptor from another structure, and 9 of the 37 targets docked had **no receptor atom
+  inside the box at all** — every ligand scored in vacuum. Receptor and Chain are now
+  resolved per row, and both `select` and `dock` refuse a box the receptor does not
+  occupy.
+- `ligands` now excludes records carrying elements the scoring function cannot type. The
+  six boron drugs were silently given no poses by Uni-Dock, which alone made every target
+  permanently incomplete. The library is 1,954 records, not 1,960.
+- `uniprot` no longer crashes on a deleted accession (14 of AD Cluster1's 131).
+
+**Any 06_targets/ or 07_docking/ built before 2026-11-05 is invalid.** Resume treats an
+existing stage as done and the fingerprints do not carry the code version, so the stage
+directory must be moved aside before re-running:
+
+    mkdir -p superseded_mispaired_$(date +%Y%m%dT%H%M%S)
+    mv 06_targets 07_docking superseded_mispaired_*/
+
+Done already for HCC net1, net2 and net3: `select` and `ligands` were re-run under 1.2 and
+every row now pairs a pocket with its own receptor. net1's 109 docked units were moved
+aside with them; they were drawn against the old library and some against empty boxes.
 
 ## 1. The run folders
 
-Inputs are already in place (workbook + ligand library per folder), and as of 2026-11-04
-every one of the seven folders also has `00_ids/` built. HCC net1 is complete through
-`ligands`; the other six have not run `uniprot` yet.
+Inputs are in place (workbook + ligand library per folder) and all seven have `00_ids/`.
+As of 2026-11-05: HCC net1/net2/net3 are complete through `select` and `ligands` under
+image 1.2; AD Cluster1 is through `pockets` and needs `select` and `ligands` re-run under
+1.2; AD Cluster2/3/4 have run `ids` only.
 
 | Subtype | Run folder | `ids` arguments |
 |---|---|---|
