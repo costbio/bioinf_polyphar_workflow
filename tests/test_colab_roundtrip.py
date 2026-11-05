@@ -92,7 +92,7 @@ sys.exit(2)
     shutil.copyfile(WRAPPER, bin_dir / "polyphar-colab")
     (bin_dir / "polyphar-colab").chmod(0o755)
 
-    def run(_timeout=180, **env):
+    def run(_timeout=180, _argv=(), **env):
         e = dict(os.environ)
         e.update({
             "PATH": f"{bin_dir}:{os.environ['PATH']}",
@@ -105,8 +105,8 @@ sys.exit(2)
             "FAKE_COLAB_LOG": str(colab_log),
         })
         e.update({k: str(v) for k, v in env.items()})
-        return subprocess.run([str(bin_dir / "polyphar-colab")], capture_output=True,
-                              text=True, env=e, timeout=_timeout)
+        return subprocess.run([str(bin_dir / "polyphar-colab"), *_argv],
+                              capture_output=True, text=True, env=e, timeout=_timeout)
 
     ns = pytest.importorskip("types").SimpleNamespace(
         run=run, run_dir=run_dir, vm=vm, repo=repo, calls=calls, colab_log=colab_log,
@@ -255,3 +255,18 @@ def test_the_wrapper_refuses_a_dirty_package(world):
     p = world.run()
     assert p.returncode != 0
     assert "uncommitted changes" in p.stdout + p.stderr
+
+
+def test_the_library_reaches_both_export_and_merge(world):
+    """`run --library X` used to lose X at the round trip: polyphar-colab called
+    dock-export and dock-merge without it, so they fell back to the DEFAULT library.
+    Either it does not exist and the run dies at dock, or -- worse -- it does, and the
+    GPU docks a different library than the run planned. The library's sha256 is part of
+    every unit key, so those results would be keyed to something the run never used."""
+    p = world.run(_argv=["--library", "inputs/custom.sdf"])
+    assert p.returncode == 0, p.stdout + p.stderr
+    calls = world.calls.read_text().splitlines()
+    exports = [c for c in calls if c.startswith("dock-export")]
+    merges = [c for c in calls if c.startswith("dock-merge")]
+    assert exports and all("--library inputs/custom.sdf" in c for c in exports), calls
+    assert merges and all("--library inputs/custom.sdf" in c for c in merges), calls

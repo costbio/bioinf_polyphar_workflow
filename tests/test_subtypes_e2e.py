@@ -118,22 +118,13 @@ def test_a_subtype_runs_end_to_end(subtype, tmp_path, home):
     assert results, f"{subtype}: no df_results"
     assert all(len(p.read_text().splitlines()) > 1 for p in results)
 
-
-@pytest.mark.subtype_e2e
-@pytest.mark.network
-@pytest.mark.dogsite
-@pytest.mark.docker
-@pytest.mark.parametrize("subtype", sorted(SUBTYPES))
-def test_the_docking_really_ran_on_the_gpu(subtype, tmp_path, home):
-    """Uni-Dock, not a local fallback. Each unit's provenance records the engine and the
-    GPU that drew it; a run that quietly fell back to CPU would still produce results, so
-    this is what distinguishes the production path from a lookalike."""
-    run_dir = tmp_path / subtype
-    if not (run_dir / "07_docking").is_dir():
-        pytest.skip("runs with test_a_subtype_runs_end_to_end")
+    # Uni-Dock on a GPU, not a local fallback. A run that quietly fell back to CPU would
+    # still produce results, so the provenance is what tells the production path from a
+    # lookalike. (Checked here rather than in its own test: tmp_path is per-test, so a
+    # second test cannot see this run folder at all -- it would skip, always.)
     provs = list((run_dir / "07_docking").glob("*/replicates/*.prov.json"))
     assert provs, f"{subtype}: no unit provenance"
-    for p in provs:
-        info = json.loads(p.read_text())
+    for prov in provs:
+        info = json.loads(prov.read_text())
         assert info["engine_name"] == "unidock", info
-        assert info.get("gpu_model"), f"{subtype}: no GPU recorded in {p.name}"
+        assert info.get("gpu_model"), f"{subtype}: no GPU recorded in {prov.name}"

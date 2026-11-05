@@ -2,6 +2,7 @@
 # Host wrapper: one docking round trip on a Colab Pro+ GPU, end to end.
 #
 #   bin/polyphar-colab [--max-units N] [--session NAME] [--gpu L4] [--control] [--keep]
+#                      [--library PATH]
 #
 # Does, in order: dock-export here -> create/reuse a Colab session -> upload the bundle
 # and the Pushover credentials -> install the engine -> launch the detached worker -> poll
@@ -40,6 +41,9 @@ session="dock"; gpu="L4"; control=""
 # engine install -- micromamba, Uni-Dock, the pinned polyphar -- once per bundle instead
 # of once per session.
 keep="${POLYPHAR_COLAB_KEEP:+1}"
+# the run's library, forwarded from polyphar-docker: dock-export and dock-merge must both
+# see the same one, since its sha256 is part of every unit key
+library=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --max-units) max_units="$2"; shift 2 ;;
@@ -47,6 +51,7 @@ while [ $# -gt 0 ]; do
         --gpu)       gpu="$2";       shift 2 ;;
         --control)   control="--control"; shift ;;
         --keep)      keep="1"; shift ;;
+        --library)   library="$2"; shift 2 ;;
         -h|--help)   sed -n '2,24p' "${BASH_SOURCE[0]}"; exit 0 ;;
         *) echo "polyphar-colab: unknown option $1" >&2; exit 2 ;;
     esac
@@ -204,6 +209,7 @@ if [ -z "$attach" ] && [ -z "$merge_only" ]; then
     rel="${export_root#$run_dir/}/$name"
     say "dock-export -> $rel"
     "$here/polyphar-docker" dock-export --bundle "$rel" $control \
+        ${library:+--library "$library"} \
         ${max_units:+--max-units "$max_units"} --engine-version 'Uni-Dock 1.2.0'
 
     bundle="$export_root/$name"
@@ -334,7 +340,8 @@ fi
 
 say "dock-merge ($(local_count) unit(s) held here)"
 merge_rc=0
-"$here/polyphar-docker" dock-merge --bundle "$rel" $control || merge_rc=$?
+"$here/polyphar-docker" dock-merge --bundle "$rel" $control \
+    ${library:+--library "$library"} || merge_rc=$?
 
 # exit 3 is `incomplete_targets`, which is the NORMAL state until the last bundle lands:
 # this run merged its units and others remain outstanding. Treating it as failure would

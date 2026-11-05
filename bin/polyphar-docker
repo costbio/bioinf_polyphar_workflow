@@ -145,10 +145,19 @@ done
 want_roundtrip=0
 roundtrip_args=()
 engine="${POLYPHAR_ENGINE:-}"
+# --library has to reach the round trip too. Without it dock-export and dock-merge fall
+# back to the DEFAULT library, so `run --library X` either fails ("not found") or, worse,
+# docks a different library than the rest of the run planned -- and the library sha is
+# part of every unit key, so the results would be keyed to something the run never used.
+library=""
 prev=""
 for a in "$@"; do
     [ "$prev" = "--engine" ] && engine="$a"
-    case "$a" in --engine=*) engine="${a#--engine=}" ;; esac
+    [ "$prev" = "--library" ] && library="$a"
+    case "$a" in
+        --engine=*) engine="${a#--engine=}" ;;
+        --library=*) library="${a#--library=}" ;;
+    esac
     prev="$a"
 done
 have_gpu=0
@@ -239,7 +248,8 @@ if [ "$want_roundtrip" = 1 ]; then
     fi
 
     echo "== dock: no local GPU, so the work goes to the GPU host and comes back"
-    POLYPHAR_RUN_DIR="$run_dir" "$colab" "${roundtrip_args[@]}" || exit $?
+    POLYPHAR_RUN_DIR="$run_dir" "$colab" "${roundtrip_args[@]}" \
+        ${library:+--library "$library"} || exit $?
 
     if [ "${1:-}" = run ] && [ "${to:-$last_index}" -gt "$dock_i" ]; then
         echo "== stages after dock (in the container)"
