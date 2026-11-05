@@ -11,7 +11,11 @@ Runs `ids -> uniprot -> structures -> fix -> pockets -> annotate -> select -> si
 AlphaFold, with fake DoGSiteScorer, the 3-ligand bench library and smina. Two accessions
 per subtype, taken from that subtype's real input list.
 
-    DOGSITE_BIN=$PWD/tests/fixtures/fake_dogsite pytest -m subtype_e2e
+    DOGSITE_BIN=$PWD/tests/fixtures/fake_dogsite2 pytest -m subtype_e2e
+
+Note the `2`: the fake answers `--help` as DoGSite3 or as DoGSiteScorer 2 depending on the
+name it is invoked under, and the default --pocket-tool is dogsite2. Pointing DOGSITE_BIN
+at the plain `fake_dogsite` name fails the worker's tool check before any stage runs.
 
 `--engine smina` is not a detail: on a GPU-less host the default (Uni-Dock) makes
 polyphar-docker hand the docking to a REAL Colab session, which a test must never do.
@@ -28,6 +32,7 @@ import pytest
 REPO = Path(__file__).resolve().parent.parent
 WRAPPER = REPO / "bin" / "polyphar-docker"
 LIBRARY = REPO / "polyphar" / "data" / "bench" / "edrug3d_bench3.sdf"
+FAKE_SMINA = REPO / "tests" / "fixtures" / "fake_smina"
 
 # Every stage dir that must carry a manifest when the run is done.
 DIRS = ("00_ids", "01_uniprot", "02_structures", "03_pdbfixer", "04_pockets",
@@ -57,9 +62,15 @@ def _run(run_dir, home, accessions, extra=()):
     (run_dir / "inputs" / "ids.txt").write_text("".join(f"{a}\n" for a in accessions))
     shutil.copyfile(LIBRARY, run_dir / "inputs" / "bench3.sdf")
     env = {k: v for k, v in os.environ.items() if not k.startswith("PUSHOVER_")}
-    # no SMINA_BIN: the image ships the real smina, and a host path would not resolve
-    # inside the container. The 3-ligand library is what keeps the docking short.
+    # The engine is faked. These tests are about the CHAIN -- ids through dock, the
+    # pairing, the library, the unit keys -- not about smina's search, which has its own
+    # tests. Real smina costs ~3 min a unit, so seven subtypes would run for two hours
+    # and prove nothing the engine's own tests do not. fake_smina goes in the run folder
+    # because that is what the container mounts (at /work).
+    shutil.copyfile(FAKE_SMINA, run_dir / "inputs" / "fake_smina")
+    (run_dir / "inputs" / "fake_smina").chmod(0o755)
     env.update(POLYPHAR_RUN_DIR=str(run_dir), POLYPHAR_HOME=str(home),
+               SMINA_BIN="/work/inputs/fake_smina",
                POLYPHAR_VERSION=os.environ.get("POLYPHAR_VERSION", "dev"))
     argv = [str(WRAPPER), "run", "--txt", "inputs/ids.txt",
             "--library", "inputs/bench3.sdf", "--engine", "smina", *extra]

@@ -53,6 +53,7 @@ opts=(--rm --init --user "$(id -u):$(id -g)"
       -v "$run_dir":/work
       -v "$home_dir":/polyphar_home
       -e NPROCS
+      ${SMINA_BIN:+-e SMINA_BIN="$SMINA_BIN"}
       -e POLYPHAR_POCKET_TOOL="$pocket_tool"
       -e POLYPHAR_RUN_NAME="$(basename "$run_dir")")
 if [ -f "$home_dir/pushover.env" ]; then
