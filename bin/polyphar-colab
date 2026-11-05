@@ -19,6 +19,7 @@
 #   COLAB_POLL_SECONDS seconds between progress polls (default 120)
 #   POLYPHAR_MAX_UNITS units per session (default 200, ~20 h); --max-units wins
 #   ALLOW_SILENT=1     start the worker even without Pushover credentials
+#   POLYPHAR_COLAB_KEEP=1  do not stop the session at the end (same as --keep)
 #
 # Exits non-zero on any failure, so `&&` chains and tmux wrappers cannot mistake a dropped
 # session for a finished one.
@@ -33,7 +34,12 @@ poll_s="${COLAB_POLL_SECONDS:-120}"
 # 200 units is about 20 hours at ~6 GPU-minutes a unit: a session long enough to be worth
 # the setup, short enough that losing it to a dropped VM is not a disaster.
 max_units="${POLYPHAR_MAX_UNITS:-200}"
-session="dock"; gpu="L4"; control=""; keep=""
+session="dock"; gpu="L4"; control=""
+# POLYPHAR_COLAB_KEEP: leave the session up at the end. Several run folders docked one
+# after another (the seven subtype tests, or a night of subtypes) otherwise pay the
+# engine install -- micromamba, Uni-Dock, the pinned polyphar -- once per bundle instead
+# of once per session.
+keep="${POLYPHAR_COLAB_KEEP:+1}"
 while [ $# -gt 0 ]; do
     case "$1" in
         --max-units) max_units="$2"; shift 2 ;;

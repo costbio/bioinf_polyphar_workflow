@@ -17,11 +17,25 @@ Note the `2`: the fake answers `--help` as DoGSite3 or as DoGSiteScorer 2 depend
 name it is invoked under, and the default --pocket-tool is dogsite2. Pointing DOGSITE_BIN
 at the plain `fake_dogsite` name fails the worker's tool check before any stage runs.
 
-`--engine smina` is not a detail: on a GPU-less host the default (Uni-Dock) makes
-polyphar-docker hand the docking to a REAL Colab session, which a test must never do.
+**The docking is the production path: Uni-Dock on a Colab Pro+ GPU.** POSEIDON has no
+GPU, so `polyphar-docker` hands `dock` to `bin/polyphar-colab`, which exports a bundle,
+installs the pinned commit on the VM, polls, pulls results every poll and merges. Testing
+smina instead would exercise an engine the study never runs -- the defects that reached
+live data were all in the joins, and the Uni-Dock join is the one in use.
+
+That means these tests need a Colab session and spend a little GPU credit. The 3-ligand
+library keeps it small: a unit is seconds rather than the ~6 GPU-minutes a 1,960-ligand
+unit costs. POLYPHAR_COLAB_KEEP=1 holds one session across all seven, so the engine
+install is paid once instead of seven times.
+
+Prerequisites, all of them hard:
+  * the commit under test must be PUSHED -- the VM pip-installs polyphar from it;
+  * `colab` must be authenticated on this host;
+  * ~/.polyphar/pushover.env must exist, or ALLOW_SILENT=1.
 
 POLYPHAR_HOME is shared across the seven, so only the first pays for the benchmark.
 """
+import json
 import os
 import shutil
 import subprocess
@@ -32,7 +46,6 @@ import pytest
 REPO = Path(__file__).resolve().parent.parent
 WRAPPER = REPO / "bin" / "polyphar-docker"
 LIBRARY = REPO / "polyphar" / "data" / "bench" / "edrug3d_bench3.sdf"
-FAKE_SMINA = REPO / "tests" / "fixtures" / "fake_smina"
 
 # Every stage dir that must carry a manifest when the run is done.
 DIRS = ("00_ids", "01_uniprot", "02_structures", "03_pdbfixer", "04_pockets",
@@ -62,20 +75,15 @@ def _run(run_dir, home, accessions, extra=()):
     (run_dir / "inputs" / "ids.txt").write_text("".join(f"{a}\n" for a in accessions))
     shutil.copyfile(LIBRARY, run_dir / "inputs" / "bench3.sdf")
     env = {k: v for k, v in os.environ.items() if not k.startswith("PUSHOVER_")}
-    # The engine is faked. These tests are about the CHAIN -- ids through dock, the
-    # pairing, the library, the unit keys -- not about smina's search, which has its own
-    # tests. Real smina costs ~3 min a unit, so seven subtypes would run for two hours
-    # and prove nothing the engine's own tests do not. fake_smina goes in the run folder
-    # because that is what the container mounts (at /work).
-    shutil.copyfile(FAKE_SMINA, run_dir / "inputs" / "fake_smina")
-    (run_dir / "inputs" / "fake_smina").chmod(0o755)
     env.update(POLYPHAR_RUN_DIR=str(run_dir), POLYPHAR_HOME=str(home),
-               SMINA_BIN="/work/inputs/fake_smina",
+               POLYPHAR_COLAB_KEEP="1",      # one session for all seven
                POLYPHAR_VERSION=os.environ.get("POLYPHAR_VERSION", "dev"))
+    # no --engine: the default is Uni-Dock, and on a GPU-less host that is exactly the
+    # production path -- polyphar-docker hands dock to the Colab round trip.
     argv = [str(WRAPPER), "run", "--txt", "inputs/ids.txt",
-            "--library", "inputs/bench3.sdf", "--engine", "smina", *extra]
+            "--library", "inputs/bench3.sdf", *extra]
     return subprocess.run(argv, cwd=run_dir, env=env, capture_output=True, text=True,
-                          timeout=30 * 60)
+                          timeout=60 * 60)
 
 
 def _image_or_skip():
@@ -115,11 +123,17 @@ def test_a_subtype_runs_end_to_end(subtype, tmp_path, home):
 @pytest.mark.network
 @pytest.mark.dogsite
 @pytest.mark.docker
-def test_a_run_never_hands_docking_to_colab_without_a_gpu(tmp_path, home):
-    """A test that reached the real Colab path would spend GPU credit and need a session.
-    `--engine smina` must keep the docking local; this pins that the wrapper agrees."""
-    _image_or_skip()
-    r = _run(tmp_path / "local", home, SUBTYPES["net1"], extra=("--dry-run",))
-    assert r.returncode == 0, r.stdout[-2000:] + r.stderr[-2000:]
-    assert "no local GPU" not in r.stdout, r.stdout[-2000:]
-    assert "colab" not in r.stdout.lower(), r.stdout[-2000:]
+@pytest.mark.parametrize("subtype", sorted(SUBTYPES))
+def test_the_docking_really_ran_on_the_gpu(subtype, tmp_path, home):
+    """Uni-Dock, not a local fallback. Each unit's provenance records the engine and the
+    GPU that drew it; a run that quietly fell back to CPU would still produce results, so
+    this is what distinguishes the production path from a lookalike."""
+    run_dir = tmp_path / subtype
+    if not (run_dir / "07_docking").is_dir():
+        pytest.skip("runs with test_a_subtype_runs_end_to_end")
+    provs = list((run_dir / "07_docking").glob("*/replicates/*.prov.json"))
+    assert provs, f"{subtype}: no unit provenance"
+    for p in provs:
+        info = json.loads(p.read_text())
+        assert info["engine_name"] == "unidock", info
+        assert info.get("gpu_model"), f"{subtype}: no GPU recorded in {p.name}"
