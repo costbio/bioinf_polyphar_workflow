@@ -85,6 +85,13 @@ def _run(run_dir, home, accessions, extra=()):
                # launch.py would refuse to start a worker that cannot notify. A test does
                # not want notifications; a real run does, which is why the refusal exists.
                ALLOW_SILENT="1",
+               # A fresh VM installs micromamba, Uni-Dock and the pinned polyphar in
+               # about nine minutes. The production budget is 70, because there a VM you
+               # have already waited ten minutes for is worth more than a fast failure.
+               # On 2026-11-06 a Colab VM went quiet mid-install and this test sat in that
+               # 70-minute budget for 37 minutes before anyone looked; twice the real cost
+               # is all the patience a test needs.
+               COLAB_SETUP_TIMEOUT=os.environ.get("COLAB_SETUP_TIMEOUT", "1200"),
                POLYPHAR_VERSION=os.environ.get("POLYPHAR_VERSION", "dev"))
     # no --engine: the default is Uni-Dock, and on a GPU-less host that is exactly the
     # production path -- polyphar-docker hands dock to the Colab round trip.

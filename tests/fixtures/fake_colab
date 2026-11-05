@@ -21,6 +21,7 @@ Knobs (all optional):
   FAKE_COLAB_FAIL_EXEC      comma-separated fetch.py attempt numbers that fail
   FAKE_COLAB_LAUNCH_REFUSES launch.py refuses but the CLI still exits 0
   FAKE_COLAB_SETUP_REFUSES  setup.py refuses but the CLI still exits 0
+  FAKE_COLAB_SETUP_STALLS   seconds setup.py hangs for, after printing one line
   FAKE_COLAB_LOG            append one line per invocation
 """
 import hashlib
@@ -29,6 +30,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 VM = Path(os.environ["FAKE_COLAB_VM"])
@@ -167,6 +169,12 @@ def main(argv):
                 env[k] = v
 
         if name == "setup.py":
+            stall = os.environ.get("FAKE_COLAB_SETUP_STALLS")
+            if stall:
+                # the real setup.py announces each install command before running it, so a
+                # live VM is chatty even while it is slow
+                print("fake-colab: $ micromamba install -y unidock", flush=True)
+                time.sleep(float(stall))
             if os.environ.get("FAKE_COLAB_SETUP_REFUSES"):
                 # like the real CLI: the cell ran, so the exit status is 0 even though
                 # the script raised

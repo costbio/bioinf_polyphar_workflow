@@ -288,3 +288,64 @@ def test_a_failed_engine_install_is_not_mistaken_for_a_ready_vm(world):
     p = world.run(FAKE_COLAB_SETUP_REFUSES="1")
     assert p.returncode != 0, p.stdout + p.stderr
     assert "did not install" in p.stdout + p.stderr
+
+
+# --- the one-shot cells: live output, bounded wait --------------------------------------
+
+def test_the_setup_cell_is_bounded_by_its_own_budget_not_by_the_production_one(world):
+    """`colab exec`'s --timeout bounds the remote cell, never the client, so the client
+    side is the only real bound -- and it was hardcoded at 4200 s.
+
+    On 2026-11-06 a subtype run sat inside that budget for 32 minutes with the VM silent.
+    Seventy minutes is the right patience for a production session (a VM you have already
+    waited ten minutes for is worth more than a fast failure); it is the wrong patience
+    for anything else, and there was no way to say so.
+    """
+    import time
+
+    t0 = time.monotonic()
+    p = world.run(_timeout=90, COLAB_SETUP_TIMEOUT="3", FAKE_COLAB_SETUP_STALLS="60")
+    waited = time.monotonic() - t0
+
+    both = p.stdout + p.stderr
+    assert p.returncode != 0, both
+    assert waited < 45, f"waited {waited:.0f}s for a 3 s budget"
+    # and it must SAY so. `set -e` with `pipefail` ends the script the moment `timeout`
+    # returns 124, so the first version of this exited 124 with no message at all -- the
+    # same silence, just arriving sooner.
+    assert "did not install" in both, both
+    assert "COLAB_SETUP_TIMEOUT" in both, both
+    assert "nothing was lost" in both, both
+
+
+def test_a_stalled_setup_still_shows_what_the_vm_was_doing(world):
+    """The VM is chatty even while it is slow: setup.py prints each install command before
+    running it. `setup_out="$(colab exec ...)"` captured that stream and showed none of it
+    until the cell ended, so a slow micromamba and a reclaimed VM looked identical for up
+    to seventy minutes. colab_cli flushes every chunk as it arrives -- the output was being
+    produced and thrown away.
+    """
+    p = world.run(_timeout=90, COLAB_SETUP_TIMEOUT="3", FAKE_COLAB_SETUP_STALLS="60")
+    assert "micromamba install" in p.stdout, p.stdout + p.stderr
+
+
+def test_the_setup_and_launch_cells_still_reach_the_terminal_on_the_happy_path(world):
+    """tee must not eat what the old `printf '%s\\n' "$out"` used to echo."""
+    p = world.run()
+    assert p.returncode == 0, p.stdout + p.stderr
+    assert "setup: ready" in p.stdout, p.stdout
+    assert "worker pid=" in p.stdout, p.stdout
+
+
+def test_the_remote_cell_gives_up_before_the_client_does(world):
+    """If the cell outlived the client the socket would be cut with nothing to show; if it
+    were much shorter the client's budget would be a lie. One margin rule, both cells."""
+    out = subprocess.run(
+        ["bash", "-c",
+         f'set -euo pipefail; source <(sed -n "/^cell_timeout() {{/,/^}}/p" {WRAPPER!s}); '
+         'for t in 4200 900 300 60; do echo "$t $(cell_timeout $t)"; done'],
+        capture_output=True, text=True, check=True).stdout.split()
+    pairs = [(int(out[i]), int(out[i + 1])) for i in range(0, len(out), 2)]
+    for client, cell in pairs:
+        assert 0 < cell < client, (client, cell)
+        assert cell >= client * 0.8, f"{cell} is a needlessly small share of {client}"

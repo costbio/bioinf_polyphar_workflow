@@ -117,6 +117,26 @@ and merging is far more expensive than downloading.
   session is alive, and **merges what was already pulled** if the session is gone.
 - `COLAB_FETCH_EVERY=N` fetches every Nth poll instead of every one.
 
+### 2026-11-06: the one-shot cells were silent and unbounded
+
+Found while the seven subtype runs were going through: net1 sat in `setup.py` for 37
+minutes with nothing on the terminal at all, and there was no way to tell a slow
+micromamba from a VM Colab had quietly taken back.
+
+- **The output existed and was thrown away.** `colab exec` streams the cell's stdout as it
+  arrives (`colab_cli.commands.execution.display_output` flushes every chunk), and
+  `setup.py` prints each install command *before* running it. `setup_out="$(colab exec …)"`
+  held all of it until the cell ended. Both one-shot cells now `tee`, so the terminal shows
+  the VM's progress live and still checks the proof line afterwards.
+- **The client wait was hardcoded** at 4200 s for setup and 900 s for launch. `colab exec
+  --timeout` bounds the *remote cell*, never the client, so those were the only real
+  bounds. `COLAB_SETUP_TIMEOUT` and `COLAB_LAUNCH_TIMEOUT` now set them; production keeps
+  70 and 15 minutes, the subtype tests use 20. The remote cell gets ~90 % of the client's
+  budget so an overrun reports itself instead of being cut off at the socket.
+- **A timed-out cell exited silently.** Under `set -e` with `pipefail`, `timeout`'s 124
+  ended the script before the `case` that prints the diagnostic. The wait is bounded *and*
+  explained now: the message names the budget and the variable that sets it.
+
 ### 2026-11-05 (later): image 1.3, unmodelled pockets and the PocketMatch hang
 
 `export POLYPHAR_VERSION=1.3`. Two further defects, both found when AD Cluster1's

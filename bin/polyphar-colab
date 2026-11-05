@@ -31,6 +31,11 @@ repo="${POLYPHAR_REPO:-$(cd "$here/.." && pwd)}"
 run_dir="$(realpath "${POLYPHAR_RUN_DIR:-$PWD}")"
 home_dir="$(realpath "${POLYPHAR_HOME:-$HOME/.polyphar}")"
 poll_s="${COLAB_POLL_SECONDS:-120}"
+# How long the client waits for the two one-shot cells. Generous on purpose for a
+# production run -- a VM you have already waited ten minutes for is worth more than a
+# fast failure -- but a test wants the opposite, so both are knobs.
+setup_s="${COLAB_SETUP_TIMEOUT:-4200}"
+launch_s="${COLAB_LAUNCH_TIMEOUT:-900}"
 
 # 200 units is about 20 hours at ~6 GPU-minutes a unit: a session long enough to be worth
 # the setup, short enough that losing it to a dropped VM is not a disaster.
@@ -59,6 +64,44 @@ done
 
 say() { printf '\n== %s\n' "$*"; }
 note() { printf '%s  %s\n' "$(date +%H:%M:%S)" "$*"; }
+
+# `colab exec` streams the remote cell's stdout as it arrives (colab_cli's display_output
+# writes and flushes every chunk), but `out="$(colab exec ...)"` holds all of it until the
+# cell ends. setup.py prints each install command before running it, so the information
+# needed to tell a slow micromamba from a reclaimed VM was being produced and thrown away:
+# on 2026-11-06 a subtype run sat silent for 32 minutes inside a 70-minute budget with no
+# way to know which it was. Same defect as the swallowed poll failure below -- silence
+# meaning two things. tee: the terminal sees it live, `captured` still proves it worked.
+captured=""; captured_rc=0
+stream() {                       # stream <client seconds> <command...>
+    local secs="$1" tmp; shift
+    tmp="$(mktemp "${TMPDIR:-/tmp}/polyphar-colab.XXXXXX")"
+    captured_rc=0
+    # `|| captured_rc=$?`: under `set -e` + `pipefail` a timeout here would end the script
+    # on the spot, and the caller's diagnostic -- the whole reason the step is checked --
+    # would never print. A 3 s budget exited silently until this was added.
+    timeout --foreground "$secs" "$@" 2>&1 | tr -d '\000' | tee "$tmp" \
+        | sed 's/^/           /' || captured_rc=$?
+    captured="$(cat "$tmp")"
+    rm -f "$tmp"
+    return 0
+}
+
+# `timeout` reports 124 when it had to kill the client. Saying so turns "it did not work"
+# into "we stopped waiting", which is a different thing to go and look at.
+gave_up() { [ "$captured_rc" = 124 ] && printf ' after %ss (COLAB_%s_TIMEOUT)' "$1" "$2"; return 0; }
+
+# the remote cell gets a little less than the client, so a cell that overruns reports
+# itself rather than being cut off at the socket with nothing to show for it
+cell_timeout() {
+    local margin=$(( $1 / 10 ))
+    [ "$margin" -lt 5 ] && margin=5
+    [ "$margin" -gt 600 ] && margin=600
+    local n=$(( $1 - margin ))
+    [ "$n" -lt 5 ] && n=5
+    printf '%s' "$n"
+    return 0
+}
 
 # Pushover from the HOST, for the phases of the round trip the worker cannot report:
 # the worker only exists between launch and finish, so upload, merge and any failure
@@ -242,13 +285,12 @@ if [ -z "$attach" ] && [ -z "$merge_only" ]; then
     say "installing the engine (pinned to $commit)"
     # same reason as the launch below: the exit status says the cell ran, not that it
     # worked, so setup.py's own last line is the proof
-    setup_out="$(timeout --foreground 4200 colab exec -f "$repo/bin/colab/setup.py" \
-        --env "POLYPHAR_COMMIT=$commit" --timeout 3600 -s "$session" 2>&1 | tr -d '\000')" || true
-    printf '%s\n' "$setup_out"
-    case "$setup_out" in
+    stream "$setup_s" colab exec -f "$repo/bin/colab/setup.py" \
+        --env "POLYPHAR_COMMIT=$commit" --timeout "$(cell_timeout "$setup_s")" -s "$session"
+    case "$captured" in
         *"setup: ready"*) ;;
-        *) die "the engine did not install on the VM (see above). The bundle is at $rel
-     and nothing was lost; fix the cause and re-run." ;;
+        *) die "the engine did not install on the VM$(gave_up "$setup_s" SETUP) (see
+     above). The bundle is at $rel and nothing was lost; fix the cause and re-run." ;;
     esac
 
     push "dock: worker starting" "$n_units units on a $gpu. Progress every ${poll_s}s."
@@ -258,14 +300,14 @@ if [ -z "$attach" ] && [ -z "$merge_only" ]; then
     # worker already running, a bundle missing a file) looked like success -- the wrapper
     # then polled a worker that was never started, saw NO-PIDFILE at once, merged zero
     # units and said "done". So the proof of launch is launch.py's own last line.
-    launch_out="$(timeout --foreground 900 colab exec -f "$repo/bin/colab/launch.py" \
-        --timeout 600 -s "$session" ${ALLOW_SILENT:+--env "ALLOW_SILENT=$ALLOW_SILENT"} \
-        2>&1 | tr -d '\000')" || true
-    printf '%s\n' "$launch_out"
-    case "$launch_out" in
+    stream "$launch_s" colab exec -f "$repo/bin/colab/launch.py" \
+        --timeout "$(cell_timeout "$launch_s")" -s "$session" \
+        ${ALLOW_SILENT:+--env "ALLOW_SILENT=$ALLOW_SILENT"}
+    case "$captured" in
         *"worker pid="*RUNNING*) ;;
-        *) die "the worker did not start (see the message above). Nothing was lost: the
-     bundle is at $rel and the units are still outstanding." ;;
+        *) die "the worker did not start$(gave_up "$launch_s" LAUNCH) (see the message
+     above). Nothing was lost: the bundle is at $rel and the units are still
+     outstanding." ;;
     esac
 fi
 
