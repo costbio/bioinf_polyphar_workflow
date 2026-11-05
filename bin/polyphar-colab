@@ -51,8 +51,15 @@ keep="${POLYPHAR_COLAB_KEEP:+1}"
 # the run's library, forwarded from polyphar-docker: dock-export and dock-merge must both
 # see the same one, since its sha256 is part of every unit key
 library=""
+# Every OTHER dock option, forwarded verbatim from polyphar-docker after a `--`.
+# dock-export and dock-merge must see the same ones the user typed: --replicates decides
+# which units are outstanding, and --seed, --search-mode, --batch-size, --threads-per-job
+# and --unit-timeout are part of the unit key. Dropping them did not fail -- it quietly
+# docked the defaults and reported success, the same shape as the --library bug.
+dock_args=()
 while [ $# -gt 0 ]; do
     case "$1" in
+        --)          shift; dock_args=("$@"); break ;;
         --max-units) max_units="$2"; shift 2 ;;
         --session)   session="$2";   shift 2 ;;
         --gpu)       gpu="$2";       shift 2 ;;
@@ -254,7 +261,7 @@ if [ -z "$attach" ] && [ -z "$merge_only" ]; then
     rel="${export_root#$run_dir/}/$name"
     say "dock-export -> $rel"
     "$here/polyphar-docker" dock-export --bundle "$rel" $control \
-        ${library:+--library "$library"} \
+        ${library:+--library "$library"} ${dock_args[@]+"${dock_args[@]}"} \
         ${max_units:+--max-units "$max_units"} --engine-version 'Uni-Dock 1.2.0'
 
     bundle="$export_root/$name"
@@ -435,7 +442,7 @@ fi
 say "dock-merge ($(local_count) unit(s) held here)"
 merge_rc=0
 "$here/polyphar-docker" dock-merge --bundle "$rel" $control \
-    ${library:+--library "$library"} || merge_rc=$?
+    ${library:+--library "$library"} ${dock_args[@]+"${dock_args[@]}"} || merge_rc=$?
 
 # exit 3 is `incomplete_targets`, which is the NORMAL state until the last bundle lands:
 # this run merged its units and others remain outstanding. Treating it as failure would

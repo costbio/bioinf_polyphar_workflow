@@ -394,6 +394,22 @@ def test_a_lost_connection_during_launch_asks_the_vm_instead_of_relaunching(worl
     assert held(world.run_dir) == ["A/r0", "A/r1", "B/r0", "B/r1"], p.stdout + p.stderr
 
 
+def test_the_dock_options_reach_both_ends_of_the_round_trip(world):
+    """`--replicates 5` must mean five everywhere, not three on the GPU host.
+
+    The wrapper forwards them after a `--`; both dock-export and dock-merge have to see
+    the same ones, because the first decides which units are outstanding and the second
+    has to agree about what it is folding back in.
+    """
+    p = world.run(_argv=("--", "--replicates", "5", "--seed", "7"))
+    assert p.returncode == 0, p.stdout + p.stderr
+    calls = world.calls.read_text().splitlines()
+    for stage in ("dock-export", "dock-merge"):
+        line = next(l for l in calls if l.startswith(stage))
+        assert "--replicates 5" in line, (stage, line)
+        assert "--seed 7" in line, (stage, line)
+
+
 def test_a_refused_launch_is_still_fatal(world):
     """The probe only covers a lost connection. A refusal exits 0 with a reason, and the
     worker really is not running -- that must still stop the run."""

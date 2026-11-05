@@ -237,3 +237,50 @@ def test_export_reports_progress_in_the_unit_it_announced():
 
     # taken BEFORE prepare_receptors, or it would always be zero
     assert run_src.index("todo =") < run_src.index("prepare_receptors")
+
+
+def test_every_dock_option_reaches_the_gpu_host():
+    """The round trip must dock what the user asked for, not the defaults.
+
+    `bin/polyphar-docker` extracted exactly two things from the command line for the
+    Colab hand-off -- --engine (to decide whether to round trip at all) and --library.
+    Every other dock option was dropped on the floor. `dock --replicates 5` on a GPU-less
+    host therefore drew 3 replicates and reported success: the replicate COUNT is
+    deliberately not part of a unit key, so nothing downstream could notice. --seed,
+    --search-mode, --batch-size, --threads-per-job and --unit-timeout ARE part of the key,
+    so those silently keyed every result to parameters the run never used.
+
+    Found on 2026-11-06 when the mid-flight-kill check asked for 5 replicates on a
+    finished net3 folder and dock-export answered `outstanding=0`.
+
+    This reads the wrapper's list back out and checks it against the CLI's own parser, so
+    a dock option added later cannot quietly stop reaching the GPU host.
+    """
+    import argparse
+    from pathlib import Path
+
+    from polyphar.stages import dock as dock_mod
+
+    bindir = Path(__file__).resolve().parent.parent / "bin"
+    text = (bindir / "polyphar-docker").read_text()
+    listed = set(re.search(r'dock_opts="(.*?)"', text, re.S).group(1).split())
+
+    parser = argparse.ArgumentParser()
+    dock_mod.add_arguments(parser)
+    defined = {o for a in parser._actions for o in a.option_strings
+               if o.startswith("--")}
+    # --engine decides whether there IS a round trip; --library has its own variable
+    expected = defined - {"--help", "--engine", "--library"}
+
+    assert listed == expected, (
+        f"missing from the hand-off: {sorted(expected - listed)}; "
+        f"not a dock option: {sorted(listed - expected)}")
+
+    # and the colab wrapper must actually carry them through to both ends
+    colab = (bindir / "polyphar-colab").read_text()
+    assert 'dock_args=("$@")' in colab, "polyphar-colab must capture the `--` tail"
+    for stage in ("dock-export", "dock-merge"):
+        line = [l for l in colab.splitlines() if stage in l and "polyphar-docker" in l]
+        assert line, stage
+    assert colab.count('${dock_args[@]+"${dock_args[@]}"}') == 2, \
+        "both dock-export and dock-merge must receive the forwarded options"

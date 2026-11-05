@@ -156,6 +156,13 @@ engine="${POLYPHAR_ENGINE:-}"
 # docks a different library than the rest of the run planned -- and the library sha is
 # part of every unit key, so the results would be keyed to something the run never used.
 library=""
+# Dock options that must survive the hand-off to the round trip. --replicates decides
+# which units are outstanding; the rest are part of every unit key. Dropping them did not
+# fail -- `dock --replicates 5` on a GPU-less host quietly drew 3 and reported success.
+# tests/test_dock_defaults.py reads this list back out and checks it against the CLI's own
+# parser, so a new dock option cannot silently stop reaching the GPU host.
+dock_opts="--seed --threads-per-job --unit-timeout --search-mode --batch-size --replicates --poses"
+dock_pass=()
 prev=""
 for a in "$@"; do
     [ "$prev" = "--engine" ] && engine="$a"
@@ -164,6 +171,12 @@ for a in "$@"; do
         --engine=*) engine="${a#--engine=}" ;;
         --library=*) library="${a#--library=}" ;;
     esac
+    # `--opt value` (collected on the value, which is why prev is checked first) and
+    # `--opt=value`
+    for o in $dock_opts; do
+        [ "$prev" = "$o" ] && dock_pass+=("$o" "$a")
+        case "$a" in "$o"=*) dock_pass+=("$a") ;; esac
+    done
     prev="$a"
 done
 have_gpu=0
@@ -255,7 +268,8 @@ if [ "$want_roundtrip" = 1 ]; then
 
     echo "== dock: no local GPU, so the work goes to the GPU host and comes back"
     POLYPHAR_RUN_DIR="$run_dir" "$colab" "${roundtrip_args[@]}" \
-        ${library:+--library "$library"} || exit $?
+        ${library:+--library "$library"} \
+        ${dock_pass[@]+-- "${dock_pass[@]}"} || exit $?
 
     if [ "${1:-}" = run ] && [ "${to:-$default_to_index}" -gt "$dock_i" ]; then
         echo "== stages after dock (in the container)"
