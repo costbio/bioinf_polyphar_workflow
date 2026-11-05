@@ -199,7 +199,9 @@ while true; do
             fails=0
             note "$line"
             # the worker's own progress, so the terminal shows ligands as well as units
-            printf '%s\n' "$out" | grep -m1 -E 'dock-worker: [0-9]+/[0-9]+ units' \
+            # the LAST progress line: the poll tails ~3 kB of the log, oldest first, so the
+            # first match was the run's first line and showed "1%" on every poll
+            printf '%s\n' "$out" | grep -E 'dock-worker: [0-9]+/[0-9]+ units' | tail -1 \
                 | sed 's/^/           /' || true
         else
             fails=$((fails + 1))
