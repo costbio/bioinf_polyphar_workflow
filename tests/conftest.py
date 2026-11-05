@@ -1,9 +1,28 @@
 import os
 import shutil
 import subprocess
+import warnings
 from pathlib import Path
 
 import pytest
+
+# Import prody HERE, once, with warnings silenced.
+#
+# `pytest -W error` is the command the README and the runbook tell you to run, and it had
+# stopped working: prody's import emits a pyparsing deprecation
+# ("'setParseAction' deprecated"), so under -W error every test that reached prody failed
+# as an error -- 20 of them, in a suite that otherwise passed. The quality gate meant to
+# catch OUR warnings was failing on a third party's, which is the same shape of problem as
+# a test nobody runs. Importing it once at collection, outside any test's warning context,
+# makes the module cached and the deprecation harmless, and leaves -W error free to fail
+# on warnings this project actually raises. The ini filterwarnings entry cannot do this:
+# a command-line -W takes precedence over it.
+with warnings.catch_warnings():
+    warnings.simplefilter("ignore")
+    try:
+        import prody  # noqa: F401
+    except Exception:
+        pass
 
 
 def _rdkit_ok() -> bool:

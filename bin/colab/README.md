@@ -58,16 +58,33 @@ Then:
     colab exec -f bin/colab/setup.py  --timeout 3600 --env POLYPHAR_COMMIT=$POLYPHAR_COMMIT
     colab exec -f bin/colab/launch.py --timeout 600
     colab exec -f bin/colab/poll.py   --timeout 300  # repeat
-    colab exec -f bin/colab/pack.py   --timeout 600
+    colab upload have.txt /content/have.txt          # what you already hold
+    colab exec -f bin/colab/fetch.py  --timeout 600  # repeat, alongside the poll
 
-Download `/content/results.tgz`, then back on POSEIDON:
+`have.txt` is one `<label>/r<i>` per line — the units already on the host:
 
-    tar xzf results.tgz -C 07_docking/export/<name>
+    ( cd 07_docking/export/<name>/results && ls -d */replicates/*.done ) \
+        | sed 's#/replicates/#/#; s#\.done$##' > have.txt
+
+`fetch.py` tars only the finished units missing from that list and prints
+`FETCH units=<n>`. When it says `units=0` there is nothing to download. Otherwise download
+`/content/outbox.tgz`, then back on POSEIDON:
+
+    tar xzf outbox.tgz -C 07_docking/export/<name>
     polyphar-docker dock-merge --bundle 07_docking/export/<name>
 
-`dock-merge` verifies each unit's key before folding it in, and recomputes what is still
-outstanding. Only `results/` travels home: the receptors and the library came from the run
-folder and merging re-reads them there.
+**Fetch on every poll, not once at the end.** This is the whole point of the incremental
+pull: a unit on the host cannot be lost to a reclaimed VM, so losing the session costs one
+poll interval instead of everything drawn since it started. Selection is recomputed from
+`have.txt` each time and nothing is marked on the VM, so a dropped download is simply
+retried. Pass `--env FETCH_FORCE=1` on the last call to collect `worker.json` and the
+worker's log even when no new unit has landed.
+
+`dock-merge` verifies each unit's key before folding it in, recomputes what is still
+outstanding, and never replaces a draw already on record — so it is safe to run repeatedly
+against a bundle that is still filling up. Only `results/` and a few small bundle-root
+files travel home: the receptors and the library came from the run folder and merging
+re-reads them there.
 
 ## The commit pin is not optional
 

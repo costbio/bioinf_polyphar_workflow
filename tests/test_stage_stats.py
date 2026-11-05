@@ -1089,7 +1089,8 @@ def test_a_positive_below_coverage_is_named_not_silently_dropped(tmp_path):
     run, _ = _run_folder(tmp_path)
     _positive_set(run)
     for p in sorted((run / "07_docking").glob("df_results_*.csv")):
-        rs = list(csv.DictReader(p.open()))
+        with p.open(newline="", encoding="utf-8") as fh:
+            rs = list(csv.DictReader(fh))
         with p.open("w", newline="") as fh:
             w = csv.DictWriter(fh, fieldnames=list(rs[0]))
             w.writeheader()
@@ -1109,7 +1110,8 @@ def test_coverage_is_measured_on_targets_as_well_as_proteins(tmp_path):
     _positive_set(run)
     # drop ligand "5" from every SECOND pocket: every protein is still covered
     for p in sorted((run / "07_docking").glob("df_results_*P_2.csv")):
-        rs = list(csv.DictReader(p.open()))
+        with p.open(newline="", encoding="utf-8") as fh:
+            rs = list(csv.DictReader(fh))
         with p.open("w", newline="") as fh:
             w = csv.DictWriter(fh, fieldnames=list(rs[0]))
             w.writeheader()

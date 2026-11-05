@@ -65,6 +65,54 @@ push() {
 }
 die() { printf 'polyphar-colab: %s\n' "$*" >&2; push "dock failed" "$*" 1; exit 1; }
 
+# Every unit this host already holds, as `<label>/r<i>` -- the same id fetch.py reads from
+# /content/have.txt. Derived from the bundle each time: no bookkeeping file to go stale.
+local_units() {
+    [ -d "$bundle/results" ] || return 0
+    ( cd "$bundle/results" && ls -d */replicates/*.done 2>/dev/null ) \
+        | sed 's#/replicates/#/#; s#\.done$##'
+}
+local_count() { local_units | wc -l | tr -d ' '; }
+
+# Pull the units the VM has and this host does not. THE point of the exercise: a unit on
+# POSEIDON's disk cannot be lost to a reclaimed VM, so a lost session costs one interval
+# rather than everything drawn since it started.
+#
+# Returns non-zero on any failure WITHOUT losing anything: selection is recomputed from
+# this host's own tree next time, so a dropped upload, exec, download or extraction is
+# simply retried. Never call die() from here -- a failed pull must not end the run.
+fetch() {
+    local force="${1:-}" manifest out n tgz_out before
+    manifest="$(mktemp -t polyphar-have-XXXXXX.txt)"
+    local_units > "$manifest" 2>/dev/null || true
+    if ! timeout --foreground 300 colab upload "$manifest" /content/have.txt -s "$session" >/dev/null 2>&1; then
+        rm -f "$manifest"; note "           fetch: manifest upload failed; retrying next poll"; return 1
+    fi
+    rm -f "$manifest"
+    if ! out="$(timeout --foreground 900 colab exec -f "$repo/bin/colab/fetch.py" \
+                    ${force:+--env FETCH_FORCE=1} --timeout 600 -s "$session" 2>&1 | tr -d '\000')"; then
+        note "           fetch: exec failed; retrying next poll"; return 1
+    fi
+    n="$(printf '%s\n' "$out" | sed -n 's/^FETCH units=\([0-9]*\).*/\1/p' | head -1)"
+    if [ -z "$n" ]; then
+        note "           fetch: no FETCH line (${out##*$'\n'}); retrying next poll"; return 1
+    fi
+    [ "$n" = 0 ] && return 0
+    tgz_out="$(mktemp -t polyphar-outbox-XXXXXX.tgz)"
+    if ! timeout --foreground 3600 colab download /content/outbox.tgz "$tgz_out" -s "$session" >/dev/null 2>&1; then
+        rm -f "$tgz_out"; note "           fetch: download failed; retrying next poll"; return 1
+    fi
+    before="$(local_count)"
+    # straight into the bundle: tar extraction is additive per file, and fetch.py puts each
+    # unit's .done marker last so an interrupted extract cannot certify a missing record
+    if ! tar xzf "$tgz_out" -C "$bundle"; then
+        rm -f "$tgz_out"; note "           fetch: the archive did not extract; retrying next poll"; return 1
+    fi
+    rm -f "$tgz_out"
+    note "           pulled $n unit(s); $before -> $(local_count) held here"
+    return 0
+}
+
 command -v colab >/dev/null 2>&1 || die "the colab CLI is not on PATH (pip install google-colab-cli)"
 [ -d "$run_dir" ] || die "run dir $run_dir does not exist"
 [ -d "$repo/bin/colab" ] || die "$repo/bin/colab not found; set POLYPHAR_REPO"
@@ -97,6 +145,11 @@ export_root="$run_dir/07_docking/export"
 # to the first: if the session is alive and holds this very bundle, skip straight to
 # polling, then pack, download and merge as usual. Nothing is re-exported or re-uploaded.
 attach=""
+merge_only=""
+fetch_every="${COLAB_FETCH_EVERY:-1}"
+max_fails="${COLAB_MAX_POLL_FAILS:-10}"
+session_lost=""
+fetch_tick=0
 unmerged=()
 if [ -d "$export_root" ]; then
     for b in "$export_root"/*/; do
@@ -124,8 +177,13 @@ if [ "${#unmerged[@]}" = 1 ]; then
         say "re-attaching to bundle $rel on Colab session '$session' (nothing re-exported)"
         push "dock: re-attached" "Polling bundle $name again on session $session."
     elif [ -d "$b/results" ] && [ -n "$(ls -A "$b/results" 2>/dev/null)" ]; then
-        die "bundle $brel has downloaded results but was not merged. Merge it:
-     bin/polyphar-docker dock-merge --bundle $brel $control && touch $brel/.merged"
+        # Since the pull became incremental this is the ORDINARY state after any
+        # interruption: units were pulled, the session is gone, the merge never ran.
+        # Refusing here would strand real results behind a manual command.
+        merge_only=1
+        bundle="$b"; rel="$brel"; name="${b##*/}"
+        say "session '$session' is gone, but $(local_count) pulled unit(s) are here: merging them"
+        push "dock: merging what was pulled" "Session gone; merging $(local_count) unit(s) already home."
     else
         die "bundle $brel is unmerged and Colab session '$session' does not hold it
      (session gone, or a different bundle${remote:+: $remote}). If you used another
@@ -135,7 +193,7 @@ if [ "${#unmerged[@]}" = 1 ]; then
 fi
 
 tgz=""
-if [ -z "$attach" ]; then
+if [ -z "$attach" ] && [ -z "$merge_only" ]; then
     name="$(date +%Y%m%dT%H%M%S)"
     rel="${export_root#$run_dir/}/$name"
     say "dock-export -> $rel"
@@ -161,25 +219,28 @@ if [ -z "$attach" ]; then
     fi
 
     say "uploading bundle ($(du -h "$tgz" | cut -f1))"
-    colab upload "$tgz" /content/bundle.tgz -s "$session"
+    timeout --foreground 3600 colab upload "$tgz" /content/bundle.tgz -s "$session"
     if [ -f "$home_dir/pushover.env" ]; then
-        colab upload "$home_dir/pushover.env" /content/pushover.env -s "$session"
+        timeout --foreground 300 colab upload "$home_dir/pushover.env" /content/pushover.env -s "$session"
     else
         say "WARNING: $home_dir/pushover.env not found; launch will refuse unless ALLOW_SILENT=1"
     fi
 
     # --- 3. run ---------------------------------------------------------------------------
     say "installing the engine (pinned to $commit)"
-    colab exec -f "$repo/bin/colab/setup.py" --env "POLYPHAR_COMMIT=$commit" --timeout 3600 -s "$session"
+    timeout --foreground 4200 colab exec -f "$repo/bin/colab/setup.py" --env "POLYPHAR_COMMIT=$commit" --timeout 3600 -s "$session"
 
     push "dock: worker starting" "$n_units units on a $gpu. Progress every ${poll_s}s."
     say "launching the detached worker"
-    colab exec -f "$repo/bin/colab/launch.py" --timeout 600 -s "$session" \
+    timeout --foreground 900 colab exec -f "$repo/bin/colab/launch.py" --timeout 600 -s "$session" \
         ${ALLOW_SILENT:+--env "ALLOW_SILENT=$ALLOW_SILENT"} \
         || die "the worker did not start (see the message above). Nothing was lost: the
      bundle is at $rel and the units are still outstanding."
 fi
 
+if [ -n "$merge_only" ]; then
+    say "nothing to poll: merging the units already pulled"
+else
 say "polling every ${poll_s}s (the poll is also the keep-alive)"
 # Every poll prints a line, including a failed one. Swallowing the failure and grepping
 # for ^STATE= made a dropped websocket look exactly like a quiet worker: on 2026-11-04 a
@@ -205,6 +266,16 @@ while true; do
             # first match was the run's first line and showed "1%" on every poll
             printf '%s\n' "$out" | grep -E 'dock-worker: [0-9]+/[0-9]+ units' | tail -1 \
                 | sed 's/^/           /' || true
+            # The incremental pull. poll.py already prints done=<n>/<total>, so when the
+            # VM has nothing this host lacks we spend no upload, no exec and no download
+            # -- which is every poll but the few where a unit actually lands.
+            remote_done="$(printf '%s\n' "$line" | sed -n 's/.*done=\([0-9]*\)\/.*/\1/p')"
+            fetch_tick=$((fetch_tick + 1))
+            if [ -n "$remote_done" ] && [ "$remote_done" = "$(local_count)" ]; then
+                :
+            elif [ "$((fetch_tick % fetch_every))" = 0 ]; then
+                fetch || true
+            fi
         else
             fails=$((fails + 1))
             note "poll returned no STATE line (attempt $fails); worker is detached and unaffected"
@@ -218,21 +289,44 @@ while true; do
                  "6 consecutive polls failed. The worker may still be running; check with
 colab download /content/worker.log /tmp/w.log -s $session" 1
         fi
+        # Without this the loop polls a dead session for ever. It used to be harmless
+        # because nothing had been pulled anyway; now that every poll brings results
+        # home, giving up and merging what is here is the right end to a lost VM.
+        if [ "$fails" -ge "$max_fails" ]; then
+            note "giving up after $fails consecutive failed polls; merging what is here"
+            push "dock: session lost" \
+                 "$fails polls failed in a row. Merging the $(local_count) unit(s) already pulled." 1
+            session_lost=1
+            break
+        fi
     fi
     case "$out" in
         *STATE=GONE*|*STATE=NO-PIDFILE*) break ;;
     esac
 done
+fi
 
 # --- 4. bring it home -----------------------------------------------------------------
-push "dock: worker finished" "Packing and bringing results home."
-say "packing results"
-timeout --foreground 900 colab exec -f "$repo/bin/colab/pack.py" --timeout 600 -s "$session"
-res="$(mktemp -t polyphar-results-XXXXXX.tgz)"
-timeout --foreground 3600 colab download /content/results.tgz "$res" -s "$session"
-tar xzf "$res" -C "$bundle"
+# Most of the results are already here, pulled poll by poll. This is the last sweep: the
+# units finished since the final poll, plus worker.json and the worker's own failed.tsv
+# and log, which the per-poll pulls also carry but which are only complete now.
+if [ -n "$session_lost" ]; then
+    merge_only=1
+    say "the session is gone: merging the $(local_count) unit(s) that were pulled"
+fi
+if [ -z "$merge_only" ]; then
+    push "dock: worker finished" "Fetching the last results and merging."
+    say "final fetch"
+    ok=""
+    for try in 1 2 3; do
+        if fetch force; then ok=1; break; fi
+        note "final fetch attempt $try failed; retrying"
+    done
+    [ -n "$ok" ] || die "the final fetch failed three times. Everything pulled so far is
+     at $rel/results and is NOT lost: re-run to retry the fetch and the merge."
+fi
 
-say "dock-merge"
+say "dock-merge ($(local_count) unit(s) held here)"
 merge_rc=0
 "$here/polyphar-docker" dock-merge --bundle "$rel" $control || merge_rc=$?
 
@@ -247,8 +341,8 @@ case "$merge_rc" in
      $bundle/results. Fix the cause and re-run `polyphar-docker dock-merge --bundle $rel`." ;;
 esac
 
-[ -n "$keep" ] || colab stop -s "$session" || true
-rm -f ${tgz:+"$tgz"} "$res"
+[ -n "$keep" ] || [ -n "$merge_only" ] || colab stop -s "$session" || true
+rm -f ${tgz:+"$tgz"}
 
 push "dock: merged" "Bundle $name merged into the run folder. Re-run \`polyphar dock\` until nothing is outstanding."
 say "done: bundle $rel merged. Re-run until dock reports nothing outstanding."

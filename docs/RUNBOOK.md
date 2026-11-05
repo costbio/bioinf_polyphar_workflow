@@ -62,6 +62,26 @@ than failing 2,083 records one at a time:
     docker build --build-arg POLYPHAR_GIT_COMMIT=$(git rev-parse HEAD) \
         -f docker/Dockerfile -t polyphar:1.2 -t polyphar:dev .
 
+### 2026-11-06: results come home continuously, not once at the end
+
+The Colab round trip used to pack and download **only after the worker finished**. A VM
+reclaimed mid-session therefore cost every unit drawn since it started — up to 200 units
+and ~20 GPU-hours on net1. Capping a session below 24 h was never a real defence.
+
+`bin/polyphar-colab` now pulls on **every poll** (~2 min). `bin/colab/fetch.py` sends only
+the finished units the host does not already hold, so a lost VM costs at most one poll
+interval. `dock-merge` still runs once at the end: a pulled unit is already safe on disk,
+and merging is far more expensive than downloading.
+
+- Nothing is marked on the VM. The host sends what it has (`/content/have.txt`) and the
+  selection is recomputed each time, so a dropped upload, exec, download or extraction is
+  retried on the next poll and loses nothing.
+- When the VM has nothing the host lacks, the poll costs no transfer at all.
+- A unit still being written has no `.done` marker and does not travel.
+- Interrupting the wrapper is now safe at any moment: re-running it re-attaches if the
+  session is alive, and **merges what was already pulled** if the session is gone.
+- `COLAB_FETCH_EVERY=N` fetches every Nth poll instead of every one.
+
 ### 2026-11-05 (later): image 1.3, unmodelled pockets and the PocketMatch hang
 
 `export POLYPHAR_VERSION=1.3`. Two further defects, both found when AD Cluster1's
@@ -204,7 +224,7 @@ What it refuses to do, and why:
   both would be worked, and the second merge's draws are discarded with the GPU time
   already spent. Instead, if the Colab session still holds that bundle (checked by the
   sha256 of its `run_key.json`), re-running **re-attaches**: no export, no upload, no new
-  worker, just polling and then pack, download and merge. That is the recovery when the
+  worker, just polling and then fetch, download and merge. That is the recovery when the
   host terminal dies mid-run: the detached worker keeps docking and notifying, and the
   same `$POLYPHAR dock` brings its results home. If the session is gone, it says so and
   stops.

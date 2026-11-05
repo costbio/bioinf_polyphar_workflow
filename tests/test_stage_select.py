@@ -69,6 +69,13 @@ def _make_run(tmp_path, drugscore_rows, annotation_rows, protein_info_rows, tm=N
     return RunLayout(run)
 
 
+def _rows(path):
+    """CSV rows, with the file closed -- an unclosed handle is a ResourceWarning, and
+    `pytest -W error` (the documented command) turns that into a failure."""
+    with open(path, newline="", encoding="utf-8") as fh:
+        return list(csv.DictReader(fh))
+
+
 def _ds(acc, protein, pocket, fname, vol=800.0, ds=0.9, sv=0.40):
     return {"UniProt ID": acc, "Gene Name": f"{acc}G_HUMAN", "Protein": protein,
             "Pocket": pocket, "Pocket Filename": fname, "volume": str(vol),
@@ -176,10 +183,10 @@ def test_run_writes_the_panel_the_funnel_and_a_reason_per_rejection(tmp_path):
     counts = select.run(layout, _args(), _Progress())
 
     assert counts["panel"] == 1 and counts["selected_pockets"] == 3
-    targets = list(csv.DictReader(open(layout.targets / "final_targets.csv")))
+    targets = _rows(layout.targets / "final_targets.csv")
     assert [t["UniProt_ID"] for t in targets] == ["P1"]
 
-    funnel = list(csv.DictReader(open(layout.targets / "panel_funnel.tsv")))
+    funnel = _rows(layout.targets / "panel_funnel.tsv")
     counts_seq = [int(f["pockets_remaining"]) for f in funnel]
     assert counts_seq == sorted(counts_seq, reverse=True)      # monotone chain
     assert counts_seq[0] == 3 and counts_seq[-1] == 1
@@ -204,7 +211,7 @@ def test_excluded_accessions_are_dropped_and_recorded(tmp_path):
     counts = select.run(layout, _args(), _Progress())
 
     assert counts["panel"] == 1 and counts["excluded"] == 1
-    targets = list(csv.DictReader(open(layout.targets / "final_targets.csv")))
+    targets = _rows(layout.targets / "final_targets.csv")
     assert [t["UniProt_ID"] for t in targets] == ["P1"]
     assert "p73" in (layout.targets / "failed.tsv").read_text()
 
@@ -253,7 +260,7 @@ def test_eligible_pockets_csv_lists_every_passing_pocket(tmp_path):
     counts = select.run(layout, _args(), _Progress())
     assert counts["panel"] == 2 and counts["eligible_pockets"] == 3
 
-    elig = list(csv.DictReader(open(layout.targets / "eligible_pockets.csv")))
+    elig = _rows(layout.targets / "eligible_pockets.csv")
     assert len(elig) == 3
     assert [e["Pocket_Path"] for e in elig] == [
         "04_pockets/P1/a.pdb", "04_pockets/P1/b.pdb", "04_pockets/P2/c.pdb"]
@@ -267,7 +274,7 @@ def test_excluded_accessions_are_absent_from_eligible_pockets_too(tmp_path):
              "File": f"02_structures/{a}/AF-{a}-F1.pdb"} for a in ("O15350", "P1")]
     layout = _make_run(tmp_path, ds_rows, anns, info)
     select.run(layout, _args(), _Progress())
-    elig = list(csv.DictReader(open(layout.targets / "eligible_pockets.csv")))
+    elig = _rows(layout.targets / "eligible_pockets.csv")
     assert [e["UniProt_ID"] for e in elig] == ["P1"]
 
 

@@ -1,0 +1,244 @@
+#!/usr/bin/env python3
+"""Stand-in for the `colab` CLI, backed by a directory that plays the VM.
+
+`bin/polyphar-colab` had no tests at all, which is how a terminal round trip survived
+long enough to cost a 2.5 h stall and nearly a session's worth of GPU time. This fake
+lets the whole wrapper run under pytest in seconds, including the paths that only happen
+when something goes wrong: a VM that disappears, a download that fails, a unit that is
+still being written.
+
+$FAKE_COLAB_VM stands in for /content. The real `bin/colab/fetch.py` runs against it, so
+the selection logic under test is the shipped one, not a reimplementation.
+
+Knobs (all optional):
+  FAKE_COLAB_VM             the VM directory (required)
+  FAKE_COLAB_UNITS_PER_POLL units the simulated worker finishes per poll (default 1)
+  FAKE_COLAB_TOTAL          units in the bundle (default: rows in units.tsv)
+  FAKE_COLAB_DIE_AFTER      the session vanishes after this many polls
+  FAKE_COLAB_GONE_AFTER     the worker reports GONE after this many polls
+  FAKE_COLAB_HANG_AFTER     the worker stops finishing units after this many polls
+  FAKE_COLAB_FAIL_DOWNLOAD  comma-separated download attempt numbers that fail
+  FAKE_COLAB_FAIL_EXEC      comma-separated fetch.py attempt numbers that fail
+  FAKE_COLAB_LOG            append one line per invocation
+"""
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+VM = Path(os.environ["FAKE_COLAB_VM"])
+STATE = VM / ".state.json"
+SESSIONS = VM / ".sessions"
+FETCH = Path(__file__).resolve().parents[2] / "bin" / "colab" / "fetch.py"
+
+
+def log(line):
+    path = os.environ.get("FAKE_COLAB_LOG")
+    if path:
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+
+
+def state():
+    try:
+        return json.loads(STATE.read_text())
+    except (OSError, ValueError):
+        return {"polls": 0, "downloads": 0, "fetches": 0, "finished": 0}
+
+
+def save(st):
+    STATE.write_text(json.dumps(st))
+
+
+def nums(name):
+    return {int(x) for x in os.environ.get(name, "").split(",") if x.strip()}
+
+
+def remote(path):
+    """/content/x -> <VM>/x"""
+    return VM / str(path).lstrip("/").removeprefix("content/")
+
+
+def sessions():
+    return {p.name for p in SESSIONS.iterdir()} if SESSIONS.is_dir() else set()
+
+
+def opt(argv, name):
+    return argv[argv.index(name) + 1] if name in argv else None
+
+
+def total_units():
+    if os.environ.get("FAKE_COLAB_TOTAL"):
+        return int(os.environ["FAKE_COLAB_TOTAL"])
+    try:
+        return len((VM / "bundle" / "units.tsv").read_text().splitlines()) - 1
+    except OSError:
+        return 0
+
+
+def unit_rows():
+    """[(label, replicate)] from the bundle's units.tsv, in order."""
+    try:
+        lines = (VM / "bundle" / "units.tsv").read_text().splitlines()
+    except OSError:
+        return []
+    out = []
+    for line in lines[1:]:
+        f = line.split("\t")
+        if len(f) >= 2:
+            out.append((f[0], f[1]))
+    return out
+
+
+def finish(n):
+    """Write `n` more finished units, exactly as the worker would."""
+    rows = unit_rows()
+    st = state()
+    made = 0
+    for label, rep in rows[st["finished"]: st["finished"] + n]:
+        d = VM / "bundle" / "results" / label / "replicates"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"r{rep}.sdf").write_text(f"{label} r{rep}\n$$$$\n")
+        (d / f"r{rep}.log").write_text("fake engine\n")
+        (d / f"r{rep}.prov.json").write_text(json.dumps({"replicate": int(rep)}))
+        (d / f"r{rep}.done").write_text(f"key-{label}-{rep}\n")   # last, as the worker does
+        made += 1
+    st["finished"] += made
+    save(st)
+    return st["finished"]
+
+
+def main(argv):
+    log(" ".join(argv))
+    cmd = argv[0] if argv else ""
+    session = opt(argv, "-s") or opt(argv, "--session")
+
+    if cmd == "sessions":
+        for name in sorted(sessions()):
+            print(f"[{name}] L4")
+        return 0
+
+    if cmd == "new":
+        SESSIONS.mkdir(parents=True, exist_ok=True)
+        (SESSIONS / session).write_text("up")
+        return 0
+
+    if cmd == "stop":
+        (SESSIONS / session).unlink(missing_ok=True)
+        return 0
+
+    # everything below needs a live session
+    if session and session not in sessions():
+        print(f"fake-colab: no session {session}", file=sys.stderr)
+        return 1
+
+    if cmd == "upload":
+        src, dst = Path(argv[1]), remote(argv[2])
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(src, dst)
+        return 0
+
+    if cmd == "download":
+        st = state()
+        st["downloads"] += 1
+        save(st)
+        if st["downloads"] in nums("FAKE_COLAB_FAIL_DOWNLOAD"):
+            print("fake-colab: download failed", file=sys.stderr)
+            return 1
+        src, dst = remote(argv[1]), Path(argv[2])
+        if not src.exists():
+            print(f"fake-colab: {argv[1]} not found", file=sys.stderr)
+            return 1
+        shutil.copyfile(src, dst)
+        return 0
+
+    if cmd == "exec":
+        script = Path(opt(argv, "-f") or opt(argv, "--file") or "")
+        name = script.name
+        env = {}
+        for i, a in enumerate(argv):
+            if a == "--env" and i + 1 < len(argv):
+                k, _, v = argv[i + 1].partition("=")
+                env[k] = v
+
+        if name == "setup.py":
+            print("fake-colab: engine installed")
+            return 0
+
+        if name == "launch.py":
+            # the real launch.py untars the uploaded bundle before starting the worker
+            bundle = VM / "bundle"
+            bundle.mkdir(parents=True, exist_ok=True)
+            tgz = VM / "bundle.tgz"
+            if tgz.exists():
+                subprocess.run(["tar", "xzf", str(tgz), "-C", str(bundle),
+                                "--strip-components=1"], check=True)
+            (bundle / "results").mkdir(exist_ok=True)
+            (VM / "worker.pid").write_text("4242")
+            save({"polls": 0, "downloads": state()["downloads"], "fetches": 0,
+                  "finished": 0})
+            print("worker pid=4242 RUNNING")
+            return 0
+
+        if name == "bundle_id.py":
+            try:
+                digest = hashlib.sha256(
+                    (VM / "bundle" / "run_key.json").read_bytes()).hexdigest()
+            except OSError:
+                digest = "none"
+            print(f"BUNDLE_ID={digest}")
+            return 0
+
+        if name == "poll.py":
+            st = state()
+            st["polls"] += 1
+            save(st)
+            die_after = os.environ.get("FAKE_COLAB_DIE_AFTER")
+            hang_after = os.environ.get("FAKE_COLAB_HANG_AFTER")
+            per = int(os.environ.get("FAKE_COLAB_UNITS_PER_POLL", "1"))
+            if not (hang_after and st["polls"] > int(hang_after)):
+                finish(per)
+            st = state()
+            total = total_units()
+            gone_after = os.environ.get("FAKE_COLAB_GONE_AFTER")
+            alive = "RUNNING" if st["finished"] < total else "GONE"
+            if gone_after and st["polls"] >= int(gone_after):
+                alive = "GONE"
+            print(f"STATE={alive} pid=4242  done={st['finished']}/{total}  "
+                  f"result_sdf={st['finished']}")
+            print(f"12:00:00 dock-worker: {st['finished']}/{total} units (1%)")
+            if die_after and st["polls"] >= int(die_after):
+                # the VM is reclaimed: the session is gone from here on
+                (SESSIONS / session).unlink(missing_ok=True)
+            return 0
+
+        if name == "fetch.py":
+            st = state()
+            st["fetches"] += 1
+            save(st)
+            if st["fetches"] in nums("FAKE_COLAB_FAIL_EXEC"):
+                print("fake-colab: exec failed", file=sys.stderr)
+                return 1
+            child = dict(os.environ)
+            child.update(env)
+            child["FETCH_BUNDLE"] = str(VM / "bundle")
+            child["FETCH_HAVE"] = str(VM / "have.txt")
+            child["FETCH_OUT"] = str(VM / "outbox.tgz")
+            p = subprocess.run([sys.executable, "-I", str(FETCH)], env=child,
+                               capture_output=True, text=True)
+            sys.stdout.write(p.stdout)
+            sys.stderr.write(p.stderr)
+            return p.returncode
+
+        print(f"fake-colab: unknown script {name}", file=sys.stderr)
+        return 2
+
+    print(f"fake-colab: unknown command {cmd}", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

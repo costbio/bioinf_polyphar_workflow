@@ -255,16 +255,20 @@ def test_wait_warns_once_without_worker(tmp_path, monkeypatch):
 
 
 def test_wait_repeats_the_warning_and_fails_once_the_worker_is_dead(tmp_path, monkeypatch):
+    # The warning is emitted on a wall-clock interval from inside the poll loop, so a
+    # starved loop emits fewer of them. With a 1.5 s deadline and a 0.4 s interval this
+    # test failed under a loaded full-suite run and passed alone; the headroom below
+    # keeps what it proves (the warning REPEATS) without depending on scheduling.
     monkeypatch.setattr(pockets, "POLL_S", 0.05)
-    monkeypatch.setattr(pockets, "NO_WORKER_REPEAT_S", 0.4)
+    monkeypatch.setattr(pockets, "NO_WORKER_REPEAT_S", 0.2)
     layout = _model_run(tmp_path)
     jobs = pockets.enqueue(layout, "dogsite2")
     prog = Prog()
     t0 = time.monotonic()
     with pytest.raises(RuntimeError, match="no DoGSiteScorer worker heartbeat for"):
         pockets.wait_for_queue(layout, prog, worker_timeout=0.2, jobs=jobs,
-                               worker_dead_after=1.5)
-    assert 1.5 <= time.monotonic() - t0 < 5
+                               worker_dead_after=3.0)
+    assert 3.0 <= time.monotonic() - t0 < 12
     assert len(prog.notes) >= 3                      # repeated, not once
     assert all(n[1] == WARNING and n[2] == 1 for n in prog.notes)
     assert not (layout.pockets / "queue" / "CLOSED").exists()
