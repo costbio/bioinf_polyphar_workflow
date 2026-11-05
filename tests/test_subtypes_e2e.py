@@ -77,6 +77,10 @@ def _run(run_dir, home, accessions, extra=()):
     env = {k: v for k, v in os.environ.items() if not k.startswith("PUSHOVER_")}
     env.update(POLYPHAR_RUN_DIR=str(run_dir), POLYPHAR_HOME=str(home),
                POLYPHAR_COLAB_KEEP="1",      # one session for all seven
+               # A unit of 3 ligands finishes in seconds, so the default 120 s poll is
+               # the whole cost of the round trip. Production keeps 120 s: there a unit
+               # is ~6 GPU-minutes and polling harder would just burn API calls.
+               COLAB_POLL_SECONDS=os.environ.get("COLAB_POLL_SECONDS", "15"),
                # POLYPHAR_HOME is a fresh temp dir, so it holds no pushover.env and
                # launch.py would refuse to start a worker that cannot notify. A test does
                # not want notifications; a real run does, which is why the refusal exists.
