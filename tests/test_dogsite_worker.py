@@ -26,6 +26,7 @@ WRAPPER = REPO / "bin" / "polyphar-docker"
 # Every test here drives the host-side wrappers in bin/, which the image does not ship
 # (docker/Dockerfile copies polyphar/ and tests/). They are checkout-only by nature.
 pytestmark = pytest.mark.repo_files
+FIX = REPO / "tests" / "fixtures"
 FAKE = REPO / "tests" / "fixtures" / "fake_dogsite"
 # the same fake under a DoGSiteScorer 2 identity (its --help lists --druggability, as DS2 2.0.0)
 FAKE2 = REPO / "tests" / "fixtures" / "fake_dogsite2"
@@ -262,13 +263,36 @@ def test_benchmark_calibration_is_per_tool(tmp_path):
         assert entry["seconds_per_unit"] < 1.0   # the legacy 1.0 was never averaged in
 
 
+def _atom_lines(path):
+    return {l.rstrip("\n") for l in Path(path).read_text().splitlines() if l.startswith("ATOM")}
+
+
+def test_fake_dogsite_carves_its_pocket_out_of_the_model(tmp_path):
+    """A pocket must lie inside its own receptor.
+
+    The fake used to copy a real pocket of a DIFFERENT protein, so every target it made
+    was a pocket/receptor mismatch -- the exact defect that docked 9 of 37 net1 targets
+    into empty space, and one an end-to-end run through this fake could never have caught,
+    because in that world the bad case was the only case."""
+    model = tmp_path / "2mjw_B.pdb"
+    shutil.copyfile(FIX / "2mjw_B.pdb", model)
+    out = tmp_path / "out"
+    r = subprocess.run([str(FAKE), "-p", str(model), "-o", str(out)],
+                       capture_output=True, text=True, env=_env())
+    assert r.returncode == 0, r.stderr
+    pocket = _atom_lines(f"{out}_res_P_1.pdb")
+    assert pocket, "the pocket has no atoms"
+    assert pocket <= _atom_lines(model), "the pocket is not part of its own model"
+
+
 def test_fake_dogsite_varies_pocket_by_model(tmp_path):
-    """Ruling: different model names give different REAL pockets (each drugScore >= 0.5),
-    so PocketMatch pairs of a local end-to-end run are not all identical (Pmax == 1)."""
+    """Different models give different pockets and different drugScores, so PocketMatch
+    pairs of a local end-to-end run are not all identical (Pmax == 1)."""
+    models = {"2mjw_B.pdb": FIX / "2mjw_B.pdb", "4y32_C.pdb": FIX / "4y32_C.pdb"}
     contents = {}
-    for name in ("2mjw_B.pdb", "1abc_A.pdb", "a.pdb"):
+    for name, src in models.items():
         model = tmp_path / name
-        model.write_text("ATOM\n")
+        shutil.copyfile(src, model)
         out = tmp_path / f"out_{name}"
         r = subprocess.run([str(FAKE), "-p", str(model), "-s", "-o", str(out)],
                            capture_output=True, text=True, env=_env())
@@ -276,11 +300,34 @@ def test_fake_dogsite_varies_pocket_by_model(tmp_path):
         desc = pd.read_csv(f"{out}_desc.txt", sep="\t")
         assert list(desc["name"]) == ["P_1"] and desc["drugScore"].iloc[0] >= 0.5
         contents[name] = (Path(f"{out}_res_P_1.pdb").read_text(), desc["drugScore"].iloc[0])
-        # deterministic
-        r = subprocess.run([str(FAKE), "-p", str(model), "-o", str(out) + "2"], env=_env())
-        assert Path(f"{out}2_res_P_1.pdb").read_text() == contents[name][0]
-    assert len({c for c, _ in contents.values()}) == 3
-    assert len({d for _, d in contents.values()}) == 3
+        # deterministic: the same model and the same output name reproduce the pocket
+        r = subprocess.run([str(FAKE), "-p", str(model), "-o", str(out)], env=_env())
+        assert Path(f"{out}_res_P_1.pdb").read_text() == contents[name][0]
+    # the pocket itself differs, because it is cut from a different protein each time
+    assert len({c for c, _ in contents.values()}) == len(models)
+
+    # and the descriptor numbers are not the same for every model (they are picked from
+    # the fixture sets by the model's file name, so a few names are needed to show it)
+    scores = set()
+    for i in range(6):
+        model = tmp_path / f"m{i}_A.pdb"
+        shutil.copyfile(FIX / "4y32_C.pdb", model)
+        out = tmp_path / f"d{i}"
+        subprocess.run([str(FAKE), "-p", str(model), "-o", str(out)], check=True,
+                       capture_output=True, env=_env())
+        scores.add(pd.read_csv(f"{out}_desc.txt", sep="\t")["drugScore"].iloc[0])
+    assert len(scores) > 1, scores
+
+
+def test_fake_dogsite_refuses_a_model_with_no_atoms(tmp_path):
+    """Carving needs real coordinates; silently writing an empty pocket would make a
+    later stage fail somewhere unrelated."""
+    model = tmp_path / "empty.pdb"
+    model.write_text("HEADER nothing\n")
+    r = subprocess.run([str(FAKE), "-p", str(model), "-o", str(tmp_path / "out")],
+                       capture_output=True, text=True, env=_env())
+    assert r.returncode != 0
+    assert "no ATOM records" in r.stdout + r.stderr
 
 
 def test_worker_failure_recorded(tmp_path):
