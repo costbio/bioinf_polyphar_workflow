@@ -801,6 +801,7 @@ STATE_CORRUPT = "corrupt"     # ran under this key, the record is unusable: disc
 LIB_DIRNAME = "ligands"       # 07_docking/ligands/ (this stage's engine input, see RESERVED_DIRS)
 TITLED_LIBRARY = "library_titled.sdf"
 DISCARD_LOG = "discarded.tsv"
+DISCARD_KEY_COLUMN = 4          # when, label, replicate, seed, KEY, reason, archived
 DISCARD_DIRNAME = "discarded"   # 07_docking/discarded/<ts>/<label>/r<i>.sdf (archive)
 EXPORT_DIRNAME = "export"       # 07_docking/export/<ts>/ (dock_export's default bundle dir)
 
@@ -2199,7 +2200,11 @@ def import_bundle(layout, plan: _Plan, bundle):
     bl = BundleLayout(bundle)
     want = {(u.label, u.replicate): u for u in plan.units}
     taken, rejected, dropped = [], [], []
-    logged = _discard_log_text(layout.docking)   # re-merging a bundle must not re-log
+    # re-merging a bundle must not re-log its drops. Keyed on (unit key, source file),
+    # the pair the row carries: the old test was two substring scans over the WHOLE log
+    # per dropped unit, which is both O(log size) each and loose -- two units of one
+    # bundle could satisfy it between them without either having been logged.
+    logged = _logged_drops(layout.docking)
     for b in read_bundle_units(bundle):
         u = b.unit
         mine = want.get((u.label, u.replicate))
@@ -2231,7 +2236,8 @@ def import_bundle(layout, plan: _Plan, bundle):
             # effect, so it is logged like any other discarded draw. Its bytes stay in the
             # bundle: `archived` says where.
             dropped.append((f"{u.label}/{u.name}", str(bundle)))
-            if f"{u.key}\t" not in logged or str(src_sdf) not in logged:
+            if (u.key, str(src_sdf)) not in logged:
+                logged.add((u.key, str(src_sdf)))
                 log_discard(layout.docking, u,
                             f"dropped on merge: a draw for this unit is already on record "
                             f"here, so the bundle's draw was not merged (bundle: {bundle})",
@@ -2243,16 +2249,49 @@ def import_bundle(layout, plan: _Plan, bundle):
             discard(layout, mine, "replaced by a draw merged from a bundle")
         dst_sdf.parent.mkdir(parents=True, exist_ok=True)
         dst_done.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(src_sdf, dst_sdf)
+        _copy_atomic(src_sdf, dst_sdf)
         if src_log.is_file():
-            shutil.copyfile(src_log, dst_log)
+            _copy_atomic(src_log, dst_log)
         src_prov = prov_path(bl, u)
         if src_prov.is_file():   # the provenance of the draw travels with the draw
-            shutil.copyfile(src_prov, prov_path(layout, mine))
+            _copy_atomic(src_prov, prov_path(layout, mine))
         _atomic_text(dst_done, mine.key + "\n")   # written last: the record is in place
         taken.append(mine)
     _carry_discards(bundle, layout)
     return taken, rejected, dropped
+
+
+def _logged_drops(stage_dir) -> set:
+    """{(unit key, archived path)} already in the discard log.
+
+    log_discard writes tab-separated rows carrying both; reading them as fields makes the
+    "already logged?" test exact and O(1) per unit instead of a substring scan over the
+    whole file."""
+    out = set()
+    for line in _discard_log_text(stage_dir).splitlines()[1:]:
+        f = line.split("\t")
+        if len(f) >= 2:
+            out.add((f[DISCARD_KEY_COLUMN], f[-1]))   # key, archived
+    return out
+
+
+def _copy_atomic(src: Path, dst: Path) -> None:
+    """Copy into place through a temporary file in the destination directory.
+
+    A plain copyfile leaves a PARTIAL file if the merge is interrupted. Nothing is lost --
+    an uncertified fragment is not a record, and the marker is written separately and last
+    -- but the next merge sees a file standing in the unit's place, archives the fragment
+    as a discard and logs it. The discard log and the archive then fill with debris that
+    looks like thrown-away science and is not."""
+    import shutil
+
+    tmp = dst.with_name(f".{dst.name}.{os.getpid()}.tmp")
+    try:
+        shutil.copyfile(src, tmp)
+        os.replace(tmp, dst)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def _discard_log_text(stage_dir) -> str:
