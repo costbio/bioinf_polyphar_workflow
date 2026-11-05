@@ -146,7 +146,12 @@ What it refuses to do, and why:
 
 - **A second bundle while an earlier one is unmerged.** Both would hold the same units,
   both would be worked, and the second merge's draws are discarded with the GPU time
-  already spent. Merge or delete the old bundle first.
+  already spent. Instead, if the Colab session still holds that bundle (checked by the
+  sha256 of its `run_key.json`), re-running **re-attaches**: no export, no upload, no new
+  worker, just polling and then pack, download and merge. That is the recovery when the
+  host terminal dies mid-run: the detached worker keeps docking and notifying, and the
+  same `$POLYPHAR dock` brings its results home. If the session is gone, it says so and
+  stops.
 - **Start with uncommitted changes under `polyphar/`.** The worker installs polyphar from
   the commit it pins, so the GPU would run different code than this host planned the unit
   keys with.
