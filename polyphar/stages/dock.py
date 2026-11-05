@@ -123,6 +123,7 @@ import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from polyphar import geometry
 from polyphar.stages import dock_unidock as unidock
 from polyphar.stages import ligands
 from polyphar.stages.fix import H_SEED, reference_platform, seeded_placement, strip_date_remark
@@ -334,17 +335,10 @@ def receptor_to_pdbqt(pdb, pdbqt) -> None:
 
 def pocket_box(pocket_pdb) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
     """(centre, size) of the pocket's ATOM/HETATM coordinates, unpadded."""
-    xyz = []
-    with open(pocket_pdb, encoding="utf-8", errors="replace") as fh:
-        for line in fh:
-            if line.startswith(("ATOM", "HETATM")):
-                xyz.append((float(line[30:38]), float(line[38:46]), float(line[46:54])))
+    xyz = geometry.read_atoms(pocket_pdb)
     if not xyz:
         raise ValueError(f"{pocket_pdb}: no atoms")
-    lo = [min(c[k] for c in xyz) for k in range(3)]
-    hi = [max(c[k] for c in xyz) for k in range(3)]
-    return (tuple((hi[k] + lo[k]) / 2 for k in range(3)),
-            tuple(hi[k] - lo[k] for k in range(3)))
+    return geometry.bounding_box(xyz)
 
 
 # --- smina ---------------------------------------------------------------------------
@@ -1604,7 +1598,13 @@ def prepare_receptors(layout, plan: _Plan, rows: list) -> dict:
     out: dict[str, tuple[Path, tuple, tuple]] = {}
     for t in plan.usable:
         try:
-            out[t.label] = (_prepare_receptor(layout, t), *pocket_box(t.pocket))
+            pdbqt = _prepare_receptor(layout, t)
+            center, size = pocket_box(t.pocket)
+            # Before any docking: a box the receptor does not occupy means the pocket and
+            # the receptor are different structures, and every ligand would be scored in
+            # vacuum. Refuse the target rather than produce a plausible-looking result.
+            geometry.check_box_occupancy(pdbqt, center, size, label=t.label)
+            out[t.label] = (pdbqt, center, size)
         except Exception as exc:
             rows.append((t.label, f"receptor/pocket preparation failed: "
                                   f"{type(exc).__name__}: {exc}"))

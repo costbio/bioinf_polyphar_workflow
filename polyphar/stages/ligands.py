@@ -135,6 +135,14 @@ OUTPUT = "library_prepared.sdf"
 TABLE = "ligands.csv"
 MAX_ROTATABLE_BONDS = 15            # exclude > this
 MAX_MW = 900.0                      # exclude > this (Da)
+# Elements the Vina scoring function can type in a LIGAND. Anything else has no
+# parameters, and the engine answers by silently writing no pose for that record: on net1
+# the six boron drugs (bortezomib, ixazomib, ixazomib citrate, tavaborole, crisaborole,
+# vaborbactam) were absent from all 102 replicates, with no error in any log, and because
+# a target is only complete when every ligand has poses, NO target could ever complete.
+# Excluding them here states the limitation once, in the library, instead of letting it
+# surface as an unexplained incompleteness per target.
+DOCKABLE_ELEMENTS = frozenset({"H", "C", "N", "O", "F", "P", "S", "CL", "BR", "I"})
 ETKDG_SEED = 42                     # only used for records that fail sanitisation
 MMFF_VARIANT = "MMFF94"
 MMFF_MAX_ITERS = 2000
@@ -261,7 +269,8 @@ def profile(lines) -> dict:
         deg[b] += 1
     rot = sum(1 for i, (a, b) in enumerate(edges)
               if orders[i] == 1 and i in br and deg[a] > 1 and deg[b] > 1)
-    return {"heavy_atoms": len(heavy_idx), "mw": mw, "rotatable_bonds": rot}
+    return {"heavy_atoms": len(heavy_idx), "mw": mw, "rotatable_bonds": rot,
+            "elements": sorted(set(el))}
 
 
 def exclusion(prof: dict) -> str:
@@ -271,6 +280,10 @@ def exclusion(prof: dict) -> str:
         reasons.append(f"rotatable_bonds={prof['rotatable_bonds']}>{MAX_ROTATABLE_BONDS}")
     if prof["mw"] > MAX_MW:
         reasons.append(f"mw={prof['mw']:.1f}>{MAX_MW:g}")
+    undockable = sorted(set(prof.get("elements", ())) - DOCKABLE_ELEMENTS)
+    if undockable:
+        reasons.append("element(s) the scoring function cannot type: "
+                       + ",".join(undockable))
     return "; ".join(reasons)
 
 
@@ -544,7 +557,10 @@ def _prepare_one(index: int, lines: list) -> dict:
     _silence_rdkit_warnings()
     prof = profile(lines)
     why = exclusion(prof)
-    row = {"record_index": index, **prof, "kept": not why, "exclusion": why,
+    # `elements` is an input to exclusion(), not a column: the exclusion string already
+    # names the offending ones, and ligands.csv has a fixed schema.
+    row = {"record_index": index, **{k: v for k, v in prof.items() if k != "elements"},
+           "kept": not why, "exclusion": why,
            "method": "", "mmff_converged": "", "mmff_status": "", "net_charge": "",
            "note": ""}
     if why:
@@ -831,6 +847,8 @@ def run(layout, args, progress) -> dict:
         "excluded_rotatable_bonds": sum(1 for r in rows
                                         if "rotatable_bonds=" in (r["exclusion"] or "")),
         "excluded_mw": sum(1 for r in rows if "mw=" in (r["exclusion"] or "")),
+        "excluded_undockable_element": sum(
+            1 for r in rows if "cannot type" in (r["exclusion"] or "")),
         # `minimised` means "this conformer came out of MMFF94": a record whose minimised
         # conformer was discarded (stereo inversion) or never built (no parameters) keeps
         # its deposited geometry and is NOT counted here.

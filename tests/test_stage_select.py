@@ -102,8 +102,8 @@ def test_receptor_path_for_alphafold_uses_the_model_file():
     info = [{"UniProt ID": "P1", "PDB": "", "Chain ID": "A", "AlphaFold": "True",
              "File": "02_structures/P1/AF-P1-F1.pdb"}]
     paths, chains = select._receptor_paths(panel, info)
-    assert paths["P1"] == "02_structures/P1/AF-P1-F1.pdb"
-    assert chains["P1"] == "A"
+    assert paths[("P1", "AF-P1-F1")] == "02_structures/P1/AF-P1-F1.pdb"
+    assert chains[("P1", "AF-P1-F1")] == "A"
 
 
 def test_receptor_path_for_a_pdb_chain_points_at_pdbfixer_and_keeps_the_real_chain():
@@ -113,8 +113,8 @@ def test_receptor_path_for_a_pdb_chain_points_at_pdbfixer_and_keeps_the_real_cha
     info = [{"UniProt ID": "P1", "PDB": "2MJW", "Chain ID": "b", "AlphaFold": "False",
              "File": "02_structures/P1/2mjw_b.pdb"}]
     paths, chains = select._receptor_paths(panel, info)
-    assert paths["P1"] == "03_pdbfixer/P1/2mjw_b.pdb"
-    assert chains["P1"] == "b"
+    assert paths[("P1", "2MJW_B")] == "03_pdbfixer/P1/2mjw_b.pdb"
+    assert chains[("P1", "2MJW_B")] == "b"
 
 
 def test_chains_differing_only_by_case_are_ambiguous_not_guessed():
@@ -139,7 +139,8 @@ def test_target_rows_keep_the_columns_dock_consumes():
     """dock reads Protein, Pocket, Receptor_Path and Pocket_Path; the schema must not
     drift even though Similarity and Is_Hub are now meaningless."""
     panel = {"P1": [(_ds("P1", "AF-P1-F1", "P_2", "AF-P1-F1_res_P_2.pdb"), _an("x"))]}
-    rows = select.target_rows(panel, {"P1": "02_structures/P1/AF-P1-F1.pdb"}, {"P1": "A"})
+    rows = select.target_rows(panel, {("P1", "AF-P1-F1"): "02_structures/P1/AF-P1-F1.pdb"},
+                              {("P1", "AF-P1-F1"): "A"})
     assert list(rows[0]) == select.TARGET_COLUMNS
     r = rows[0]
     assert r["Protein"] == "AF-P1-F1" and r["Pocket"] == "P_2"
@@ -154,7 +155,8 @@ def test_target_rows_are_sorted_by_accession_not_input_order():
         "P2": [(_ds("P2", "AF-P2-F1", "P_1", "b.pdb"), _an("b.pdb", acc="P2"))],
         "P1": [(_ds("P1", "AF-P1-F1", "P_1", "a.pdb"), _an("a.pdb"))],
     }
-    rows = select.target_rows(panel, {"P1": "x", "P2": "y"}, {"P1": "A", "P2": "A"})
+    rows = select.target_rows(panel, {("P1", "AF-P1-F1"): "x", ("P2", "AF-P2-F1"): "y"},
+                              {("P1", "AF-P1-F1"): "A", ("P2", "AF-P2-F1"): "A"})
     assert [r["UniProt_ID"] for r in rows] == ["P1", "P2"]
 
 
@@ -267,3 +269,80 @@ def test_excluded_accessions_are_absent_from_eligible_pockets_too(tmp_path):
     select.run(layout, _args(), _Progress())
     elig = list(csv.DictReader(open(layout.targets / "eligible_pockets.csv")))
     assert [e["UniProt_ID"] for e in elig] == ["P1"]
+
+
+# --- one receptor per PICK, not per protein -------------------------------------------
+
+def test_each_pick_gets_its_own_receptor_not_the_first_picks():
+    """A protein keeping pockets from two structures must get each pocket's OWN receptor.
+
+    Resolving one receptor per accession gave the second row the first row's receptor
+    while its box still came from its own pocket: on net1 that mispaired 83 of 479 rows
+    and docked 9 targets into empty space."""
+    panel = {"P1": [(_ds("P1", "1AAA_A", "P_1", "1aaa_A_res_P_1.pdb"), _an("a", af=False)),
+                    (_ds("P1", "2BBB_A", "P_1", "2bbb_A_res_P_1.pdb"), _an("b", af=False))]}
+    info = [{"UniProt ID": "P1", "PDB": "1AAA", "Chain ID": "A", "AlphaFold": "False",
+             "File": "02_structures/P1/1aaa_A.pdb"},
+            {"UniProt ID": "P1", "PDB": "2BBB", "Chain ID": "A", "AlphaFold": "False",
+             "File": "02_structures/P1/2bbb_A.pdb"}]
+    paths, chains = select._receptor_paths(panel, info)
+    assert paths[("P1", "1AAA_A")] == "03_pdbfixer/P1/1aaa_A.pdb"
+    assert paths[("P1", "2BBB_A")] == "03_pdbfixer/P1/2bbb_A.pdb"
+
+    rows = select.target_rows(panel, paths, chains)
+    got = {r["Protein"]: (r["Pocket_Path"], r["Receptor_Path"]) for r in rows}
+    assert got["1AAA_A"] == ("04_pockets/P1/1aaa_A_res_P_1.pdb", "03_pdbfixer/P1/1aaa_A.pdb")
+    assert got["2BBB_A"] == ("04_pockets/P1/2bbb_A_res_P_1.pdb", "03_pdbfixer/P1/2bbb_A.pdb")
+
+
+# --- the pocket must belong to the receptor -------------------------------------------
+
+def _atoms(path, coords):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("".join(
+        f"ATOM  {i:5d}  CA  ALA A{i:4d}    {x:8.3f}{y:8.3f}{z:8.3f}  1.00  0.00           C\n"
+        for i, (x, y, z) in enumerate(coords, start=1)) + "END\n")
+
+
+def _grid(origin, n=5, step=1.5):
+    ox, oy, oz = origin
+    return [(ox + i * step, oy + j * step, oz + k * step)
+            for i in range(n) for j in range(n) for k in range(n)]
+
+
+def test_check_pairs_accepts_a_pocket_inside_its_receptor(tmp_path):
+    layout = _make_run(tmp_path, [_ds("P1", "AF-P1-F1", "P_1", "a.pdb")],
+                       [_an("a.pdb")],
+                       [{"UniProt ID": "P1", "PDB": "", "Chain ID": "A",
+                         "AlphaFold": "True", "File": "02_structures/P1/AF-P1-F1.pdb"}])
+    _atoms(layout.run_dir / "02_structures" / "P1" / "AF-P1-F1.pdb", _grid((0, 0, 0)))
+    _atoms(layout.run_dir / "04_pockets" / "P1" / "a.pdb", _grid((1, 1, 1), n=3, step=3))
+    rows = [{"Node": "n", "Pocket_Path": "04_pockets/P1/a.pdb",
+             "Receptor_Path": "02_structures/P1/AF-P1-F1.pdb"}]
+    assert select._check_pairs(layout, rows) == []
+
+
+def test_check_pairs_refuses_a_pocket_from_another_structure(tmp_path):
+    layout = _make_run(tmp_path, [_ds("P1", "AF-P1-F1", "P_1", "a.pdb")],
+                       [_an("a.pdb")],
+                       [{"UniProt ID": "P1", "PDB": "", "Chain ID": "A",
+                         "AlphaFold": "True", "File": "02_structures/P1/AF-P1-F1.pdb"}])
+    _atoms(layout.run_dir / "02_structures" / "P1" / "AF-P1-F1.pdb", _grid((0, 0, 0)))
+    _atoms(layout.run_dir / "04_pockets" / "P1" / "a.pdb", _grid((200, 200, 200), n=2))
+    rows = [{"Node": "P1_X_2MJW_B_P_1", "Pocket_Path": "04_pockets/P1/a.pdb",
+             "Receptor_Path": "02_structures/P1/AF-P1-F1.pdb"}]
+    bad = select._check_pairs(layout, rows)
+    assert len(bad) == 1
+    assert "P1_X_2MJW_B_P_1" in bad[0] and "not the same structure" in bad[0]
+
+
+def test_check_pairs_ignores_rows_whose_files_are_absent(tmp_path):
+    """A missing structure or pocket file belongs to an earlier stage's failed.tsv; this
+    check is only about pairing."""
+    layout = _make_run(tmp_path, [_ds("P1", "AF-P1-F1", "P_1", "a.pdb")],
+                       [_an("a.pdb")],
+                       [{"UniProt ID": "P1", "PDB": "", "Chain ID": "A",
+                         "AlphaFold": "True", "File": "02_structures/P1/AF-P1-F1.pdb"}])
+    rows = [{"Node": "n", "Pocket_Path": "04_pockets/P1/nope.pdb",
+             "Receptor_Path": "02_structures/P1/nope.pdb"}]
+    assert select._check_pairs(layout, rows) == []

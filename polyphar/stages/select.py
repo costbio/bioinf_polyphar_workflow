@@ -34,6 +34,7 @@ import os
 import tempfile
 from pathlib import Path, PurePosixPath
 
+from polyphar import geometry
 from polyphar import panel as panel_mod
 from polyphar import tmfetch
 from polyphar.common import WorkUnits, write_manifest
@@ -195,19 +196,27 @@ def _receptor_index(protein_info):
 
 
 def _receptor_paths(panel, protein_info):
-    """(Receptor_Path by accession, real author chain by accession)."""
+    """(Receptor_Path by (accession, Protein), real author chain by (accession, Protein)).
+
+    Keyed on the PICK, not on the accession. A protein contributes one row per pocket it
+    kept, and those pockets can come from different structures; resolving one receptor per
+    accession gave every later row the FIRST pick's receptor while its box still came from
+    its own pocket. Where the two structures' frames differ the box then lands outside the
+    protein entirely: on net1, 83 of 479 rows were mispaired and 9 of the 37 targets docked
+    had no receptor atom inside the box at all."""
     pdb, af = _receptor_index(protein_info)
     paths, chains, missing, ambiguous = {}, {}, [], []
     for acc, picks in panel.items():
-        row, _ann = picks[0]
+      for row, _ann in picks:
+        key = (acc, str(row.get("Protein", "")))
         structure_id, chain = split_protein(str(row.get("Protein", "")))
         if structure_id.startswith("AF-"):
             file = af.get(acc)
             if file is None:
                 missing.append(f"{acc} AlphaFold model {structure_id}")
                 continue
-            paths[acc] = str(PurePosixPath(file))
-            chains[acc] = AF_CHAIN
+            paths[key] = str(PurePosixPath(file))
+            chains[key] = AF_CHAIN
         else:
             entries = pdb.get((acc, structure_id.upper(), chain.upper()), [])
             if not entries:
@@ -218,8 +227,8 @@ def _receptor_paths(panel, protein_info):
                                  + "/".join(c for c, _ in entries))
                 continue
             real_chain, file = entries[0]
-            paths[acc] = f"03_pdbfixer/{acc}/{PurePosixPath(file).name}"
-            chains[acc] = real_chain
+            paths[key] = f"03_pdbfixer/{acc}/{PurePosixPath(file).name}"
+            chains[key] = real_chain
     if ambiguous:
         raise ValueError(
             f"{len(ambiguous)} target(s) are ambiguous: Protein_info.csv has chains that "
@@ -244,6 +253,7 @@ def target_rows(panel, paths, chains) -> list[dict]:
         gene, organism = split_entry_name(entry)
         structure_id, _ = split_protein(str(row.get("Protein", "")))
         pocket = str(row.get("Pocket", ""))
+        key = (acc, str(row.get("Protein", "")))
         out.append({
             "Node": f'{acc}_{entry}_{row.get("Protein", "")}_{pocket}',
             "UniProt_ID": acc,
@@ -252,10 +262,10 @@ def target_rows(panel, paths, chains) -> list[dict]:
             "Structure_ID": structure_id,
             "Similarity": "",          # retained for schema compatibility only
             "Protein": row.get("Protein", ""),
-            "Chain": chains.get(acc, ""),
+            "Chain": chains.get(key, ""),
             "Pocket": pocket,
             "Pocket_Path": f'04_pockets/{acc}/{row.get("Pocket Filename", "")}',
-            "Receptor_Path": paths.get(acc, ""),
+            "Receptor_Path": paths.get(key, ""),
             "Is_Hub": False,           # retained for schema compatibility only
         })
     return out
@@ -300,6 +310,26 @@ def units(layout, args) -> WorkUnits:
     return WorkUnits(1, "panel", [1.0])
 
 
+def _check_pairs(layout, targets_out) -> list[str]:
+    """Reasons for every target row whose receptor does not occupy its pocket's box.
+
+    Checked here, on the UNFIXED structure that Receptor_Path names, so a mispairing is
+    caught when the panel is written rather than after the docking round has started.
+    `dock` checks the prepared receptor again, since the two stages can be run apart."""
+    bad = []
+    for row in targets_out:
+        receptor = layout.run_dir / row["Receptor_Path"]
+        pocket = layout.run_dir / row["Pocket_Path"]
+        if not (receptor.is_file() and pocket.is_file()):
+            continue        # a missing file is the structures/pockets stage's failure
+        try:
+            center, size = geometry.bounding_box(geometry.read_atoms(pocket))
+            geometry.check_box_occupancy(receptor, center, size, label=row["Node"])
+        except ValueError as exc:
+            bad.append(str(exc))
+    return bad
+
+
 def run(layout, args, progress) -> dict:
     opts = _options(args)
     excluded = _exclusions(args)
@@ -321,8 +351,16 @@ def run(layout, args, progress) -> dict:
 
     protein_info = _read_csv(layout.protein_info)
     paths, chains = _receptor_paths(pan, protein_info)
-    _atomic_rows(d / "final_targets.csv", TARGET_COLUMNS,
-                 target_rows(pan, paths, chains))
+    targets_out = target_rows(pan, paths, chains)
+    mispaired = _check_pairs(layout, targets_out)
+    if mispaired:
+        raise ValueError(
+            f"{len(mispaired)} target(s) pair a pocket with a receptor it does not fit. "
+            "The pocket and the receptor must be the same structure; a box the receptor "
+            "does not occupy would dock every ligand into empty space.\n  "
+            + "\n  ".join(mispaired[:20])
+            + (f"\n  ... and {len(mispaired) - 20} more" if len(mispaired) > 20 else ""))
+    _atomic_rows(d / "final_targets.csv", TARGET_COLUMNS, targets_out)
     _atomic_rows(d / "eligible_pockets.csv", ELIGIBLE_COLUMNS,
                  eligible_rows(eligible, excluded))
     _atomic_rows(d / "panel_funnel.tsv", ["step", "pockets_remaining"],

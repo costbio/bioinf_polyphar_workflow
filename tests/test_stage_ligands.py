@@ -928,3 +928,32 @@ def test_stage_module_exposes_the_stage_contract():
         assert callable(getattr(ligands, name))
     assert isinstance(ligands.STAGE, str)
     assert isinstance(ligands.units, types.FunctionType)
+
+
+# --- elements the scoring function cannot type ----------------------------------------
+
+def test_profile_reports_the_elements_present():
+    record = _molfile("X", [("C", 0, 0, 0), ("B", 1.5, 0, 0), ("O", 3.0, 0, 0)],
+                      [(1, 2, 1), (2, 3, 1)])
+    assert ligands.profile(_lines(record))["elements"] == ["B", "C", "O"]
+
+
+def test_a_boron_ligand_is_excluded_because_vina_cannot_type_it():
+    """Uni-Dock answers a boron ligand by writing no pose at all, with no error. Six such
+    drugs (bortezomib, ixazomib, tavaborole, ...) were missing from every replicate on
+    net1, so no target could ever be complete."""
+    prof = {"heavy_atoms": 3, "mw": 100.0, "rotatable_bonds": 0, "elements": ["B", "C", "O"]}
+    why = ligands.exclusion(prof)
+    assert "cannot type" in why and "B" in why
+
+
+def test_the_ordinary_drug_elements_are_all_dockable():
+    prof = {"heavy_atoms": 20, "mw": 300.0, "rotatable_bonds": 3,
+            "elements": sorted(ligands.DOCKABLE_ELEMENTS)}
+    assert ligands.exclusion(prof) == ""
+
+
+def test_a_record_with_no_element_information_is_not_excluded_for_elements():
+    """profile() defaults a blank element column to carbon; exclusion() must not invent a
+    reason when `elements` is absent entirely (older callers, fixtures)."""
+    assert ligands.exclusion({"heavy_atoms": 5, "mw": 80.0, "rotatable_bonds": 0}) == ""

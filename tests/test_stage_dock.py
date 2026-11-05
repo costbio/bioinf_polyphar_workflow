@@ -1638,3 +1638,28 @@ def test_an_empty_target_list_sweeps_nothing(run_folder, capsys):
     assert counts["obsoleted"] == 0
     assert sorted(p.name for p in layout.docking.iterdir()) == before
 
+
+
+# --- a box the receptor does not occupy ------------------------------------------------
+
+def test_a_target_whose_box_misses_its_receptor_is_refused_before_docking(run_folder):
+    """The pocket and the receptor must be the same structure. When they are not, the box
+    lands off the protein and every ligand is docked in vacuum, scored and written -- on
+    net1 that happened to 9 of the 37 targets docked. prepare_receptors must refuse the
+    target instead, before any engine runs."""
+    layout, _ = run_folder
+    pocket = layout.run_dir / "04_pockets" / "P25815" / "P25815_2mjw_A.pdb_res_P_1.pdb"
+    moved = []
+    for line in pocket.read_text().splitlines(keepends=True):
+        if line.startswith(("ATOM", "HETATM")):
+            x = float(line[30:38]) + 150.0          # same pocket, another frame
+            line = f"{line[:30]}{x:8.3f}{line[38:]}"
+        moved.append(line)
+    pocket.write_text("".join(moved))
+
+    plan, _lib, _engine = dock.plan_for(layout, _args())
+    rows = []
+    prepared = dock.prepare_receptors(layout, plan, rows)
+    assert "2mjw_A_P_1" not in {t.label for t in plan.usable if t.label in prepared}
+    assert any("docking box holds" in reason for _label, reason in rows)
+    assert any("not the same structure" in reason for _label, reason in rows)
