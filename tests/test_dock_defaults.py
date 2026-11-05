@@ -2,6 +2,8 @@
 (tests/test_stage_dock.py is importorskip'd on openbabel and is silent without it).
 """
 
+import re
+
 from polyphar.stages import dock
 
 
@@ -187,3 +189,25 @@ def test_export_counts_every_receptor_it_will_prepare_not_just_the_bundles(monke
     assert "_whole_targets" not in src, "the cap does not limit receptor preparation"
     # and prepare_receptors really does walk the whole usable set
     assert "plan.usable" in inspect.getsource(dock.prepare_receptors)
+
+
+# --- the wrapper's stage range must match the CLI's ------------------------------------
+
+def test_the_wrapper_stops_after_dock_like_the_cli_does():
+    """`polyphar run --to` defaults to dock, because stats needs a clinical-guideline
+    positive set only a human can write. The round-trip split in bin/polyphar-docker used
+    the LAST stage as its default instead, so on a GPU-less host `polyphar-docker run`
+    quietly went further than `polyphar run`: it ran control and stats unasked and died in
+    stats' preflight for want of inputs/positive_sets.csv. Found by the subtype runs."""
+    from pathlib import Path
+
+    from polyphar.stages.run import DEFAULT_TO_STAGE
+
+    wrapper = Path(__file__).resolve().parent.parent / "bin" / "polyphar-docker"
+    text = wrapper.read_text()
+    index = int(re.search(r"^default_to_index=(\d+)", text, re.M).group(1))
+    names = dict(re.findall(r"(\d+)\) echo (\w+)", text))
+    assert names[str(index)] == DEFAULT_TO_STAGE, (
+        f"the wrapper defaults --to {names[str(index)]}, the CLI defaults to "
+        f"{DEFAULT_TO_STAGE}")
+    assert "to=\"$last_index\"" not in text, "the old last-stage default is back"

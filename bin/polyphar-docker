@@ -106,6 +106,12 @@ stage_name() {   # the reverse of stage_index, for rebuilding a --from/--to rang
 }
 pockets_index=4
 last_index=11
+# `polyphar run --to` defaults to DOCK (run.py DEFAULT_TO_STAGE): stats needs a
+# clinical-guideline positive set that only a human can write. The round-trip split below
+# has to use the same default, or `polyphar-docker run` on a GPU-less host would quietly
+# go further than `polyphar run` does -- it ran control and stats unasked, and died in
+# stats' preflight for want of inputs/positive_sets.csv.
+default_to_index=9
 set_stage() {   # $1 = from|to, $2 = stage name
     _i="$(stage_index "$2")"
     [ -n "$_i" ] || return 0
@@ -177,7 +183,7 @@ case "${1:-}" in
         ;;
     benchmark) want_bench=1 ;;
     run)
-        from=0 to="$last_index" prev=""
+        from=0 to="$default_to_index" prev=""
         for a in "${@:2}"; do
             case "$prev" in
                 --from) set_stage from "$a" ;;
@@ -251,10 +257,10 @@ if [ "$want_roundtrip" = 1 ]; then
     POLYPHAR_RUN_DIR="$run_dir" "$colab" "${roundtrip_args[@]}" \
         ${library:+--library "$library"} || exit $?
 
-    if [ "${1:-}" = run ] && [ "${to:-$last_index}" -gt "$dock_i" ]; then
+    if [ "${1:-}" = run ] && [ "${to:-$default_to_index}" -gt "$dock_i" ]; then
         echo "== stages after dock (in the container)"
         POLYPHAR_RUN_DIR="$run_dir" "$0" run --from control \
-            --to "$(stage_name "${to:-$last_index}")" "${passthru[@]}"
+            --to "$(stage_name "${to:-$default_to_index}")" "${passthru[@]}"
         exit $?
     fi
     exit 0
