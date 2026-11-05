@@ -349,3 +349,55 @@ def test_the_remote_cell_gives_up_before_the_client_does(world):
     for client, cell in pairs:
         assert 0 < cell < client, (client, cell)
         assert cell >= client * 0.8, f"{cell} is a needlessly small share of {client}"
+
+
+# --- a lost websocket is not a refusal --------------------------------------------------
+
+def test_a_lost_connection_during_setup_is_asked_again(world):
+    """What cost Cluster4 on 2026-11-06.
+
+    `colab exec` exits 0 when the cell RAN and the script raised -- a refusal, and
+    definitive. A non-zero exit means the CLI itself gave up: on POSEIDON the websocket
+    drops with `RuntimeError: Connection was lost` and the client then hangs until the
+    budget kills it, while the kernel carries on installing server-side. setup.py is
+    idempotent -- it reports "unidock already installed" and returns in seconds -- so the
+    honest answer to a lost connection is to ask again, not to throw the session away.
+    """
+    p = world.run(FAKE_COLAB_LOSE_SETUP="1")
+    assert p.returncode == 0, p.stdout + p.stderr
+    assert "asking again" in p.stdout, p.stdout
+    assert held(world.run_dir) == ["A/r0", "A/r1", "B/r0", "B/r1"], p.stdout + p.stderr
+
+
+def test_a_refused_setup_is_never_retried(world):
+    """A refusal is the cell's own answer and asking twice only wastes the budget."""
+    p = world.run(_timeout=120, FAKE_COLAB_SETUP_REFUSES="1")
+    assert p.returncode != 0, p.stdout
+    assert "asking again" not in p.stdout, p.stdout
+    setups = [l for l in colab_calls(world) if "setup.py" in l]
+    assert len(setups) == 1, setups
+
+
+def test_a_lost_connection_during_launch_asks_the_vm_instead_of_relaunching(world):
+    """launch.py must never be re-run blind.
+
+    If the first call DID start the worker -- and on a lost connection it usually did, the
+    client just never saw it say so -- a second call is refused with "a dock-worker is
+    already running" and the wrapper dies with a worker on the VM burning GPU units that
+    nobody is watching. The poll already answers the only question that matters.
+    """
+    p = world.run(FAKE_COLAB_LOSE_LAUNCH="1")
+    assert p.returncode == 0, p.stdout + p.stderr
+    assert "asking the VM whether it started" in p.stdout, p.stdout
+    launches = [l for l in colab_calls(world) if "launch.py" in l]
+    assert len(launches) == 1, f"launch.py must not be re-run: {launches}"
+    assert held(world.run_dir) == ["A/r0", "A/r1", "B/r0", "B/r1"], p.stdout + p.stderr
+
+
+def test_a_refused_launch_is_still_fatal(world):
+    """The probe only covers a lost connection. A refusal exits 0 with a reason, and the
+    worker really is not running -- that must still stop the run."""
+    p = world.run(_timeout=120, FAKE_COLAB_LAUNCH_REFUSES="1")
+    assert p.returncode != 0, p.stdout
+    assert "the worker did not start" in p.stdout + p.stderr, p.stdout + p.stderr
+    assert "asking the VM" not in p.stdout, p.stdout

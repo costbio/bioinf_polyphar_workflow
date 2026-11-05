@@ -130,12 +130,31 @@ micromamba from a VM Colab had quietly taken back.
   the VM's progress live and still checks the proof line afterwards.
 - **The client wait was hardcoded** at 4200 s for setup and 900 s for launch. `colab exec
   --timeout` bounds the *remote cell*, never the client, so those were the only real
-  bounds. `COLAB_SETUP_TIMEOUT` and `COLAB_LAUNCH_TIMEOUT` now set them; production keeps
-  70 and 15 minutes, the subtype tests use 20. The remote cell gets ~90 % of the client's
-  budget so an overrun reports itself instead of being cut off at the socket.
+  bounds. `COLAB_SETUP_TIMEOUT` and `COLAB_LAUNCH_TIMEOUT` now set them, defaulting to 30
+  and 15 minutes; a fresh VM installs in about nine. The remote cell gets ~90 % of the
+  client's budget so an overrun reports itself instead of being cut off at the socket.
 - **A timed-out cell exited silently.** Under `set -e` with `pipefail`, `timeout`'s 124
   ended the script before the `case` that prints the diagnostic. The wait is bounded *and*
   explained now: the message names the budget and the variable that sets it.
+
+#### A lost websocket is not a refusal
+
+Cluster4 failed in the seven-subtype run with `RuntimeError: Connection was lost` and then
+twenty minutes of nothing. The `colab` CLI prints that traceback and **does not exit** —
+the client hangs while the kernel carries on working server-side (first seen 2026-11-03).
+The budget is the only thing that ends it.
+
+Two failures wear the same face at `setup` and `launch`, and they now get different
+answers:
+
+- `colab exec` **exits 0** when the cell ran and the script raised. That is a *refusal* —
+  the cell's own answer, definitive, never retried.
+- A **non-zero** exit means the CLI gave up. `setup.py` is idempotent (it reports
+  `unidock already installed` and returns in seconds), so the wrapper simply asks again.
+- `launch.py` is **never** re-run. If the first call did start the worker — and on a lost
+  connection it usually did — a second is refused with *a dock-worker is already running*
+  and the run dies with a worker on the VM burning GPU units nobody is watching. The
+  wrapper polls instead: `STATE=RUNNING` means the launch landed.
 
 ### 2026-11-05 (later): image 1.3, unmodelled pockets and the PocketMatch hang
 

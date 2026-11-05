@@ -31,10 +31,12 @@ repo="${POLYPHAR_REPO:-$(cd "$here/.." && pwd)}"
 run_dir="$(realpath "${POLYPHAR_RUN_DIR:-$PWD}")"
 home_dir="$(realpath "${POLYPHAR_HOME:-$HOME/.polyphar}")"
 poll_s="${COLAB_POLL_SECONDS:-120}"
-# How long the client waits for the two one-shot cells. Generous on purpose for a
-# production run -- a VM you have already waited ten minutes for is worth more than a
-# fast failure -- but a test wants the opposite, so both are knobs.
-setup_s="${COLAB_SETUP_TIMEOUT:-4200}"
+# How long the client waits for the two one-shot cells. A fresh VM installs micromamba,
+# Uni-Dock and the pinned polyphar in about nine minutes (measured), so 30 is generous for
+# any plausibly slow install while bounding the OTHER thing this budget pays for: a lost
+# websocket, where the client hangs and the budget is the only way out. At the old 4200 a
+# dropped connection cost seventy minutes before anything could be retried.
+setup_s="${COLAB_SETUP_TIMEOUT:-1800}"
 launch_s="${COLAB_LAUNCH_TIMEOUT:-900}"
 
 # 200 units is about 20 hours at ~6 GPU-minutes a unit: a session long enough to be worth
@@ -285,8 +287,26 @@ if [ -z "$attach" ] && [ -z "$merge_only" ]; then
     say "installing the engine (pinned to $commit)"
     # same reason as the launch below: the exit status says the cell ran, not that it
     # worked, so setup.py's own last line is the proof
-    stream "$setup_s" colab exec -f "$repo/bin/colab/setup.py" \
-        --env "POLYPHAR_COMMIT=$commit" --timeout "$(cell_timeout "$setup_s")" -s "$session"
+    install_engine() {
+        stream "$setup_s" colab exec -f "$repo/bin/colab/setup.py" \
+            --env "POLYPHAR_COMMIT=$commit" --timeout "$(cell_timeout "$setup_s")" \
+            -s "$session"
+    }
+    install_engine
+    # Two different failures wear the same face here. `colab exec` exits 0 when the cell
+    # RAN and the script raised -- a refusal, and definitive. A non-zero exit means the
+    # CLI itself gave up: on POSEIDON the websocket drops ("RuntimeError: Connection was
+    # lost") and the client then hangs until the budget kills it, while the kernel carries
+    # on installing server-side. Seen 2026-11-03, and it cost Cluster4 on 2026-11-06.
+    # setup.py is idempotent by construction -- it reports "unidock already installed" and
+    # returns in seconds -- so the honest response to a lost connection is to ask again.
+    case "$captured" in
+        *"setup: ready"*) ;;
+        *) if [ "$captured_rc" != 0 ]; then
+               say "lost the connection to the VM; asking again (setup is idempotent)"
+               install_engine
+           fi ;;
+    esac
     case "$captured" in
         *"setup: ready"*) ;;
         *) die "the engine did not install on the VM$(gave_up "$setup_s" SETUP) (see
@@ -303,6 +323,19 @@ if [ -z "$attach" ] && [ -z "$merge_only" ]; then
     stream "$launch_s" colab exec -f "$repo/bin/colab/launch.py" \
         --timeout "$(cell_timeout "$launch_s")" -s "$session" \
         ${ALLOW_SILENT:+--env "ALLOW_SILENT=$ALLOW_SILENT"}
+    case "$captured" in
+        *"worker pid="*RUNNING*) ;;
+        *) # Never re-run launch.py on a lost connection: if the first call DID start the
+           # worker, the second is refused ("a dock-worker is already running") and the
+           # run dies with a worker burning GPU units nobody is watching. Ask instead.
+           if [ "$captured_rc" != 0 ]; then
+               say "lost the connection during launch; asking the VM whether it started"
+               probe="$(timeout --foreground 300 colab exec -f "$repo/bin/colab/poll.py" \
+                   --timeout 120 -s "$session" 2>&1 | tr -d '\000' || true)"
+               printf '%s\n' "$probe" | sed 's/^/           /'
+               case "$probe" in *"STATE=RUNNING"*) captured="worker pid= RUNNING" ;; esac
+           fi ;;
+    esac
     case "$captured" in
         *"worker pid="*RUNNING*) ;;
         *) die "the worker did not start$(gave_up "$launch_s" LAUNCH) (see the message
