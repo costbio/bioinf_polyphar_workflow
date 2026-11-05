@@ -113,7 +113,7 @@ if [ "${#unmerged[@]}" = 1 ]; then
     brel="${b#$run_dir/}"
     remote=""
     if colab sessions 2>/dev/null | grep -q "^\[$session\]"; then
-        remote="$(timeout 180 colab exec -f "$repo/bin/colab/bundle_id.py" --timeout 60 -s "$session" 2>&1 \
+        remote="$(timeout --foreground 180 colab exec -f "$repo/bin/colab/bundle_id.py" --timeout 60 -s "$session" 2>&1 \
                   | tr -d '\000' | sed -n 's/^BUNDLE_ID=//p' | head -1)"
     fi
     local_id="$(sha256sum "$b/run_key.json" 2>/dev/null | cut -d' ' -f1)"
@@ -185,7 +185,9 @@ say "polling every ${poll_s}s (the poll is also the keep-alive)"
 # for ^STATE= made a dropped websocket look exactly like a quiet worker: on 2026-11-04 a
 # healthy run showed nothing in the terminal for 14 minutes while two polls silently
 # failed. Silence must mean one thing, so it is now reserved for "the wrapper is dead".
-# `timeout`: colab exec's own --timeout bounds the remote cell, not the client. On
+# `timeout --foreground`: without it timeout moves colab into its own process group and
+# Ctrl+C in the terminal never reaches it (nor stops the wrapper). colab exec's own
+# --timeout bounds the remote cell, not the client. On
 # 2026-11-04 a poll client hung on a lost websocket for 8 hours with --timeout 120, and
 # the loop -- and the keep-alive -- stopped with it while the worker docked on unwatched.
 fails=0
@@ -193,7 +195,7 @@ while true; do
     sleep "$poll_s"
     # tr -d '\000': the exec output can carry a null byte, and bash then warns
     # "command substitution: ignored null byte in input" on every single poll
-    if out="$(timeout 300 colab exec -f "$repo/bin/colab/poll.py" --timeout 120 -s "$session" 2>&1 | tr -d '\000')"; then
+    if out="$(timeout --foreground 300 colab exec -f "$repo/bin/colab/poll.py" --timeout 120 -s "$session" 2>&1 | tr -d '\000')"; then
         line="$(printf '%s\n' "$out" | grep -m1 -E '^STATE=' || true)"
         if [ -n "$line" ]; then
             fails=0
@@ -225,9 +227,9 @@ done
 # --- 4. bring it home -----------------------------------------------------------------
 push "dock: worker finished" "Packing and bringing results home."
 say "packing results"
-timeout 900 colab exec -f "$repo/bin/colab/pack.py" --timeout 600 -s "$session"
+timeout --foreground 900 colab exec -f "$repo/bin/colab/pack.py" --timeout 600 -s "$session"
 res="$(mktemp -t polyphar-results-XXXXXX.tgz)"
-timeout 3600 colab download /content/results.tgz "$res" -s "$session"
+timeout --foreground 3600 colab download /content/results.tgz "$res" -s "$session"
 tar xzf "$res" -C "$bundle"
 
 say "dock-merge"
