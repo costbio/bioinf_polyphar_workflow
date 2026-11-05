@@ -77,6 +77,10 @@ def _run(run_dir, home, accessions, extra=()):
     env = {k: v for k, v in os.environ.items() if not k.startswith("PUSHOVER_")}
     env.update(POLYPHAR_RUN_DIR=str(run_dir), POLYPHAR_HOME=str(home),
                POLYPHAR_COLAB_KEEP="1",      # one session for all seven
+               # POLYPHAR_HOME is a fresh temp dir, so it holds no pushover.env and
+               # launch.py would refuse to start a worker that cannot notify. A test does
+               # not want notifications; a real run does, which is why the refusal exists.
+               ALLOW_SILENT="1",
                POLYPHAR_VERSION=os.environ.get("POLYPHAR_VERSION", "dev"))
     # no --engine: the default is Uni-Dock, and on a GPU-less host that is exactly the
     # production path -- polyphar-docker hands dock to the Colab round trip.

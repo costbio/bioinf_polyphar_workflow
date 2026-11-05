@@ -19,6 +19,8 @@ Knobs (all optional):
   FAKE_COLAB_HANG_AFTER     the worker stops finishing units after this many polls
   FAKE_COLAB_FAIL_DOWNLOAD  comma-separated download attempt numbers that fail
   FAKE_COLAB_FAIL_EXEC      comma-separated fetch.py attempt numbers that fail
+  FAKE_COLAB_LAUNCH_REFUSES launch.py refuses but the CLI still exits 0
+  FAKE_COLAB_SETUP_REFUSES  setup.py refuses but the CLI still exits 0
   FAKE_COLAB_LOG            append one line per invocation
 """
 import hashlib
@@ -165,10 +167,21 @@ def main(argv):
                 env[k] = v
 
         if name == "setup.py":
+            if os.environ.get("FAKE_COLAB_SETUP_REFUSES"):
+                # like the real CLI: the cell ran, so the exit status is 0 even though
+                # the script raised
+                print("SystemExit: engine install failed", file=sys.stderr)
+                return 0
             print("fake-colab: engine installed")
+            print("setup: ready")
             return 0
 
         if name == "launch.py":
+            if os.environ.get("FAKE_COLAB_LAUNCH_REFUSES"):
+                print("refusing to start a silent worker: /content/pushover.env is missing",
+                      file=sys.stderr)
+                return 0        # exit 0 anyway -- this is what the real CLI does
+
             # the real launch.py untars the uploaded bundle before starting the worker
             bundle = VM / "bundle"
             bundle.mkdir(parents=True, exist_ok=True)

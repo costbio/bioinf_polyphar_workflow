@@ -240,14 +240,33 @@ if [ -z "$attach" ] && [ -z "$merge_only" ]; then
 
     # --- 3. run ---------------------------------------------------------------------------
     say "installing the engine (pinned to $commit)"
-    timeout --foreground 4200 colab exec -f "$repo/bin/colab/setup.py" --env "POLYPHAR_COMMIT=$commit" --timeout 3600 -s "$session"
+    # same reason as the launch below: the exit status says the cell ran, not that it
+    # worked, so setup.py's own last line is the proof
+    setup_out="$(timeout --foreground 4200 colab exec -f "$repo/bin/colab/setup.py" \
+        --env "POLYPHAR_COMMIT=$commit" --timeout 3600 -s "$session" 2>&1 | tr -d '\000')" || true
+    printf '%s\n' "$setup_out"
+    case "$setup_out" in
+        *"setup: ready"*) ;;
+        *) die "the engine did not install on the VM (see above). The bundle is at $rel
+     and nothing was lost; fix the cause and re-run." ;;
+    esac
 
     push "dock: worker starting" "$n_units units on a $gpu. Progress every ${poll_s}s."
     say "launching the detached worker"
-    timeout --foreground 900 colab exec -f "$repo/bin/colab/launch.py" --timeout 600 -s "$session" \
-        ${ALLOW_SILENT:+--env "ALLOW_SILENT=$ALLOW_SILENT"} \
-        || die "the worker did not start (see the message above). Nothing was lost: the
-     bundle is at $rel and the units are still outstanding."
+    # `colab exec` exits 0 even when the script it ran raised: the cell executed, which is
+    # all the CLI reports. Trusting it meant a refused launch (no Pushover credentials, a
+    # worker already running, a bundle missing a file) looked like success -- the wrapper
+    # then polled a worker that was never started, saw NO-PIDFILE at once, merged zero
+    # units and said "done". So the proof of launch is launch.py's own last line.
+    launch_out="$(timeout --foreground 900 colab exec -f "$repo/bin/colab/launch.py" \
+        --timeout 600 -s "$session" ${ALLOW_SILENT:+--env "ALLOW_SILENT=$ALLOW_SILENT"} \
+        2>&1 | tr -d '\000')" || true
+    printf '%s\n' "$launch_out"
+    case "$launch_out" in
+        *"worker pid="*RUNNING*) ;;
+        *) die "the worker did not start (see the message above). Nothing was lost: the
+     bundle is at $rel and the units are still outstanding." ;;
+    esac
 fi
 
 if [ -n "$merge_only" ]; then

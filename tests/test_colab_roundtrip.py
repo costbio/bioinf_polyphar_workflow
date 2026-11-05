@@ -270,3 +270,21 @@ def test_the_library_reaches_both_export_and_merge(world):
     merges = [c for c in calls if c.startswith("dock-merge")]
     assert exports and all("--library inputs/custom.sdf" in c for c in exports), calls
     assert merges and all("--library inputs/custom.sdf" in c for c in merges), calls
+
+
+def test_a_refused_launch_is_not_mistaken_for_a_started_worker(world):
+    """`colab exec` exits 0 even when the script it ran raised -- the cell executed, which
+    is all the CLI reports. Trusting that, the wrapper polled a worker that was never
+    started, saw NO-PIDFILE at once, merged zero units and said "done". Found on the real
+    Colab path: seven subtype runs reported success having docked nothing."""
+    p = world.run(FAKE_COLAB_LAUNCH_REFUSES="1")
+    assert p.returncode != 0, p.stdout + p.stderr
+    assert "the worker did not start" in p.stdout + p.stderr
+    assert not (world.run_dir / "merged.json").exists(), "it merged anyway"
+
+
+def test_a_failed_engine_install_is_not_mistaken_for_a_ready_vm(world):
+    """Same trap one step earlier: without the engine the worker cannot dock at all."""
+    p = world.run(FAKE_COLAB_SETUP_REFUSES="1")
+    assert p.returncode != 0, p.stdout + p.stderr
+    assert "did not install" in p.stdout + p.stderr

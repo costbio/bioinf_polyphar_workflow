@@ -66,3 +66,7 @@ sh(f"{sys.executable} -m polyphar.cli --help > /dev/null 2>&1 || polyphar --help
    timeout=180, check=False)
 
 print(f"\nsetup ok in {time.time()-t0:.0f}s", flush=True)
+
+# The wrapper checks for this exact line: `colab exec` exits 0 even when this script
+# raised, so the only honest proof that setup finished is setup saying so.
+print("setup: ready", flush=True)
