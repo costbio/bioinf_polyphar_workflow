@@ -1,241 +1,89 @@
 # Runbook: the v2 reruns, one stage at a time
 
-For running the seven subtypes on POSEIDON by hand, one stage at a time, checking the output
-of each before starting the next. `README.md` stays the reference for what the stages do and
-why; this file is only the order, the exact commands and what to look at afterwards.
+Running the seven subtypes on POSEIDON, one stage at a time. `README.md` is the reference
+for what the stages do and why; this file is the order, the commands, and what to check.
 
-Decided 2026-11-02: **DoGSiteScorer 2** (`drugScore >= 0.5`, the 2023 rule) is the primary
-pocket tool, so no `--pocket-tool` argument is needed anywhere below. DoGSite3 with
-`--min-volume 120` is the sensitivity analysis and needs a **separate run folder**.
+**DoGSiteScorer 2** (`drugScore >= 0.5`, the 2023 rule) is the pocket tool, so no
+`--pocket-tool` argument is needed below. DoGSite3 with `--min-volume 120` is the
+sensitivity analysis and needs its own run folder.
 
 ## 0. Once per shell
 
-Run everything inside `tmux`: the wrapper starts and stops the host DoGSiteScorer worker, and
-losing the ssh connection mid-stage would kill it.
+Work inside `tmux`: the wrapper runs the host DoGSiteScorer worker, and losing the ssh
+connection mid-stage would kill it.
 
     tmux new -s polyphar          # or: tmux attach -t polyphar
 
     export REPO=/media/ilayda/Elements/adep_csb/repos/bioinf_polyphar_workflow
     export DATA=/media/ilayda/Elements/adep_csb/disease_subtypes_v2
-    export POLYPHAR_VERSION=1.1
+    export POLYPHAR_VERSION=1.5
     export DOGSITE_BIN=/media/ilayda/Elements/adep_csb/dogsitescorer2/dogsitescorer-2.0.0/dogsite
     export NPROCS=64
     export POLYPHAR=$REPO/bin/polyphar-docker
     export PATH=$HOME/.local/bin:$PATH      # the colab CLI lives here
 
-Check the tools answer before starting a subtype:
-
     "$DOGSITE_BIN" --version >/dev/null && echo "dogsite ok"
-    docker images polyphar        # polyphar:1.1 must exist (1.0 predates rdkit)
-    colab usage                   # Colab auth + the compute-unit balance
+    docker images polyphar
+    colab usage                   # Colab auth + compute-unit balance
 
-If `colab usage` opens an authorization URL, the token has expired: visit it, approve, and
+`colab usage` opening an authorization URL means the token expired: visit it, approve,
 paste the code back. It expires often enough to catch you mid-week.
 
-**Every command below is run from inside the subtype's run folder** — the wrapper takes the
+**Every command below runs from inside the subtype's run folder** — the wrapper takes the
 run folder from the current directory.
 
-## 0b. After pulling a new polyphar
+### Images
 
-**Stage fingerprints do not include the code version** — `run` only *warns* on a mismatch, it
-does not redo anything. So after a pull, any stage dir written by a module that changed is
-silently kept and is wrong. Compare the recorded commit against the stages that moved:
+| Tag | Commit | Notes |
+|---|---|---|
+| `1.1` | `76dd25b` | the HCC net1 reference results below were produced here |
+| `1.2` | `a41a3f0` | receptor/pocket pairing, undockable elements, deleted accessions |
+| `1.3` | `a77dc99` | unmodelled pockets, the PocketMatch hang |
+| `1.4` | — | **do not use:** rebuilt repeatedly with different content, so the tag identifies nothing |
+| `1.5` | `7897ece` | current; the Colab round trip hardened |
+
+Build with a **new** version number, plus the commit as its own tag so content stays
+identifiable even if a version tag is ever moved:
+
+    sha=$(git rev-parse --short HEAD)
+    docker build --build-arg POLYPHAR_GIT_COMMIT=$(git rev-parse HEAD) -f docker/Dockerfile \
+        -t polyphar:<next> -t polyphar:latest -t polyphar:dev -t "polyphar:$sha" .
+
+    docker run --rm --entrypoint sh "polyphar:$POLYPHAR_VERSION" -c 'echo $POLYPHAR_GIT_COMMIT'
+    git -C "$REPO" rev-parse HEAD        # these two must agree
+
+## 0b. After pulling
+
+**Rebuild the image after any pull touching `polyphar/`** — the image carries the code, so
+a stale one runs old stages under a new commit's name. The host wrappers
+(`bin/polyphar-docker`, `bin/polyphar-colab`) are read from disk instead, so never pull
+while a round trip is in flight or the run mixes two versions of them.
+
+**Stage fingerprints do not include the code version** — `run` only *warns* on a mismatch.
+Any stage dir written by a module that changed is silently kept and is wrong:
 
     for d in 0*/ 0*/annotation; do
       [ -f "$d/manifest.json" ] && python3 -c "import json,sys;m=json.load(open('$d/manifest.json'));print('$d', (m.get('git_commit') or '?')[:7])"
     done
 
-Then **move** (do not delete) the dirs of changed stages aside, so a mistake is recoverable:
+**Move** (do not delete) the dirs of changed stages aside:
 
     mkdir -p superseded_$(date +%Y%m%dT%H%M%S)
     mv 05_similarity 06_targets superseded_*/
 
-`ids`, `uniprot`, `structures`, `fix` and **`pockets`** were unchanged by the 2026-11-04
-update, so their output stays valid — which matters, because `pockets` is the licence-gated
-one. `annotate`, `select`, `similarity` changed, and `ligands` / `dock` / `control` / `stats`
-are new.
-
-**The image must be rebuilt after a pull that touches `environment.yml`.** The 2026-11-04
-update added `rdkit`, and `ligands` now fails the whole stage when rdkit is missing rather
-than failing 2,083 records one at a time:
-
-    docker build --build-arg POLYPHAR_GIT_COMMIT=$(git rev-parse HEAD) \
-        -f docker/Dockerfile -t polyphar:1.2 -t polyphar:dev .
-
-### 2026-11-06 (later): five ways the wrapper behaved differently from the tool
-
-Running the seven subtypes through the REAL Colab/Uni-Dock path -- rather than a local
-engine -- turned up five defects in `bin/polyphar-docker` and `bin/polyphar-colab`. All
-five share one shape: **the host wrapper quietly doing something other than what
-`polyphar` itself does**, and none was reachable by any test that existed before, because
-those two scripts had no tests at all.
-
-| what | why it mattered |
-|---|---|
-| `--library` was dropped at the round trip | `dock-export`/`dock-merge` fell back to the DEFAULT library. On a run folder that has one, the GPU would dock a **different library than the run planned**, with the wrong sha in every unit key. |
-| `colab exec` exits 0 even when the remote script raised | A refused `launch.py` looked like a started worker: poll, `NO-PIDFILE`, merge **0 units**, report "done". On a real subtype that is 200 units you believe are running. |
-| `import_bundle` copied non-atomically | An interrupted merge left a partial SDF that the next merge archived as a discarded draw. No draw lost, but the discard log fills with debris. |
-| the drop-dedup was a substring scan | O(log size) per unit, and loose enough that two units could satisfy it between them without either having been logged. |
-| the wrapper's `--to` defaulted to the LAST stage | `polyphar run` stops after `dock`; the wrapper ran `control` and `stats` **unasked** and died in stats' preflight. |
-
-Both execs now require the script's own last line as proof -- `worker pid=... RUNNING`,
-and a new `setup: ready` -- rather than the exit status. `tests/test_dock_defaults.py`
-fails if the wrapper's default stage ever diverges from `run.DEFAULT_TO_STAGE` again.
-
-**Running the seven subtypes.** They dock through real Colab Uni-Dock, which is the point:
-
-    DOGSITE_BIN=$PWD/tests/fixtures/fake_dogsite2 POLYPHAR_VERSION=1.4 \
-        pytest tests/test_subtypes_e2e.py
-
-Three traps worth knowing, each of which cost a run:
-- **`fake_dogsite2`, not `fake_dogsite`.** Same file; under its plain name it answers
-  `--help` as DoGSite3, which conflicts with the default `--pocket-tool dogsite2`.
-- **The commit must be pushed.** The VM pip-installs polyphar from it.
-- **`ALLOW_SILENT=1`** unless `$POLYPHAR_HOME/pushover.env` exists -- `launch.py` refuses
-  to start a worker that cannot notify you, which is right for a real run.
-
-`POLYPHAR_COLAB_KEEP=1` holds one session across several run folders, so the engine
-install is paid once instead of once per bundle. Useful for a night of subtypes too.
-
-### 2026-11-06: results come home continuously, not once at the end
-
-The Colab round trip used to pack and download **only after the worker finished**. A VM
-reclaimed mid-session therefore cost every unit drawn since it started — up to 200 units
-and ~20 GPU-hours on net1. Capping a session below 24 h was never a real defence.
-
-`bin/polyphar-colab` now pulls on **every poll** (~2 min). `bin/colab/fetch.py` sends only
-the finished units the host does not already hold, so a lost VM costs at most one poll
-interval. `dock-merge` still runs once at the end: a pulled unit is already safe on disk,
-and merging is far more expensive than downloading.
-
-- Nothing is marked on the VM. The host sends what it has (`/content/have.txt`) and the
-  selection is recomputed each time, so a dropped upload, exec, download or extraction is
-  retried on the next poll and loses nothing.
-- When the VM has nothing the host lacks, the poll costs no transfer at all.
-- A unit still being written has no `.done` marker and does not travel.
-- Interrupting the wrapper is now safe at any moment: re-running it re-attaches if the
-  session is alive, and **merges what was already pulled** if the session is gone.
-- `COLAB_FETCH_EVERY=N` fetches every Nth poll instead of every one.
-
-### 2026-11-06: the one-shot cells were silent and unbounded
-
-Found while the seven subtype runs were going through: net1 sat in `setup.py` for 37
-minutes with nothing on the terminal at all, and there was no way to tell a slow
-micromamba from a VM Colab had quietly taken back.
-
-- **The output existed and was thrown away.** `colab exec` streams the cell's stdout as it
-  arrives (`colab_cli.commands.execution.display_output` flushes every chunk), and
-  `setup.py` prints each install command *before* running it. `setup_out="$(colab exec …)"`
-  held all of it until the cell ended. Both one-shot cells now `tee`, so the terminal shows
-  the VM's progress live and still checks the proof line afterwards.
-- **The client wait was hardcoded** at 4200 s for setup and 900 s for launch. `colab exec
-  --timeout` bounds the *remote cell*, never the client, so those were the only real
-  bounds. `COLAB_SETUP_TIMEOUT` and `COLAB_LAUNCH_TIMEOUT` now set them, defaulting to 30
-  and 15 minutes; a fresh VM installs in about nine. The remote cell gets ~90 % of the
-  client's budget so an overrun reports itself instead of being cut off at the socket.
-- **A timed-out cell exited silently.** Under `set -e` with `pipefail`, `timeout`'s 124
-  ended the script before the `case` that prints the diagnostic. The wait is bounded *and*
-  explained now: the message names the budget and the variable that sets it.
-
-#### A lost websocket is not a refusal
-
-Cluster4 failed in the seven-subtype run with `RuntimeError: Connection was lost` and then
-twenty minutes of nothing. The `colab` CLI prints that traceback and **does not exit** —
-the client hangs while the kernel carries on working server-side (first seen 2026-11-03).
-The budget is the only thing that ends it.
-
-Two failures wear the same face at `setup` and `launch`, and they now get different
-answers:
-
-- `colab exec` **exits 0** when the cell ran and the script raised. That is a *refusal* —
-  the cell's own answer, definitive, never retried.
-- A **non-zero** exit means the CLI gave up. `setup.py` is idempotent (it reports
-  `unidock already installed` and returns in seconds), so the wrapper simply asks again.
-- `launch.py` is **never** re-run. If the first call did start the worker — and on a lost
-  connection it usually did — a second is refused with *a dock-worker is already running*
-  and the run dies with a worker on the VM burning GPU units nobody is watching. The
-  wrapper polls instead: `STATE=RUNNING` means the launch landed.
-
-#### The engine string the keys are planned under
-
-`bin/polyphar-colab` passes `--engine-version` to `dock-export` as a fixed string. It has
-to be fixed there: the host has no GPU to ask, and a unit key cannot be assigned after the
-work it identifies. It said `Uni-Dock 1.2.0` while the VM's binary calls itself
-`Uni-Dock v1.2.0`, so `dock-merge`'s *drawn by X, planned under Y* warning — the only
-thing standing between a silently changed engine and results keyed to a version that never
-ran — fired on **every** merge and meant nothing.
-
-Corrected to `Uni-Dock v1.2.0` on 2026-11-06, when the `disease_subtypes_v2` run folders
-held **0 recorded draws** (net1's docking had already been set aside as
-`superseded_mispaired_*`), so it cost nothing. **Changing it again supersedes every draw
-made under the old string**, so it is `POLYPHAR_ENGINE_VERSION` now rather than a literal:
-change the VM's engine and the override, together, between runs and never during one.
-
-The gap that remains, by construction: a different engine on the VM is *recorded* (per-unit
-`prov.json` carries what actually ran) and *warned about*, but does not supersede the
-units, because the key was fixed before the work was sent.
-
-### 2026-11-05 (later): image 1.3, unmodelled pockets and the PocketMatch hang
-
-`export POLYPHAR_VERSION=1.3`. Two further defects, both found when AD Cluster1's
-`similarity` appeared to hang:
-
-- **PocketMatch does not fail on an input it cannot handle, it SPINS** — 100 % CPU, ~1 MB
-  RSS, no output, no error. One pocket of `UNK` residues stalled 11 of Cluster1's 66 jobs
-  for 2.5 h. A single UNK residue is enough. `similarity` now drops such a pocket before
-  PocketMatch sees it, and `--pm-timeout` (default 3600 s) bounds every job.
-- **Pockets lined by unmodelled backbone reached the panel.** A traced main chain with no
-  side chains (`UNK`, or a poly-ALA stub) has no chemistry: docking it scores a backbone
-  groove. `pockets` now drops a pocket whose lining is mostly unmodelled, so it reaches
-  neither `select`, nor `similarity`, nor `dock`, and `structures` rejects a chain that is
-  unmodelled throughout (> 95 %).
-
-Measured over the 6,124 eligible pockets of Cluster1 and net1/net2/net3: 6,118 have no
-unmodelled residue and 6 are 100 % unmodelled (all 6BQ1 chain A). Only Cluster1 is
-affected — **net1, net2 and net3 need no pocket re-run.** Chains are a continuum, no chain
-is entirely unmodelled, and the heavily traced ones still give fully modelled pockets, so
-the chain guard is deliberately set where it discards nothing on this data.
-
-To re-apply the pocket filter to a run folder whose DoGSiteScorer output already exists,
-delete the stage manifest and re-run `pockets`: the queue re-uses every existing result,
-so nothing is sent to DoGSiteScorer again.
-
-    rm 04_pockets/manifest.json
-    $POLYPHAR pockets
-
-### 2026-11-05: image 1.2, and why `select` and `ligands` must be re-run
-
-Three defects were found while investigating why no net1 target could complete. All three
-are fixed in **image 1.2**, so `export POLYPHAR_VERSION=1.2`.
-
-- `select` gave every target row of a protein the receptor of its FIRST row, while each
-  row's box came from its own pocket. 83 of net1's 479 rows paired a pocket with a
-  receptor from another structure, and 9 of the 37 targets docked had **no receptor atom
-  inside the box at all** — every ligand scored in vacuum. Receptor and Chain are now
-  resolved per row, and both `select` and `dock` refuse a box the receptor does not
-  occupy.
-- `ligands` now excludes records carrying elements the scoring function cannot type. The
-  six boron drugs were silently given no poses by Uni-Dock, which alone made every target
-  permanently incomplete. The library is 1,954 records, not 1,960.
-- `uniprot` no longer crashes on a deleted accession (14 of AD Cluster1's 131).
-
-**Any 06_targets/ or 07_docking/ built before 2026-11-05 is invalid.** Resume treats an
-existing stage as done and the fingerprints do not carry the code version, so the stage
-directory must be moved aside before re-running:
-
-    mkdir -p superseded_mispaired_$(date +%Y%m%dT%H%M%S)
-    mv 06_targets 07_docking superseded_mispaired_*/
-
-Done already for HCC net1, net2 and net3: `select` and `ligands` were re-run under 1.2 and
-every row now pairs a pocket with its own receptor. net1's 109 docked units were moved
-aside with them; they were drawn against the old library and some against empty boxes.
-
 ## 1. The run folders
 
 Inputs are in place (workbook + ligand library per folder) and all seven have `00_ids/`.
-As of 2026-11-05: HCC net1/net2/net3 are complete through `select` and `ligands` under
-image 1.2; AD Cluster1 is through `pockets` and needs `select` and `ligands` re-run under
-1.2; AD Cluster2/3/4 have run `ids` only.
+
+| Subtype | Through | Next |
+|---|---|---|
+| HCC net1, net2, net3 | `06_targets` | `dock` |
+| AD Cluster1 | `06_targets` | `dock` |
+| AD Cluster2, Cluster3, Cluster4 | `00_ids` | `uniprot` onwards |
+
+**No subtype has any recorded docking draw** — 0 `.done` markers across all seven
+`07_docking/`. net1's earlier 109 units were set aside as `superseded_mispaired_*` when
+the receptor/pocket pairing defect was found.
 
 | Subtype | Run folder | `ids` arguments |
 |---|---|---|
@@ -254,7 +102,6 @@ AD uses `--gene-column GeneID` because many `UNIPROTID` cells hold several acces
 makes the `uniprot` stage keep one protein per workbook row, the one whose primary gene name
 equals `GeneID`. Do **not** flatten the workbook into a txt list: that loses the row→gene
 association, and e.g. Cluster1 would keep CALM1/CALM2/CALM3 instead of only CALM3.
-
 ## 2. The stages, in order
 
 Start with **HCC net1**. Then the other subtypes, in whatever order suits you.
@@ -329,9 +176,51 @@ What it refuses to do, and why:
 
 `dock-merge` exiting 3 is normal: this bundle merged and other units are still outstanding.
 
+**Results come home at every poll, not once at the end.** Nothing is marked on the VM: the
+host sends what it already holds and the selection is recomputed each time, so a dropped
+upload, exec, download or extraction is retried on the next poll and loses nothing. A unit
+still being written has no `.done` marker and does not travel. Interrupting the wrapper is
+safe at any moment — re-running re-attaches if the session is alive and merges what was
+already pulled if it is gone. A reclaimed VM costs one poll interval.
+
+A lost websocket is not a refusal: `colab exec` exits 0 when the cell ran and the script
+refused (definitive), non-zero when the CLI itself gave up. The wrapper retries `setup.py`
+(idempotent) and never re-runs `launch.py` — a second launch is refused with *a dock-worker
+is already running* and would leave a worker burning GPU units unwatched; it polls instead.
+
+| Variable | Default | What it does |
+|---|---|---|
+| `POLYPHAR_MAX_UNITS` | 200 | units per session |
+| `POLYPHAR_COLAB_KEEP` | unset | hold the session across run folders, so the engine install is paid once |
+| `COLAB_POLL_SECONDS` | 120 | poll interval; the poll is also the keep-alive |
+| `COLAB_SETUP_TIMEOUT` | 1800 | client wait for the install (a fresh VM takes ~9 min) |
+| `COLAB_LAUNCH_TIMEOUT` | 900 | client wait for the worker to start |
+| `COLAB_FETCH_EVERY` | 1 | fetch every Nth poll |
+| `COLAB_MAX_POLL_FAILS` | 10 | consecutive poll failures before merging what is here |
+| `POLYPHAR_ENGINE_VERSION` | `Uni-Dock v1.2.0` | the engine string the unit keys are planned under |
+
+**`POLYPHAR_ENGINE_VERSION` must match what the VM's binary reports of itself**, or
+`dock-merge` warns *drawn by X, planned under Y* on every merge and the one check guarding
+against a silently changed engine becomes noise. It is pinned on the host because this
+machine has no GPU to ask and a key cannot be assigned after the work it identifies.
+**Changing it supersedes every draw made under the old string** — change it and the VM's
+engine together, between runs, never during one. The gap this leaves, by construction: a
+different engine on the VM is recorded in each unit's `prov.json` and warned about, but
+does not supersede.
+
 Underneath, `bin/polyphar-colab` drives the round trip and
 [`bin/colab/README.md`](../bin/colab/README.md) documents the individual steps — useful for
 another GPU host or for debugging a session, but you should not need either.
+
+**The seven subtypes end-to-end**, through real Colab Uni-Dock, ~60 min:
+
+    DOGSITE_BIN=$PWD/tests/fixtures/fake_dogsite2 POLYPHAR_VERSION=1.5 \
+        pytest tests/test_subtypes_e2e.py
+
+Three traps, each of which has cost a run: use **`fake_dogsite2`**, not `fake_dogsite`
+(same file, but under its plain name it answers `--help` as DoGSite3 and conflicts with
+`--pocket-tool dogsite2`); **the commit must be pushed**, since the VM pip-installs
+polyphar from it; and **`ALLOW_SILENT=1`** unless `$POLYPHAR_HOME/pushover.env` exists.
 
 ### The control's docking goes the same way
 
@@ -357,7 +246,6 @@ readouts.
 | `inputs/positive_sets.csv` | **required.** The clinical-guideline (EASL / NCCN / ESMO) systemic-therapy list, intersected with the dockable e-Drug3D records. Columns `set,ID,name,subgroup,source`; `set` is `hcc` or `ad`; `subgroup` is `targeted` or `cytotoxic`. Building it is guideline reading, not code — `polyphar stats` will not invent it, and `polyphar run` with `stats` in range stops in preflight without it. `tests/fixtures/positive_sets.csv` is a worked example. |
 | `inputs/positive_control.json` | **produced by `polyphar control`** — do not hand-write it. An absent one is **not** a pass: every primary, subgroup and contrast result is then reported `unknown` and marked UNINTERPRETABLE. Gated on redocking RMSD <= 2 A, the library top-decile fraction, and the median self-rank, each with a minimum n and a 98% panel-coverage floor. `pose_in_pocket_fraction` is still written but **gates nothing** — its null (~0.85 on real pockets) sat above the old 0.70 threshold, so it separated nothing. `control` needs `dock` to have run: without it the library-percentile readout is n=0 and the verdict is `unknown`, not a pass. |
 | `--control-panel <other run folder>` | the pre-registered negative control: the same drug sets on the other disease's panel. Without it only one of the two primary tests runs, the contrast arm is not produced, and every output says so. Pointing it at this run folder is refused. |
-
 ## 3. What to check after each stage
 
 Every stage writes `manifest.json` **last** — if it exists, the stage finished. `failed.tsv`
@@ -418,10 +306,9 @@ AD Cluster3 should now contain **P85299 (PRR5)**. The 2023 list had a truncated 
 An AD row whose accessions cannot be resolved to one protein by gene name **stops the stage**
 on purpose. Bring the row here rather than editing the workbook.
 
-### Reference results: HCC net1, 2026-11-04
+### Reference results: HCC net1
 
-The first full v2 subtype, as a sanity check for the other six. Run on POSEIDON at
-`polyphar:1.1` / commit `a0289cd`.
+The first full v2 subtype, as a sanity check for the other six. `polyphar:1.1` / `a0289cd`.
 
 | Stage | Counts | Failed |
 |---|---|---|
@@ -435,71 +322,43 @@ The first full v2 subtype, as a sanity check for the other six. Run on POSEIDON 
 | `similarity` | 2802528 pairs → 2754032 rows | 3 |
 | `ligands` | 2083 records → **1954 kept**, 129 excluded | 0 |
 
-Two things in that table are worth knowing before reading your own:
-
-- **`grid_illegal=1127` at `annotate` is not a docking risk.** Those are pockets whose
-  Uni-Dock grid at 0.375 Å exceeds the engine's limits (128/axis, 531441 total), and
-  Uni-Dock *exits* on a violation. `panel.py` rejects them with reason `grid`, and the
-  funnel confirms it: `tm 2590 → grid 2385`. Verified on this run — of 2371 eligible
-  pockets and 479 final targets, **zero** are grid-illegal, by the stored flag and by
-  recomputing the grid independently from the box dimensions. Only 205 are dropped at the
-  `grid` step because the `volume` filter (11606 → 4682) already removed most oversized
-  clefts first.
-- **The 3 `similarity` failures are PocketMatch heap corruption**, not clean rejections:
-  `cabbage-core` died with SIGABRT (`malloc(): corrupted top size`, and a glibc malloc
-  assertion) on `P03952/6t7p_A` and two `P07288/2zch_P` pockets. Three of 2368 pockets does
-  not move the network, but memory corruption in the comparison binary is worth
-  understanding rather than filing as "3 failed".
+`grid_illegal=1127` at `annotate` is not a docking risk: those pockets' Uni-Dock grids
+exceed the engine's limits and `select` rejects them, so zero of the 479 final targets are
+grid-illegal. The 3 `similarity` failures are PocketMatch heap corruption (SIGABRT in
+`cabbage-core`), not clean rejections — three of 2368 pockets does not move the network,
+but it is memory corruption, not "3 failed".
 
 ## 4. Things that will bite
 
-- **Check `docker ps` before rebuilding the image.** A running container keeps the image it
-  started with, so a rebuild cannot disturb a live run — but a job started after it gets
-  different code than one started before, and nothing in the run folder records which. On
-  2026-11-04 a net2 docking run was found still on a pre-rebuild image, running smina after
-  the default had changed to Uni-Dock.
-- **Run the test suite inside the image before trusting a rebuild.** On the development
-  machine 71 tests skip for missing openbabel and rdkit, and that is where two defects hid
-  on 2026-11-04 (41 failures in `test_stage_dock.py` that the local run called green):
+- **Check `docker ps` before rebuilding.** A running container keeps the image it started
+  with, so a rebuild cannot disturb a live run — but a job started after it gets different
+  code, and nothing in the run folder records which.
+- **Run the suite inside the image before trusting a rebuild.** On a dev machine ~78 tests
+  skip for missing openbabel and rdkit, which is where defects hide:
 
       docker run --rm --user 1000:1000 -v $PWD:/src -w /src --entrypoint python \
-          polyphar:1.1 -m pytest tests -q -m 'not repo_files and not docker'
+          polyphar:1.5 -m pytest tests -q -m 'not repo_files and not docker'
 
   `repo_files` and `docker` are deselected because the image has neither `bin/` nor a
-  docker CLI; mounting the checkout makes those tests run and then fail on missing `pgrep`.
-- **One stage at a time means the ETA is per stage.** `run --dry-run` prints the whole table.
-- **`pockets` needs the DoGSiteScorer licence.** The current evaluation activation on this
-  machine expires **2026-11-16**. Get the pocket stages of all seven subtypes done inside
-  that window; `dock` needs no DoGSiteScorer and has no deadline, so it can wait.
-- **Docking dominates the total time.** With smina, ~57 s per ligand per receptor on this
-  machine and 1,960 prepared ligands, so roughly 32 CPU-hours per receptor before parallelism.
-  With Uni-Dock on an L4 it is 0.176 s/ligand and flat across box volume — about 46 hours for
-  one subtype at one replicate, against ~34 days on CPU. Run `select` for every subtype first
-  to learn how many receptors there actually are.
-- **`--nprocs` does not divide a Uni-Dock ETA.** The GPU runs one unit at a time; the estimate
-  table knows this. If a GPU row ever shrinks with `--nprocs`, that is a bug, not a speedup.
-- **Resume treats existing output as done, and the stage fingerprint does not include the
-  code version.** After any change to polyphar, use a fresh run folder or delete the stage
-  directory — otherwise half the output is from the old code.
-- **One pocket tool per run folder.** A run asking for the other tool fails before queuing.
-  DoGSite3 sensitivity analysis → its own run folder.
-- **Pocket file names are not 2023's.** Both tools now use `<pdb>_<chain>` as the base name
-  (`9r1w_AAA_res_P_1_1.pdb`), because the 2023 DoGSiteScorer 2 scheme exceeded PocketMatch's
-  32-character limit on current PDB entries with multi-character chain IDs. Pocket IDs and
-  drugScores are unchanged.
-- **If a stage reports UniProt "not reachable", check the endpoint before the network.**
-  UniProt's REST service has twice returned HTTP 500 for a request shape that used to work,
-  while the service as a whole stayed up:
-  - 2026-11-02: intermittent 500s from `/stream`, which is why `uniprot` uses
-    `/uniprotkb/search` with pagination.
-  - 2026-11-04: `/uniprotkb/search` began rejecting `accession:A OR accession:B ...` queries
-    of **20 terms or more** (10 still returned 200, 20/40/80 did not), which killed `select`
-    mid-run on net1. `tmfetch` now uses `/uniprotkb/accessions`, the endpoint meant for
-    fetching a known list, which takes them comma-separated and is documented to 100 per call.
-
-  The tell in both cases is that a free-text query (`?query=insulin`) returns 200 while the
-  stage's own request 500s. That means the request shape, not the service — retrying will
-  never succeed. `tests/test_tmfetch.py` pins the accessions endpoint so it cannot regress.
+  docker CLI.
+- **`pockets` needs the DoGSiteScorer licence**, and this machine's evaluation activation
+  expires **2026-11-16**. Get all seven subtypes through `pockets` inside that window;
+  `dock` needs no DoGSiteScorer and has no deadline.
+- **Docking dominates the total time.** Uni-Dock on an L4 is 0.176 s/ligand and flat across
+  box volume — about 46 h per subtype per replicate, against ~34 days on CPU with smina.
+  Run `select` for every subtype first to learn how many receptors there are.
+- **`--nprocs` does not divide a Uni-Dock ETA.** The GPU runs one unit at a time. A GPU row
+  shrinking with `--nprocs` is a bug, not a speedup.
+- **Resume treats existing output as done** and the stage fingerprint does not include the
+  code version. After any change, use a fresh run folder or move the stage dir aside.
+- **One pocket tool per run folder.** A run asking for the other fails before queuing.
+- **Pocket file names are not 2023's**: both tools use `<pdb>_<chain>` as the base name,
+  because the 2023 scheme exceeded PocketMatch's 32-character limit on current PDB entries
+  with multi-character chain IDs. Pocket IDs and drugScores are unchanged.
+- **UniProt "not reachable" usually means the request shape, not the network.** Its REST
+  service has twice returned HTTP 500 for a shape that used to work while the service
+  itself was up; the tell is that `?query=insulin` returns 200 while the stage's request
+  500s. Retrying never succeeds. `tests/test_tmfetch.py` pins the endpoints in use.
 
 ## 5. When something fails
 
