@@ -441,3 +441,31 @@ def test_a_refused_launch_is_still_fatal(world):
     assert p.returncode != 0, p.stdout
     assert "the worker did not start" in p.stdout + p.stderr, p.stdout + p.stderr
     assert "asking the VM" not in p.stdout, p.stdout
+
+
+def test_the_session_name_is_reachable_without_touching_the_argv(world):
+    """Concurrent subtypes need one session each, and the only caller is polyphar-docker,
+    which has no --session to forward.
+
+    `bin/polyphar-docker dock` builds the round-trip argv itself; a user cannot get
+    `--session` into it. Every run folder therefore reused the session called "dock", so a
+    second subtype started while the first was working would re-attach to the first one's
+    VM, find a worker already running and refuse. An environment variable is reachable from
+    anywhere, which is what the run folders need.
+    """
+    p = world.run(COLAB_SESSION="dock2", COLAB_GPU="A100")
+    assert p.returncode == 0, p.stdout + p.stderr
+    calls = colab_calls(world)
+    assert calls, "the fake recorded nothing"
+    assert all("-s dock2" in c or "dock2" in c for c in calls if " -s " in c), calls
+    assert any("--gpu A100" in c for c in calls), calls
+    assert not any(" -s dock " in f" {c} " for c in calls), \
+        f"the default session must not be used when COLAB_SESSION is set: {calls}"
+
+
+def test_an_explicit_session_argument_still_wins_over_the_variable(world):
+    """The flag is the more specific statement of intent."""
+    p = world.run(_argv=("--session", "fromflag"), COLAB_SESSION="fromenv")
+    assert p.returncode == 0, p.stdout + p.stderr
+    calls = [c for c in colab_calls(world) if " -s " in c]
+    assert calls and all("fromflag" in c for c in calls), calls

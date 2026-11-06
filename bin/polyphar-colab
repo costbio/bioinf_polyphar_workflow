@@ -2,6 +2,7 @@
 # Host wrapper: one docking round trip on a Colab Pro+ GPU, end to end.
 #
 #   bin/polyphar-colab [--max-units N] [--session NAME] [--gpu L4] [--control] [--keep]
+#   COLAB_SESSION / COLAB_GPU set the same two, so `polyphar-docker dock` can reach them
 #                      [--library PATH]
 #
 # Does, in order: dock-export here -> create/reuse a Colab session -> upload the bundle
@@ -42,7 +43,12 @@ launch_s="${COLAB_LAUNCH_TIMEOUT:-900}"
 # 200 units is about 20 hours at ~6 GPU-minutes a unit: a session long enough to be worth
 # the setup, short enough that losing it to a dropped VM is not a disaster.
 max_units="${POLYPHAR_MAX_UNITS:-200}"
-session="dock"; gpu="L4"; control=""
+# One Colab session per NAME. Subtypes run concurrently by giving each its own, which is
+# the only lever that shortens the wall clock without changing the science: the compute-unit
+# total is the same, the burn rate multiplies. Without it every run folder would reuse the
+# session called "dock" -- the second would re-attach to the first one's VM, find a worker
+# already running and refuse.
+session="${COLAB_SESSION:-dock}"; gpu="${COLAB_GPU:-L4}"; control=""
 # POLYPHAR_COLAB_KEEP: leave the session up at the end. Several run folders docked one
 # after another (the seven subtype tests, or a night of subtypes) otherwise pay the
 # engine install -- micromamba, Uni-Dock, the pinned polyphar -- once per bundle instead

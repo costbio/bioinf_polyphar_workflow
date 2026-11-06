@@ -190,6 +190,8 @@ is already running* and would leave a worker burning GPU units unwatched; it pol
 
 | Variable | Default | What it does |
 |---|---|---|
+| `COLAB_SESSION` | `dock` | which Colab session this run folder uses |
+| `COLAB_GPU` | `L4` | GPU type for a session this run creates |
 | `POLYPHAR_MAX_UNITS` | 200 | units per session |
 | `POLYPHAR_COLAB_KEEP` | unset | hold the session across run folders, so the engine install is paid once |
 | `COLAB_POLL_SECONDS` | 120 | poll interval; the poll is also the keep-alive |
@@ -211,6 +213,34 @@ does not supersede.
 Underneath, `bin/polyphar-colab` drives the round trip and
 [`bin/colab/README.md`](../bin/colab/README.md) documents the individual steps — useful for
 another GPU host or for debugging a session, but you should not need either.
+
+#### Running subtypes concurrently
+
+One unit is ~5.7 GPU-minutes (1,954 ligands at 0.176 s). At 3 replicates that is **137
+GPU-hours for net1 alone** (479 targets), and about **400 hours for all seven** — roughly
+17 days if they run one after another. The compute-unit cost is ~780 of the account's
+balance either way; **wall clock is the constraint, not budget**.
+
+The only lever that shortens it without changing the science is running subtypes at the
+same time in **separate Colab sessions**. Same CU total, multiplied burn rate. Each run
+folder needs its own session name, or the second re-attaches to the first one's VM, finds a
+worker already running and refuses:
+
+    # terminal 1
+    cd $DATA/Liver_cancer/net1   && COLAB_SESSION=net1 $POLYPHAR dock
+    # terminal 2
+    cd $DATA/Alzhemier/Cluster1  && COLAB_SESSION=cluster1 $POLYPHAR dock
+
+Check `colab usage` for the burn rate afterwards: it rises by ~1.94/hr per live L4 session.
+Start one extra session first and confirm the account actually holds two concurrent GPUs
+before relying on three.
+
+The two levers that DO change the science, with their numbers, are decisions for the study,
+not the runbook: dropping to 1 replicate takes net1 to 46 GPU-h but leaves every score
+carrying Uni-Dock's full non-determinism (mean |Δ| 0.07-0.13, max 1.20 kcal/mol, against a
+~6.4 range) instead of a mean over 3 with an SE; and one pocket per protein instead of two
+takes net1 to ~269 targets but a single pocket is the known ligand site only 59 % of the
+time.
 
 **The seven subtypes end-to-end**, through real Colab Uni-Dock, ~60 min:
 
