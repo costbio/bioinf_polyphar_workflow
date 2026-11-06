@@ -232,15 +232,47 @@ worker already running and refuses:
     cd $DATA/Alzhemier/Cluster1  && COLAB_SESSION=cluster1 $POLYPHAR dock
 
 Check `colab usage` for the burn rate afterwards: it rises by ~1.94/hr per live L4 session.
-Start one extra session first and confirm the account actually holds two concurrent GPUs
-before relying on three.
+**Two concurrent L4s is the account's cap** (a third is refused with *Allocation refused
+(precondition failed)*), but the cap is per accelerator type — a T4 comes up as a third.
+Parallelism is across subtypes, not within one: the wrapper refuses a second bundle while
+an earlier one is unmerged, so net1's own 137 hours cannot be split and are the floor.
 
-The two levers that DO change the science, with their numbers, are decisions for the study,
-not the runbook: dropping to 1 replicate takes net1 to 46 GPU-h but leaves every score
-carrying Uni-Dock's full non-determinism (mean |Δ| 0.07-0.13, max 1.20 kcal/mol, against a
-~6.4 range) instead of a mean over 3 with an SE; and one pocket per protein instead of two
-takes net1 to ~269 targets but a single pocket is the known ligand site only 59 % of the
-time.
+#### Search settings: measured, not assumed
+
+`--search-mode balance --replicates 3` are the settings, and they are the defaults. Both
+were measured on 2026-11-06 (48 targets x 233 ligands x 5 draws for replicates; 12 targets
+x 233 ligands x 3 draws at each of the three modes, identical pairs across modes).
+
+| mode | exhaustiveness x max_step | s/ligand | best-of-3 |
+|---|---|---|---|
+| `fast` | 128 x 20 | 0.20 | -5.366 |
+| **`balance`** | **384 x 40** | **0.37** | **-5.576** |
+| `detail` | 512 x 40 | 0.44 | -5.585 |
+
+Cost scales far below the nominal work — `fast`→`balance` is 6x the search for 1.85x the
+time — but the quality return saturates first. `fast` is genuinely too coarse (0.21 kcal/mol
+worse, double the spread); `detail` buys **0.008 kcal/mol** for 19 % more time. `balance` is
+the knee.
+
+**The binding constraint is `max_step`, not exhaustiveness.** `fast`→`balance` moved both
+and gained 0.21; `balance`→`detail` moved only exhaustiveness and gained 0.008. More short
+trajectories do not find what a longer one would. If convergence ever has to be pushed,
+that is the lever to test.
+
+Replicates, best-of-k over 10,483 (target, ligand) pairs: k=1 -5.643, k=3 **-5.779**,
+k=5 -5.823. **3→5 buys 0.044 kcal/mol for +67 % GPU (~300 h)** — under 2 % of the scoring
+function's own ~2-3 kcal/mol error against experiment, and ~3 rank positions in 233. Not
+bought.
+
+The residual under-convergence is **size-dependent**, which is why it is worth stating
+rather than ignoring: the 3→5 gain is 0.067 kcal/mol at >=8 rotatable bonds against 0.018
+at <=3, and 0.065 for >=27 heavy atoms against 0.020 for <=17. **Box volume is not a
+driver** (0.039-0.048 across tertiles). The size-matched strata in `stats` are exactly the
+control for the size dependence.
+
+The remaining lever that changes the science is one pocket per protein instead of two:
+it takes net1 to ~269 targets, but a single pocket is the known ligand site only 59 % of
+the time.
 
 **The seven subtypes end-to-end**, through real Colab Uni-Dock, ~60 min:
 

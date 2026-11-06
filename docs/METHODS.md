@@ -122,7 +122,18 @@ prepared library and records `library_prepared` in its manifest, so re-preparing
 - **Uni-Dock on a GPU is the production engine**; `--engine smina` is the CPU route. The two
   score scales differ (Uni-Dock reads +0.326 kcal/mol less negative, n=580, ρ=0.951), so a
   run must not mix them — `control` inherits `dock`'s engine for that reason.
-- **A ligand's score at a target is the BEST of its replicate draws**, not their mean.
+- **Each ligand's score at a target is the best of three independent draws** (seeds 42-44)
+  under Uni-Dock's `balance` preset (exhaustiveness 384, max_step 40). Measured on
+  2026-11-06 over 10,483 (target, ligand) pairs: best-of-k had **not** fully converged at
+  k=5, and the residual is larger for flexible ligands (3→5 gain 0.067 kcal/mol at >=8
+  rotatable bonds against 0.018 at <=3; 0.065 for >=27 heavy atoms against 0.020 for <=17),
+  while box volume is not a driver. The size-matched comparison controls that dependence by
+  construction. Going to 5 draws would buy 0.044 kcal/mol — under 2 % of the scoring
+  function's own error against experimental affinity — for 67 % more compute, and was not
+  bought. `detail` (exhaustiveness 512) over `balance` buys 0.008 kcal/mol and was not
+  taken either.
+
+- **The best draw, not their mean.**
   Vina-family docking is a stochastic search over a *deterministic* scoring function: given
   a pose the score is fixed, and what varies between replicates is whether the search found
   the good pose. Every draw is an upper bound on the global minimum in that box, so the
