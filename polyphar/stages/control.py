@@ -733,10 +733,10 @@ def calibration_tool(args) -> str:
 # --- the readouts --------------------------------------------------------------------------
 
 def _summary_scores(layout, targets) -> tuple:
-    """({target: {ligand id: score_mean}}, [(target, reason)]) from the control docking.
+    """({target: {ligand id: score_min}}, [(target, reason)]) from the control docking.
 
     Read through `stats.read_df_results`, which is the ONE df_results reader in this repo:
-    it rejects non-finite and unparseable `score_mean` values and returns them. A NaN here
+    it rejects non-finite and unparseable `score_min` values and returns them. A NaN here
     would otherwise reach `self_rank_percentile`, where it compares false against
     everything and comes out BETTER than the best achievable rank (see that function)."""
     from polyphar.stages import stats

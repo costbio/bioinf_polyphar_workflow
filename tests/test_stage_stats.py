@@ -1047,7 +1047,7 @@ def test_the_fine_strata_are_finer_and_recorded(tmp_path):
 
 def test_unparseable_scores_are_counted_and_not_absorbed(tmp_path):
     path = tmp_path / "df_results_x.csv"
-    path.write_text("Ligand,ID,Pocket,n,score_mean\n"
+    path.write_text("Ligand,ID,Pocket,n,score_min\n"
                     "a,1,x,3,nan\nb,2,x,3,inf\nc,3,x,3,-7.0\nd,4,x,3,\ne,5,x,3,oops\n")
     scores, dropped = stats.read_df_results(path)
     assert scores == {"3": -7.0}
@@ -1074,12 +1074,12 @@ def test_a_panel_whose_every_row_is_unparseable_raises(tmp_path):
     run, _ = _run_folder(tmp_path)
     _positive_set(run)
     for p in (run / "07_docking").glob("df_results_*.csv"):
-        p.write_text("Ligand,ID,Pocket,n,score_mean\nA,1,x,2,NOT_A_NUMBER\n")
+        p.write_text("Ligand,ID,Pocket,n,score_min\nA,1,x,2,NOT_A_NUMBER\n")
     with pytest.raises(RuntimeError, match="not one usable score"):
         stats.run(RunLayout(run), _args(run), _Progress())
     assert not (run / "08_stats" / "manifest.json").exists()
     failed = (run / "08_stats" / "failed.tsv").read_text()
-    assert "unusable score_mean row" in failed
+    assert "unusable score_min row" in failed
 
 
 # --- P7: coverage ----------------------------------------------------------------------
@@ -1219,3 +1219,85 @@ def test_the_runbook_documents_the_stats_stage():
     assert "stats" in text
     assert "inputs/positive_sets.csv" in text
     assert "inputs/positive_control.json" in text
+
+
+# --- the estimator: a stochastic search needs the best draw, not the mean ---------------
+
+def test_the_ranking_uses_the_best_draw_not_the_mean(tmp_path):
+    """Vina-family docking searches stochastically over a DETERMINISTIC scoring function.
+
+    Given a pose the score is fixed; what varies between replicates is whether the search
+    found the good pose. Every draw is therefore an upper bound on the global minimum in
+    that box, never below it, so E[draw] > the quantity of interest: the mean is biased by
+    construction, by the expected failure of the search, and the minimum is the consistent
+    estimator.
+
+    The bias is worse than imprecision because it is not uniform -- a flexible ligand's
+    search is harder, so its draws sit further above the true minimum. Ranking on the mean
+    penalises exactly the molecules with the most conformational space.
+    """
+    path = tmp_path / "df_results_x.csv"
+    path.write_text(
+        "Ligand,ID,Pocket,n,score_mean,score_sd,score_se,score_min,score_max\n"
+        # a ligand whose search failed twice: a good minimum, a mediocre mean
+        "flexible,1,x,3,-6.0,1.7,1.0,-8.0,-4.0\n"
+        # one that converged every time: worse minimum, better mean
+        "rigid,2,x,3,-7.0,0.1,0.05,-7.1,-6.9\n")
+
+    scores, dropped = stats.read_df_results(path)
+    assert not dropped, dropped
+    assert scores == {"1": -8.0, "2": -7.1}, "the reader must take score_min"
+    # and the ordering is the one the minimum implies, not the mean's
+    assert scores["1"] < scores["2"], "the mean would have ranked these the other way"
+    assert stats.SCORE_COLUMN == "score_min"
+
+
+def test_a_ligand_with_fewer_draws_than_its_target_is_dropped(tmp_path):
+    """min-of-k improves monotonically with k, so comparing a ligand drawn 3 times against
+    one drawn twice at the SAME target rewards the extra draw rather than the molecule.
+
+    Under mean-ranking an uneven `n` was a nuisance; under min-ranking it is a bias, so the
+    short ligand is dropped, counted and named -- the coverage gate then sees it.
+    """
+    path = tmp_path / "df_results_x.csv"
+    path.write_text("Ligand,ID,Pocket,n,score_min\n"
+                    "full,1,x,3,-7.0\nfull2,2,x,3,-6.0\nshort,3,x,2,-9.0\n")
+
+    scores, dropped = stats.read_df_results(path)
+    assert set(scores) == {"1", "2"}, "the 2-draw ligand must not be ranked against 3-draw ones"
+    assert len(dropped) == 1 and dropped[0][0] == "3"
+    assert "2 draw(s)" in dropped[0][1] and "3" in dropped[0][1]
+
+
+def test_an_equal_but_lower_draw_count_is_not_penalised(tmp_path):
+    """The rule is comparability WITHIN a target, not a minimum number of draws: a target
+    every one of whose ligands has two draws is internally consistent and is kept."""
+    path = tmp_path / "df_results_x.csv"
+    path.write_text("Ligand,ID,Pocket,n,score_min\na,1,x,2,-7.0\nb,2,x,2,-6.0\n")
+    scores, dropped = stats.read_df_results(path)
+    assert scores == {"1": -7.0, "2": -6.0} and not dropped
+
+
+def test_the_ranking_column_is_the_one_the_preregistration_names():
+    """The sha256 pin catches an edit to the document. It does not catch the code drifting
+    AWAY from it.
+
+    On 2026-11-06 `stats` was changed to rank by `score_min` while the pre-registration
+    still said `score_mean`, and the whole suite passed -- a silent divergence between the
+    registered analysis and the one that would have run. The pin guards one direction; this
+    guards the other.
+    """
+    from pathlib import Path
+
+    doc = (Path(stats.__file__).resolve().parent.parent / "data" / "preregistration.md")
+    text = doc.read_text()
+    step1 = text.split("**Step 1")[1].split("**Step 2")[0]
+
+    assert f"`{stats.SCORE_COLUMN}`" in step1, (
+        f"stats ranks by {stats.SCORE_COLUMN}, which step 1 of the pre-registration does "
+        f"not name. Either the code or the document is wrong; an amendment fixes the "
+        f"document, and it needs a new PREREGISTRATION_SHA256.")
+    # and the estimator it replaced must not still be presented as the ranking column
+    other = "score_mean" if stats.SCORE_COLUMN == "score_min" else "score_min"
+    assert f"ranked by `{other}`" not in step1, \
+        f"step 1 still says it ranks by {other}"

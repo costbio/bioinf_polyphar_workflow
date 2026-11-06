@@ -31,7 +31,13 @@ size and pocket generosity cannot produce the result**.
 ## 2. The statistic
 
 **Step 1 — within-target percentile.** For each target (one pocket of one protein), every
-ligand scored on it is ranked by `score_mean` from `07_docking/df_results_<label>.csv`.
+ligand scored on it is ranked by `score_min` from `07_docking/df_results_<label>.csv` — the
+best of that ligand's replicate draws at that target (see the 2026-11-06 amendment).
+
+A ligand with fewer draws than its target's best-attested count is **dropped** from that
+target, counted and named: min-of-k improves monotonically with k, so ranking a 3-draw
+ligand against a 2-draw one would reward the extra draw rather than the molecule. The
+dropped ligand is then subject to the coverage rule below like any other gap.
 
 * Direction: **more negative = better binding = percentile closer to 1**.
 * Ties: **mid-rank**.
@@ -444,6 +450,41 @@ distribution built on it. A "perfect cross-protein match" must never be reported
 
 Every entry here must be dated, must say what changed and why, and must be accompanied by
 a new `stats.PREREGISTRATION_SHA256`; the test suite fails until both are done together.
+
+### 2026-11-06 — the estimator, before any result exists
+
+`dock` has produced no live draw for any of the seven subtypes (net1's earlier 109 units
+were set aside as `superseded_mispaired_20261105T162341` when the receptor/pocket pairing
+defect was found), and no `08_stats` or `08_control` directory exists anywhere. No value of
+the statistic existed when this was written.
+
+* **§ 2 step 1**: ligands are ranked by **`score_min`**, not `score_mean`.
+
+  Vina-family docking is a stochastic search over a *deterministic* scoring function. Given
+  a pose the score is fixed; what varies between replicates is whether the search found the
+  good pose. Every draw is therefore an upper bound on the global minimum of the scoring
+  function in that box and never below it, so `E[draw] >` the quantity of interest: **the
+  mean is biased by construction**, by the expected failure of the search, while the
+  minimum over draws converges to it from above and is the consistent estimator.
+
+  This is not only a precision argument. The bias is not uniform — a flexible ligand's
+  search is harder, so its draws sit further above the true minimum than a rigid ligand's.
+  Ranking on the mean therefore penalises exactly the molecules with the most
+  conformational space. The size-matched strata (§ 2) already defend against this, since
+  positives and controls are matched on heavy atoms and rotatable bonds and so on search
+  difficulty too; ranking on the minimum removes the bias at its source rather than
+  relying on that defence.
+
+* **§ 2 step 1**: ligands with fewer draws than their target's best-attested count are
+  dropped, counted and named. min-of-k is a function of k, so an uneven draw count is a
+  bias under this estimator where it was only a nuisance under the mean.
+
+* The replicate spread (`score_sd`, `score_se`) is **reported and never ranked on**. It is
+  a sampling-adequacy diagnostic — whether the search converged — not an error bar on
+  affinity. Nothing in this document treats it as one.
+
+* Not changed: the replicate count (3), the within-target percentile, `M`, the strata, the
+  permutation test, the coverage rule, the control gate.
 
 ### 2026-11-04 — revision before any result exists
 

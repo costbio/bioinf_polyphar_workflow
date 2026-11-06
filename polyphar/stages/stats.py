@@ -13,7 +13,7 @@ The claim under test
     comparable molecules do.
 
 Step 1 -- within-target percentile
-    For every target, every ligand scored on it is ranked by `score_mean` and converted
+    For every target, every ligand scored on it is ranked by `score_min` and converted
     to a percentile in [0, 1]. More negative = better binding = percentile near 1. Ties
     take the mid-rank, and percentile = 1 - (rank - 0.5)/N, so the percentiles of one
     target have mean exactly 0.5 whatever its score distribution is.
@@ -120,7 +120,7 @@ PocketMatch note
 
 Inputs
     06_targets/final_targets.csv            label (Protein_Pocket) -> UniProt_ID
-    07_docking/df_results_<label>.csv       Ligand, ID, Pocket, n, score_mean, ...
+    07_docking/df_results_<label>.csv       Ligand, ID, Pocket, n, score_min, ...
     07_docking/<label>/replicates/r<i>.sdf  raw per-replicate poses (step 5)
     07_docking/library/ligands.csv          heavy_atoms / rotatable_bonds (pinned)
     inputs/positive_sets.csv                THE POSITIVE SET -- see read_positive_sets
@@ -183,7 +183,7 @@ PREREGISTERED_LIBRARY = "e-Drug3D_2083 (1,960 records surviving the dockability 
 # are updated together (tests/test_stage_stats.py::
 # test_the_preregistration_is_the_one_this_code_was_written_against).
 PREREGISTRATION = "data/preregistration.md"
-PREREGISTRATION_SHA256 = "4dff92a8c81d7ff8372c3197c30a3d1615c28251c96e58f012e0ba31a6f41747"
+PREREGISTRATION_SHA256 = "7e6598d1034531246f9335993b3760c35e5072a1711c2f53e562be327179d47c"
 # A ligand must be scored on at least this share of the panel's proteins AND of the panel's
 # targets to carry an M. 0.98, not 0.9: under informative missingness -- a ligand failing
 # where it fits worst, which is the realistic direction -- M is biased by up to
@@ -258,7 +258,7 @@ CONTROL_SET = ("size-matched e-Drug3D molecules that are not in the positive set
                "the controls are other approved drugs of the same size, not a generic "
                "screening set")
 
-# The descriptive surface's grid (score_mean in kcal/mol, more negative = better).
+# The descriptive surface's grid (score_min in kcal/mol, more negative = better).
 SURFACE_THRESHOLDS = (-11.0, -10.5, -10.0, -9.5, -9.0, -8.5, -8.0, -7.5, -7.0)
 SURFACE_MIN_TARGETS = (1, 2, 3, 5, 10, 20, 50)
 
@@ -951,8 +951,29 @@ def df_results_path(docking: Path, label: str) -> Path:
     return Path(docking) / f"df_results_{label}.csv"
 
 
-def read_df_results(path) -> tuple:
-    """({ligand ID: score_mean}, [(ID, why)]) from one df_results_<label>.csv.
+SCORE_COLUMN = "score_min"
+# Vina-family docking is a stochastic search over a DETERMINISTIC scoring function. Given a
+# pose, the score is fixed; what varies between replicates is whether the search found the
+# good pose. Every draw is therefore an upper bound on the global minimum in that box --
+# never below it -- so E[draw] > the quantity of interest and the MEAN IS BIASED BY
+# CONSTRUCTION, by the expected failure of the search. The minimum over draws converges to
+# it from above and is the consistent estimator.
+#
+# The bias is not uniform, which is why this is not merely a precision question: a flexible
+# ligand's search is harder, so its draws sit further above the true minimum than a rigid
+# ligand's. Ranking by the mean penalises exactly the molecules with the most conformational
+# space. (The size-matched strata are the defence -- positives and controls are matched on
+# heavy atoms and rotatable bonds, so their search difficulty is matched too.)
+#
+# The spread across replicates is then a SAMPLING-ADEQUACY diagnostic, not an error bar on
+# affinity: score_sd/score_se are reported, never ranked on.
+
+
+def read_df_results(path, column: str = SCORE_COLUMN) -> tuple:
+    """({ligand ID: score}, [(ID, why)]) from one df_results_<label>.csv.
+
+    The score is `score_min`, the best of that ligand's draws at this target -- see
+    SCORE_COLUMN above for why the mean is the wrong estimator for a stochastic search.
 
     Unusable rows are COUNTED AND RETURNED, never silently skipped: a file that exists but
     whose every row is unparseable used to yield an empty dict, which looked exactly like
@@ -964,20 +985,38 @@ def read_df_results(path) -> tuple:
     itself wrongly -- it reorders its neighbours ([-10, nan, -5, -8] comes out
     [0.875, 0.625, 0.125, 0.375], with -5 and -8 swapped) and corrupts that target's whole
     ranking. dock_unidock filters non-finite poses; the smina path has no equivalent."""
-    out, dropped = {}, []
+    rows, dropped = [], []
     for r in _read_csv(path):
         lid = str(r.get("ID", "")).strip()
-        raw = r.get("score_mean", None)
+        raw = r.get(column, None)
         try:
             v = float(raw)
         except (TypeError, ValueError):
-            dropped.append((lid or "?", f"score_mean {raw!r} is not a number"))
+            dropped.append((lid or "?", f"{column} {raw!r} is not a number"))
             continue
         if not math.isfinite(v):
-            dropped.append((lid or "?", f"score_mean {raw!r} is not finite"))
+            dropped.append((lid or "?", f"{column} {raw!r} is not finite"))
             continue
         if not lid:
             dropped.append(("?", "no ID"))
+            continue
+        try:
+            n = int(float(r.get("n", 0)))
+        except (TypeError, ValueError):
+            n = 0
+        rows.append((lid, v, n))
+
+    # min-of-k is a function of k: more draws can only improve it. Ranking a ligand with
+    # three draws against one with two at the SAME target would reward the extra draw, not
+    # the molecule. (Under mean-ranking this was a nuisance; under min-ranking it is a
+    # bias.) Ligands short of this target's best-attested draw count are dropped, counted
+    # and named, exactly like an unparseable row -- the coverage gate then sees them.
+    best_n = max((n for _, _, n in rows), default=0)
+    out = {}
+    for lid, v, n in rows:
+        if best_n and n < best_n:
+            dropped.append((lid, f"{n} draw(s) where this target attests {best_n}; "
+                                 f"min-of-k is not comparable across k"))
             continue
         out[lid] = v
     return out, dropped
@@ -1066,7 +1105,7 @@ class Panel:
         self.name = name
         self.run_dir = Path(run_dir)
         self.protein_of = protein_of                 # label -> accession
-        self.pooled = pooled                         # label -> {ID: score_mean}
+        self.pooled = pooled                         # label -> {ID: score_min}
         self.replicates = replicates                 # replicate -> {label: {ID: best}}
 
     @property
@@ -1341,7 +1380,7 @@ def _params(args) -> dict:
             "balance_flag_sd": BALANCE_FLAG_SD,
             "statistic": "mean over proteins of max over that protein's targets of the "
                          "within-target percentile",
-            "percentile": "mid-rank; 1 = most negative score_mean",
+            "percentile": "mid-rank; 1 = most negative score_min (best draw)",
             "direction": DIRECTION,
             "control_panel": str(getattr(args, "control_panel", None) or ""),
             **THRESHOLDS}
@@ -1448,7 +1487,7 @@ def _load(jobs, meta, args, progress, failures, dropped=None) -> tuple:
             pooled[(key, label)] = scores
             if bad and dropped is not None:
                 shown = "; ".join(f"{lid}: {why}" for lid, why in bad[:5])
-                dropped.append((str(path), f"{len(bad)} unusable score_mean row(s) "
+                dropped.append((str(path), f"{len(bad)} unusable {SCORE_COLUMN} row(s) "
                                            f"dropped ({shown}"
                                            f"{', ...' if len(bad) > 5 else ''})",
                                 len(bad)))

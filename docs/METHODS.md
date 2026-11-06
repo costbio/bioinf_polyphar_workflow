@@ -122,9 +122,16 @@ prepared library and records `library_prepared` in its manifest, so re-preparing
 - **Uni-Dock on a GPU is the production engine**; `--engine smina` is the CPU route. The two
   score scales differ (Uni-Dock reads +0.326 kcal/mol less negative, n=580, ρ=0.951), so a
   run must not mix them — `control` inherits `dock`'s engine for that reason.
-- **Scores are means over replicates with a reported SE**, not single draws: Uni-Dock is not
-  deterministic across repeats at the same seed (mean |Δ| 0.07–0.13, max 1.20 kcal/mol
-  against a ~6.4 kcal/mol range), so the default is 3 replicates averaged.
+- **A ligand's score at a target is the BEST of its replicate draws**, not their mean.
+  Vina-family docking is a stochastic search over a *deterministic* scoring function: given
+  a pose the score is fixed, and what varies between replicates is whether the search found
+  the good pose. Every draw is an upper bound on the global minimum in that box, so the
+  mean is biased by the expected failure of the search — and biased *unevenly*, since a
+  flexible ligand's search is harder and its draws sit further above the true minimum.
+  Three independent draws (seeds 42–44); the spread (`score_sd`, `score_se`) is reported as
+  a **sampling-adequacy diagnostic, never as an error bar on affinity** and never ranked
+  on. A ligand with fewer draws than its target's best-attested count is dropped, since
+  min-of-k improves with k.
 
 ## Statistics (`polyphar stats`)
 
@@ -135,7 +142,7 @@ pocket generosity cannot produce the result**. Pre-registered in
 `docs/superpowers/specs/2026-11-03-statistics-design.md`. Read the pre-registration before
 changing a parameter.
 
-- **Within-target percentile.** Every target's ligands are ranked by `score_mean`
+- **Within-target percentile.** Every target's ligands are ranked by `score_min`
   (mid-ranks; more negative = better = percentile near 1), so every target's percentiles
   have mean 0.5. Pocket generosity is *removed*, not adjusted for.
 - **The statistic** is `M = mean over PROTEINS of (max over that protein's targets of the

@@ -738,9 +738,9 @@ def test_the_control_reads_df_results_through_the_one_reader(run_folder):
     ctrl = control.ControlLayout(layout.run_dir)
     ctrl.docking.mkdir(parents=True, exist_ok=True)
     (ctrl.docking / "df_results_2mjw_A_P_1.csv").write_text(
-        "ID,score_mean\nbad,nan\ngood,-7.0\n")
+        "ID,score_min\nbad,nan\ngood,-7.0\n")
     (ctrl.docking / "df_results_AF-P01350-F1_P_1.csv").write_text(
-        "ID,score_mean\nbad,-1.0\ngood,-1.0\n")
+        "ID,score_min\nbad,-1.0\ngood,-1.0\n")
     from polyphar.stages import dock
 
     scores, reasons = control._summary_scores(layout, dock.read_targets(layout))
