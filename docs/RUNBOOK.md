@@ -3,7 +3,7 @@
 Running the seven subtypes on POSEIDON, one stage at a time. `README.md` is the reference
 for what the stages do and why; this file is the order, the commands, and what to check.
 
-**DoGSiteScorer 2** (`drugScore >= 0.5`, the 2023 rule) is the pocket tool, so no
+**DoGSiteScorer 2** (`drugScore >= 0.5`) is the pocket tool, so no
 `--pocket-tool` argument is needed below. DoGSite3 with `--min-volume 120` is the
 sensitivity analysis and needs its own run folder.
 
@@ -95,7 +95,7 @@ the receptor/pocket pairing defect was found.
 | AD Cluster3 | `$DATA/Alzhemier/Cluster3` | as Cluster1, `--sheet cluster3` |
 | AD Cluster4 | `$DATA/Alzhemier/Cluster4` | as Cluster1, `--sheet cluster4` |
 
-The AD sheets are lowercase (`cluster1`), the folders capitalised (`Cluster1`), as in 2023.
+The AD sheets are lowercase (`cluster1`), the folders capitalised (`Cluster1`).
 `Alzhemier` is misspelled on purpose.
 
 AD uses `--gene-column GeneID` because many `UNIPROTID` cells hold several accessions; it
@@ -294,12 +294,12 @@ So Cluster1 legitimately reads 78 rows and writes 131 lines: 41 single-accession
 37 multi-accession rows, which collapse back to 41 + 37 = 78. Seeing 131 after `ids` and
 concluding the gene matching failed is a mistake — check `uniprot.csv`, not `ids.txt`.
 
-**net1 is the whole point of the rerun.** The 2023 `net1UniprotID.txt` was the *net3* tab
-(197 IDs). If `00_ids/ids.txt` comes out at 197, the wrong sheet was read — stop and fix it.
-See `Gene_Disease_Association/NOTES_HCC_subtype1_rerun.md`.
+**net1 and net3 are easy to confuse**: both sheets exist in the same workbook and net3 has
+197 reviewed IDs. If net1's `00_ids/ids.txt` comes out at 197, the wrong sheet was read —
+stop and fix it before anything downstream runs.
 
-AD Cluster3 should now contain **P85299 (PRR5)**. The 2023 list had a truncated `P8529`, so
-2023 ran Cluster3 without it:
+AD Cluster3 must contain **P85299 (PRR5)**; a truncated `P8529` in an input list is not a
+UniProt entry and silently drops the protein:
 
     grep -c P85299 00_ids/ids.txt      # expect 1
 
@@ -352,9 +352,10 @@ but it is memory corruption, not "3 failed".
 - **Resume treats existing output as done** and the stage fingerprint does not include the
   code version. After any change, use a fresh run folder or move the stage dir aside.
 - **One pocket tool per run folder.** A run asking for the other fails before queuing.
-- **Pocket file names are not 2023's**: both tools use `<pdb>_<chain>` as the base name,
-  because the 2023 scheme exceeded PocketMatch's 32-character limit on current PDB entries
-  with multi-character chain IDs. Pocket IDs and drugScores are unchanged.
+- **Pocket file names must stay under 32 characters**, PocketMatch's limit, and it keeps
+  base names only — so a collision merges distinct pockets. Both tools use `<pdb>_<chain>`
+  as the base name for that reason; `pockets` runs the name guard at its end and fails with
+  the offending names listed.
 - **UniProt "not reachable" usually means the request shape, not the network.** Its REST
   service has twice returned HTTP 500 for a shape that used to work while the service
   itself was up; the tell is that `?query=insulin` returns 200 while the stage's request

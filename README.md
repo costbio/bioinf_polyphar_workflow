@@ -20,7 +20,7 @@ machine has no GPU (see [Engine on another machine](#engine-on-another-machine))
 stage prints and notifies its work units and ETA before starting, and every stage resumes.
 
 - [docs/RUNBOOK.md](docs/RUNBOOK.md) — running the seven v2 subtypes on POSEIDON.
-- [docs/METHODS.md](docs/METHODS.md) — every difference from 2023 that could change a
+- [docs/METHODS.md](docs/METHODS.md) — the parameters, definitions and rules that decide a
   reported number, and the pre-registered statistics.
 
 ## First-time server setup
@@ -28,7 +28,7 @@ stage prints and notifies its work units and ETA before starting, and every stag
 Once per machine, in order — each step checks what the next depends on. Needs `git`,
 `docker` (your user in the `docker` group), `conda`/`mamba`, `tmux`, host `python3` >= 3.8.
 
-    # 1. repo + host env (the DoGSite and regression tests run on the host)
+    # 1. repo + host env (the DoGSite tests run on the host)
     git clone https://github.com/costbio/bioinf_polyphar_workflow.git ~/repos/bioinf_polyphar_workflow
     REPO=~/repos/bioinf_polyphar_workflow && cd "$REPO"
     conda env create -f environment.yml && conda activate polyphar && pip install -e .
@@ -63,19 +63,6 @@ Once per machine, in order — each step checks what the next depends on. Needs 
     #    "no protein pair has Pmax >= 0.7" is a property of these two test proteins, not a
     #    fault -- rerun with POLYPHAR_E2E_PMAX=0.3.
     cd "$REPO" && pytest tests/test_run_e2e.py
-
-**Reproducing the 2023 pockets** (DoGSiteScorer 2 only) tells you whether a newly licensed
-binary behaves like the one used then. It reruns three net2 PLK1 chains and requires the
-same pocket names with drugScore within 1e-4. If it fails, do not start a rerun until you
-know why: pockets, and everything after them, would not be comparable.
-
-    mkdir -p ~/adep_csb/disease_subtypes/Liver_cancer/net2/{pockets,pdbfixer/P53350}
-    rsync -av workstation:/mnt/c/experiments/adep_csb/disease_subtypes/Liver_cancer/net2/pockets/DrugScore.csv \
-        ~/adep_csb/disease_subtypes/Liver_cancer/net2/pockets/
-    rsync -av 'workstation:/mnt/c/experiments/adep_csb/disease_subtypes/Liver_cancer/net2/pdbfixer/P53350/{2ogq_A,4o56_A,4h5x_B}.pdb' \
-        ~/adep_csb/disease_subtypes/Liver_cancer/net2/pdbfixer/P53350/
-    POLYPHAR_POCKET_TOOL=dogsite2 ADEP_DATA=~/adep_csb \
-        pytest -W error -m "dogsite and regression" tests/test_stage_pockets.py
 
 **For the DoGSite3 sensitivity analysis instead**: install it with the ZBH installer
 (`/opt/ZBH/dogsite3/dogsite3`, `VERSION_INFO` beside it), activate once
@@ -262,7 +249,7 @@ exits 3, like `run`, and sends its `done` notification at priority 1.
 
 - **`polyphar estimate`** prints one row per remaining stage. The next stage is exact (from
   its inputs). Later stages are labelled `projected` and use values observed in this run
-  where they exist, else priors from the 2023 HCC net2 run.
+  where they exist, else built-in priors.
 - **`polyphar benchmark`** times a small fixture workload per stage on one process and
   stores seconds per unit in `~/.polyphar/calibration.json`. Every finished stage also
   updates its entry. `pockets` is calibrated on the host by
@@ -271,11 +258,10 @@ exits 3, like `run`, and sends its `done` notification at priority 1.
 
 ## Methods
 
-[docs/METHODS.md](docs/METHODS.md) maps the 2023 scripts onto the subcommands and records
-every difference that could change a reported number — ligand preparation and its
-non-standard rotatable-bond definition, pocket-pair filtering, SIFTS chain selection, hub
-ties, AlphaFold versions, seeds and protonation. Read it before writing Methods or quoting
-a count.
+[docs/METHODS.md](docs/METHODS.md) holds the parameters, definitions and rules that decide
+a reported number — ligand preparation and its non-standard rotatable-bond definition,
+SIFTS chain selection, the pocket rules, pocket-pair filtering, seeds and protonation, and
+the pre-registered statistics. Read it before writing Methods or quoting a count.
 
 ## Docking units, replicates and resume
 
@@ -412,17 +398,7 @@ here.
   the names listed in `failed.tsv` (no manifest), before `similarity` would.
 - **DoGSiteScorer 2** (BioSolveIT; tested with 2.0.0), the **primary tool**: flags
   `-s -i -y -d -w 4`, outputs `<out>_desc.txt` / `<out>_res_P_<n>[_<m>].pdb`, selection
-  `drugScore >= 0.5` (`--drugscore-cutoff`), which is the 2023 rule. Version 2.0.0
-  reproduces the 2023 drugScore values exactly on the net2 regression chains (setup step 5),
-  so a rerun is comparable with 2023.
-  - **The base name is not 2023's.** 2023 wrote `<UniProt>_<pdb>_<chain>.pdb_res_P_<n>.pdb`.
-    A current PDB entry with a multi-character author chain ID breaks PocketMatch's
-    32-character limit that way (`P53350_9r1w_AAA.pdb_res_P_1_1.pdb` is 33), and PocketMatch
-    keeps only base names, so truncation would merge distinct pockets. Decided 2026-11-02:
-    both tools use the same base name, `<pdb>_<chain>` (see **Names** below), so the
-    DoGSiteScorer 2 pocket file of that chain is `9r1w_AAA_res_P_1_1.pdb` (22). The
-    accession is in the enclosing folder and in `DrugScore.csv`'s `UniProt ID` column, so
-    nothing is lost; only file names differ from 2023.
+  `drugScore >= 0.5` (`--drugscore-cutoff`).
 - **DoGSite3** (ZBH, Universität Hamburg; tested with 1.3.0), the **sensitivity analysis**
   and not the primary tool: install with the ZBH installer (`/opt/ZBH/dogsite3/dogsite3`)
   and activate the license once with `dogsite3 --license <key>`. The worker runs
@@ -430,30 +406,22 @@ here.
   with DoGSiteScorer 2), descriptors to `<out>_desc.txt` (`-d`), each (sub)pocket's complete
   residues to `<out>_P_<n>[_<m>]_res.pdb` (the PocketMatch input). The version is read from
   `VERSION_INFO` next to the binary (else `unknown`).
-  - **Selection: `volume >= 120 Å³`** (`--min-volume`), the cutoff calibrated against the
-    2023 drugScore selection (see below). DoGSite3 has no drugScore. Pockets and subpockets
-    are judged alike, as drugScore was in 2023.
-  - **Volumes are much smaller than DoGSiteScorer 2's.** On the same 20 pdbfixer chains of
-    the 2023 net2 run, the largest DoGSite3 pocket had a median 0.24× the volume of the
-    largest DoGSiteScorer 2 pocket (2OGQ_A, PLK1 kinase domain: 211 vs 546 Å³). Of 523
-    DoGSite3 pockets in 50 random net2 models (40 chains, 10 AlphaFold models), only 11 (in
-    10 models) have volume >= 300 Å³; DoGSiteScorer 2 kept 40 pockets by drugScore >= 0.5 on
-    the 20 chains above. That is why the cutoff is calibrated rather than taken over. Check
-    the selected-pocket counts (`counts.selected`) before similarity.
-  - **Calibration on DoGSite3's own scale:** `scripts/calibrate_dogsite3_volume.py` runs a
-    tool on the 2023 net2 inputs and finds the DoGSite3 volume cutoff that keeps the same
-    fraction of pockets as drugScore >= 0.5 did in 2023 (pockets and subpockets on both
-    sides), and compares the two selections by residue overlap. On 488 net2 models the kept
-    fraction is f = 0.129 and the cutoff is **120 Å³** (the default). The two selections
-    agree only loosely: precision 0.57 and recall 0.26 against the DoGSiteScorer 2
-    selection, and only 54 % of the DoGSiteScorer 2 pockets have any DoGSite3 match. Treat
-    DoGSite3 as a different method, not a drop-in substitute.
-- **`DrugScore.csv`** (name kept from 2023) has `UniProt ID, Gene Name, Protein, Pocket`, the
+  - **Selection: `volume >= 120 Å³`** (`--min-volume`). DoGSite3 has no drugScore, so the
+    cutoff is calibrated on its own scale rather than carried over; pockets and subpockets
+    are judged alike.
+  - **DoGSite3 volumes are much smaller than DoGSiteScorer 2's** — on matched chains the
+    largest DoGSite3 pocket has a median 0.24× the volume of the largest DoGSiteScorer 2
+    one (PLK1 kinase domain, 2OGQ_A: 211 vs 546 Å³). Check `counts.selected` before
+    similarity. `scripts/calibrate_dogsite3_volume.py` derives the cutoff that keeps the
+    same fraction of pockets as the drugScore rule and compares the two selections by
+    residue overlap; they agree only loosely (precision 0.57, recall 0.26), so **treat
+    DoGSite3 as a different method, not a drop-in substitute**.
+- **`DrugScore.csv`** has `UniProt ID, Gene Name, Protein, Pocket`, the
   tool's descriptor columns, `Pocket Filename` (the residue file on disk), `Tool` and
   `Selected` (the tool's rule). The manifest records `selection_rule`. `similarity` uses the
   rows with `Selected` true and records that rule (`selection_rule` from the pockets
-  manifest) in its manifest and fingerprint; a legacy `DrugScore.csv` without the column
-  uses `drugScore >= 0.5` (recorded as `drugscore_cutoff`).
+  manifest) in its manifest and fingerprint; a `DrugScore.csv` without the column falls
+  back to `drugScore >= 0.5` (recorded as `drugscore_cutoff`).
   Changing `--min-volume` / `--drugscore-cutoff` reruns `pockets` (selection only) on the
   next `run`.
 - **Calibration** is per tool: `calibration.json`'s `pockets` entry records its `tool`; an

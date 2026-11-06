@@ -1,146 +1,138 @@
-# Methods: what polyphar does, and how it differs from 2023
+# Methods
 
-Written for the manuscript's Methods section. Every difference from the 2023 scripts that
-could change a reported number is here, with the reason. `README.md` is how to run the
-thing; `docs/RUNBOOK.md` is the order to run it in.
+For the manuscript's Methods section: the parameters, definitions and rules that decide a
+reported number. `README.md` is how to run it; `docs/RUNBOOK.md` is the order to run it in.
 
-## Old scripts → subcommands
+## Input proteins
 
-| 2023 script | subcommand |
-|---|---|
-| `get_uniprot_data.py` | `polyphar uniprot` (with `polyphar ids` building the list) |
-| `get_pdb_af.py` | `polyphar structures` |
-| `fix_pdb.py` | `polyphar fix` |
-| `get_pockets.py` | `polyphar pockets` (+ host `bin/polyphar-dogsite-worker`) |
-| `get_pocketsimilarity.py` (README: `get_PMsimilarities.py`) | `polyphar similarity` |
-| `Gene_Disease_Association/target_selection_analysis.py` | `polyphar select` |
-| (none: the 2023 runs docked the raw library) | `polyphar ligands` |
-| per-folder smina scripts (`smina_screen_*.py`) | `polyphar dock` |
-| (none: the 2023 analysis had no size-matched test) | `polyphar stats` |
-
-## Methods-relevant changes vs 2023
-
-- **Ligand preparation (`polyphar ligands`, new).** The library is filtered and minimised
-  once, before docking. **Dockability filter: `rotatable bonds > 15` OR `MW > 900` are
-  excluded** — 123 of e-Drug3D's 2,083 records (5.9%), keeping 1,960; the library's limit
-  is MW <= 2000, so it holds peptides outside Vina's domain (bacitracin, 1,421 Da, 35
-  rotatable bonds). **The rotatable-bond definition is non-standard and must be reported as
-  such:** single, non-ring (bridge-detected), non-terminal heavy-atom bonds, **amide C-N
-  bonds included**, and the MW is a plain element-mass sum over the molfile. RDKit's and
-  Open Babel's conventional (Lipinski) definitions exclude amides and would select a
-  different library. Conformers are **minimised in place with MMFF94**, keeping the
-  deposited geometry and stereochemistry, because Vina-family docking samples torsions but
-  not ring pucker or stereo centres ("in place" means same molecule and same starting
-  point, not small movement: the largest per-atom displacement has median 1.61 A and
-  maximum 12.63 A). 23 records (metronidazole, nifedipine, chloramphenicol, ...) carry a
-  nitro group whose nitrogen is left neutral in the molfile; their valence model is
-  repaired (`[N+](=O)[O-]`) without moving an atom. 6 records — the boron-containing drugs
-  (bortezomib, tavaborole, ixazomib, ixazomib citrate, crisaborole, vaborbactam), not metal
-  complexes — have no MMFF94 parameters and keep their input geometry. MMFF94 has no
-  chirality restraint, so every tetrahedral stereocentre's signed chirality volume is
-  compared before and after minimisation and the minimised conformer is discarded if any
-  flips: 1 record does (trabectedin, ID 1808). A C/N/O atom with |formal charge| > 2 is a
-  malformed `M  CHG` line rather than chemistry (isosorbide dinitrate, ID 271, reads as a
-  carbon at +15); such records are passed through flagged and counted, never silently.
-  **Ligands keep their deposited protonation** (430 of the 1,960 prepared records carry a
-  non-zero net formal charge) while receptors are protonated at pH 7.0 by pdbfixer — a
-  deliberate asymmetry that has to be stated.
-  `dock` then docks this prepared library and fingerprints it, so re-preparing re-docks,
-  and records `library_prepared` in its manifest.
-
-- **Pocket-pair filtering.** The 2023 script dropped every pair with `Pmin == 1` or
-  `Pmax == 1`. Since PocketMatch normalises Pmin by the smaller pocket and Pmax by the
-  larger, `Pmin >= Pmax` always, so that was effectively `Pmin != 1` and it discarded every
-  *containment* pair. It is not kept: it cost two real hits above the `Pmax >= 0.7`
-  threshold (CDC25C inside PLK1, 210 of 276 elements, Pmax 0.76, in net1 and net2), and no
-  cross-protein `Pmax == 1` pair exists in any 2023 subtype. Row counts rise about 1% per
-  subtype; the `Pmax >= 0.7` network is unchanged. Pairs sharing a **chain stem** are now
-  dropped alongside same-accession pairs, because a chimeric chain SIFTS maps to two
-  accessions is extracted into both accession folders and would otherwise self-compare at
-  `Pmin == Pmax == 1`. Judge pairs on Pmax: `Pmin == 1` alone means containment, not
-  identity.
-
-- **Chain selection by SIFTS.** For each (accession, PDB entry), the chain is the one SIFTS
-  maps to that accession (`SP_PRIMARY == accession`, strict, no ortholog fallback). Among
-  matching chains, the one with the largest UniProt coverage wins, and ties go to the smallest
-  chain ID. Entries with no such chain are listed in `unmapped.tsv` and skipped. The 2023 code
-  took the first chain of every entry, so 15–22 % of its chains were a different protein.
-  Chain IDs are author IDs (`auth_asym_id`). ProDy matches `chain=` against `label_asym_id`,
-  so extraction selects by segment (ProDy stores `auth_asym_id` there).
-- **cif annotation cross-check.** Each extracted chain's depositor annotation (`_struct_ref`
-  UNP) is compared with SIFTS. A mismatch is a warning only and is listed in
-  `annotation_mismatch.tsv`.
-- **One protein per workbook row (AD).** A workbook cell with several accessions (AD
-  `UNIPROTID`) is resolved to the single reviewed human accession whose primary gene name equals
-  the row's `GeneID` (`--gene-column`); the others are listed in `excluded.tsv` as `same
-  workbook row as ...`. The 2023 AD lists had one protein per row, and this rule reproduces
-  them (it only affects the CALM3 row in cluster1). HCC has one accession per row and is
-  unchanged.
 - **Reviewed human entries only** (`Reviewed == reviewed`, organism 9606). Secondary
-  accessions are renamed to their primary (`renamed.tsv`). Excluded entries are listed in
+  accessions are renamed to their primary (`renamed.tsv`); excluded entries are listed in
   `excluded.tsv`.
-- **Current database versions**, recorded in the manifests: UniProt release, SIFTS
-  Last-Modified, AlphaFold model versions (the latest, currently v6, located through the AlphaFold DB
-  API instead of a hardcoded `v2` URL).
-- **pdbfixer is seeded** (Reference platform), so its outputs are byte-reproducible. The
-  legacy call sequence is kept, at pH 7.0.
-- **Docking receptors are protonated once, by pdbfixer at pH 7.0.** A PDB receptor is the fix
-  output, and an AlphaFold model gets hydrogens only (`addMissingHydrogens(7.0)`, seeded). The
-  PDBQT (Open Babel, Gasteiger, rigid) keeps those hydrogens. The legacy Open Babel pH 7.4
-  step (`CorrectForPH` + `addh`) is gone: it re-placed hydrogens at random on every
-  conversion. Agreement with the 2023 pose-1 scores on 2mjw (20 ligands, today's smina):
-  Spearman ρ 0.957 when the 2023 receptor PDBQT is reused, 0.994 for the new receptor path
-  (mean |Δ| 0.070 kcal/mol). Exact 2023 scores cannot be reproduced (random hydrogen
-  placement, older smina build). Receptor PDBQT sha256 values are recorded in the dock
-  manifest.
-- **Ligands**: smina `--addH 1` (its default, pinned explicitly), `--seed 42`. Kept from
-  2023: exhaustiveness 12, num_modes 12, unpadded box over the pocket atoms.
-- **Pocket detection with DoGSiteScorer 2** (default; see
-  [Pocket detection](#pocket-detection-dogsitescorer--dogsite3)). This is the 2023 method and
-  rule: `-s -i -y -d -w 4`, pockets and subpockets with drugScore >= 0.5. DoGSiteScorer
-  2.0.0 reproduces the 2023 drugScore values exactly on the net2 regression chains, so the
-  rerun's pockets are comparable with 2023's. What changes is **coverage**: the 2023 net2
-  pocket stage has output for only about 495 of its 1301 models (~38 %), and 2.0.0 finds
-  pockets for all sampled missing ones, so the 2023 similarity networks were built from a
-  minority of the structures. Suggested Methods text: "Binding pockets and subpockets were
-  detected with DoGSiteScorer (version 2.0.0) [citation] on each pdbfixer-repaired PDB chain
-  and each AlphaFold model, with subpocket detection enabled. Pockets (and subpockets) with
-  a drug score of at least 0.5 were retained for pocket similarity." DoGSite3 with a
-  calibrated volume cutoff is the sensitivity analysis (`--pocket-tool dogsite3`).
-- **Fusion / chimeric chains.** A chain SIFTS maps to several accessions (a fusion construct,
-  e.g. a target fused to MBP or T4 lysozyme) is kept whole for pdbfixer and pocket detection.
-  `Protein_info.csv` records the accession's SIFTS segments on that chain (`SIFTS segments`,
-  `PDB_BEG:PDB_END` in author numbering) and the partners (`SIFTS other accessions`). A
-  pocket with more than 50 % of its residues outside the segment(s) is dropped before
-  `DrugScore.csv` (`failed.tsv`: `pocket outside target segment: <pct>% outside; partner(s)
-  <accs>`; `counts.outside_segment`). Pocket residues are mapped back to author numbering
-  through their heavy-atom coordinates in the extracted chain (pdbfixer renumbers residues
-  but keeps the coordinates). When SIFTS leaves a bound empty or `None` (an unobserved
-  end), the segment's SEQRES range (`RES_BEG..RES_END`) is mapped through the cif's
-  `_pdbx_poly_seq_scheme` to the first and last observed author residue in it
-  (`SIFTS segments source` = `seqres`, else `pdb`; counts `segments_from_seqres`). Only
-  when that fails too (source empty, `segments_unverified`) are the chain's pockets kept
-  and counted as `segment_unverified`.
-- **Target selection**: no longer uses the similarity network at all. The 2023 rule took the
-  top-degree node of the Pmax ≥ 0.7 graph plus its neighbours, which made the target count a
-  property of how many structures were processed rather than of biology. The panel is now
-  defined by explicit pocket filters — DoGSiteScorer's `drugScore`, volume 300–1500 Å³, a
-  subpocket-parent rule, an AlphaFold pocket-pLDDT floor and a transmembrane policy — with
-  **up to 2 pockets per protein** (picking one was measured to be the known ligand site only
-  59% of the time). `similarity` now runs **after** `select`, on the panel's eligible pockets,
-  and its output is descriptive: pocket similarity is applied post hoc to docking results, not
-  used to choose targets. See `docs/superpowers/specs/2026-11-03-panel-selection-redesign-design.md`.
+- **One protein per workbook row.** A cell holding several accessions is resolved to the
+  single reviewed human accession whose primary gene name equals the row's gene column
+  (`--gene-column`); the others go to `excluded.tsv` as `same workbook row as ...`. A row
+  that resolves to none or several stops the stage with the candidates listed.
+- **Database versions are recorded in every manifest**: UniProt release, SIFTS
+  Last-Modified, and the AlphaFold model version, located through the AlphaFold DB API
+  rather than a hardcoded URL.
 
+## Structures and chains
+
+- **Chain selection by SIFTS.** For each (accession, PDB entry) the chain is the one SIFTS
+  maps to that accession (`SP_PRIMARY == accession`, strict, no ortholog fallback). Among
+  matching chains the largest UniProt coverage wins, ties to the smallest chain ID. Entries
+  with no such chain are listed in `unmapped.tsv` and skipped.
+- Chain IDs are author IDs (`auth_asym_id`). ProDy matches `chain=` against
+  `label_asym_id`, so extraction selects by segment, where ProDy stores the author ID.
+- **cif annotation cross-check.** Each extracted chain's depositor annotation
+  (`_struct_ref` UNP) is compared with SIFTS; a mismatch is a warning listed in
+  `annotation_mismatch.tsv`.
+- **Fusion / chimeric chains** — a chain SIFTS maps to several accessions, e.g. a target
+  fused to MBP or T4 lysozyme — are kept whole for pdbfixer and pocket detection.
+  `Protein_info.csv` records the accession's SIFTS segments on that chain (`PDB_BEG:PDB_END`
+  in author numbering) and the partners. **A pocket with more than 50 % of its residues
+  outside those segments is dropped** before `DrugScore.csv` (`failed.tsv`: `pocket outside
+  target segment`; `counts.outside_segment`). Pocket residues are mapped back to author
+  numbering through their heavy-atom coordinates in the extracted chain, since pdbfixer
+  renumbers residues but keeps coordinates. Where SIFTS leaves a bound empty (an unobserved
+  end) the segment's SEQRES range is mapped through the cif's `_pdbx_poly_seq_scheme` to the
+  first and last observed author residue (`SIFTS segments source` = `seqres`, else `pdb`).
+  Only when that also fails are the chain's pockets kept and counted as
+  `segment_unverified`.
+- **pdbfixer is seeded** (Reference platform), so its output is byte-reproducible, and runs
+  at pH 7.0.
+
+## Pocket detection
+
+DoGSiteScorer 2.0.0, flags `-s -i -y -d -w 4`, keeping **pockets and subpockets with
+drugScore >= 0.5**. DoGSite3 with a calibrated volume cutoff is the sensitivity analysis
+(`--pocket-tool dogsite3`), in its own run folder.
+
+Suggested Methods text:
+
+> Binding pockets and subpockets were detected with DoGSiteScorer (version 2.0.0)
+> [citation] on each pdbfixer-repaired PDB chain and each AlphaFold model, with subpocket
+> detection enabled. Pockets (and subpockets) with a drug score of at least 0.5 were
+> retained for pocket similarity.
+
+## Target selection
+
+The panel is defined by **explicit pocket filters** — DoGSiteScorer's `drugScore`, volume
+300–1500 Å³, a subpocket-parent rule, an AlphaFold pocket-pLDDT floor and a transmembrane
+policy — with **up to 2 pockets per protein**, because picking one was measured to be the
+known ligand site only 59 % of the time.
+
+`similarity` runs **after** `select`, on the panel's eligible pockets, and its output is
+descriptive: pocket similarity is applied post hoc to docking results, it does not choose
+targets. Design: `docs/superpowers/specs/2026-11-03-panel-selection-redesign-design.md`.
+
+**Pocket-pair filtering.** Pairs sharing an accession, and pairs sharing a **chain stem**,
+are dropped: a chimeric chain that SIFTS maps to two accessions is extracted into both
+accession folders and would otherwise self-compare at `Pmin == Pmax == 1`. Containment
+pairs are kept — PocketMatch normalises Pmin by the smaller pocket and Pmax by the larger,
+so `Pmin >= Pmax` always, and `Pmin == 1` alone means containment, not identity. Discarding
+them would lose real hits above the `Pmax >= 0.7` threshold (CDC25C sits inside PLK1, 210
+of 276 elements, Pmax 0.76). **Judge pairs on Pmax.**
+
+## Ligand preparation (`polyphar ligands`)
+
+The library is filtered and minimised once, before docking. `dock` fingerprints the
+prepared library and records `library_prepared` in its manifest, so re-preparing re-docks.
+
+- **Dockability filter: `rotatable bonds > 15` OR `MW > 900` are excluded** — 123 of
+  e-Drug3D's 2,083 records (5.9 %), keeping 1,960. The library's own limit is MW <= 2000,
+  so it holds peptides outside Vina's domain (bacitracin, 1,421 Da, 35 rotatable bonds).
+- **The rotatable-bond definition is non-standard and must be reported as such:** single,
+  non-ring (bridge-detected), non-terminal heavy-atom bonds, **amide C–N bonds included**,
+  with MW a plain element-mass sum over the molfile. RDKit's and Open Babel's conventional
+  (Lipinski) definitions exclude amides and would select a different library.
+- **Conformers are minimised in place with MMFF94**, keeping the deposited geometry and
+  stereochemistry, because Vina-family docking samples torsions but not ring pucker or
+  stereo centres. "In place" means the same molecule from the same starting point, not a
+  small movement: the largest per-atom displacement has median 1.61 Å and maximum 12.63 Å.
+- 23 records (metronidazole, nifedipine, chloramphenicol, …) carry a nitro group whose
+  nitrogen is left neutral in the molfile; the valence model is repaired (`[N+](=O)[O-]`)
+  without moving an atom.
+- 6 boron-containing drugs (bortezomib, tavaborole, ixazomib, ixazomib citrate,
+  crisaborole, vaborbactam) have no MMFF94 parameters and keep their input geometry.
+- MMFF94 has no chirality restraint, so every tetrahedral stereocentre's signed chirality
+  volume is compared before and after minimisation and the conformer is discarded if any
+  flips — 1 record does (trabectedin, ID 1808).
+- A C/N/O atom with |formal charge| > 2 is a malformed `M  CHG` line rather than chemistry
+  (isosorbide dinitrate, ID 271, reads as a carbon at +15). Such records pass through
+  flagged and counted, never silently.
+- Records carrying an element the scoring function cannot type are excluded, rather than
+  left to be silently given no poses.
+- **Ligands keep their deposited protonation** — 430 of the 1,960 prepared records carry a
+  non-zero net formal charge — while receptors are protonated at pH 7.0. This asymmetry is
+  deliberate and has to be stated.
+
+## Docking
+
+- **Receptors are protonated once, by pdbfixer at pH 7.0.** A PDB receptor is the `fix`
+  output; an AlphaFold model gets hydrogens only (`addMissingHydrogens(7.0)`, seeded). The
+  PDBQT (Open Babel, Gasteiger, rigid) keeps those hydrogens — no second pH correction,
+  which would re-place hydrogens at random on every conversion. Receptor PDBQT sha256
+  values are recorded in the dock manifest.
+- **Before any docking, a box the receptor does not occupy is refused**, for both `select`
+  and `dock`: it means the pocket and the receptor are different structures and every
+  ligand would be scored in vacuum.
+- Parameters: **seed 42**, exhaustiveness 12, num_modes 12, an unpadded box over the pocket
+  atoms. smina additionally pins `--addH 1` (its default, stated explicitly).
+- **Uni-Dock on a GPU is the production engine**; `--engine smina` is the CPU route. The two
+  score scales differ (Uni-Dock reads +0.326 kcal/mol less negative, n=580, ρ=0.951), so a
+  run must not mix them — `control` inherits `dock`'s engine for that reason.
+- **Scores are means over replicates with a reported SE**, not single draws: Uni-Dock is not
+  deterministic across repeats at the same seed (mean |Δ| 0.07–0.13, max 1.20 kcal/mol
+  against a ~6.4 kcal/mol range), so the default is 3 replicates averaged.
 
 ## Statistics (`polyphar stats`)
 
-Pre-registered in `polyphar/data/preregistration.md`. Read it before changing a parameter.
-
-The last stage tests the study's claim -- *approved HCC drugs bind more of the HCC panel,
-at a useful level, than comparable molecules do* -- in a comparison where **ligand size and
-pocket generosity cannot produce the result**. It is pre-registered in
-`polyphar/data/preregistration.md` and designed in
-`docs/superpowers/specs/2026-11-03-statistics-design.md`; read the pre-registration before
+The last stage tests the study's claim — *approved HCC drugs bind more of the HCC panel, at
+a useful level, than comparable molecules do* — in a comparison where **ligand size and
+pocket generosity cannot produce the result**. Pre-registered in
+`polyphar/data/preregistration.md`, designed in
+`docs/superpowers/specs/2026-11-03-statistics-design.md`. Read the pre-registration before
 changing a parameter.
 
 - **Within-target percentile.** Every target's ligands are ranked by `score_mean`
