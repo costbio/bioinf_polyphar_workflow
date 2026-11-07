@@ -255,21 +255,40 @@ def test_wait_warns_once_without_worker(tmp_path, monkeypatch):
 
 
 def test_wait_repeats_the_warning_and_fails_once_the_worker_is_dead(tmp_path, monkeypatch):
-    # The warning is emitted on a wall-clock interval from inside the poll loop, so a
-    # starved loop emits fewer of them. With a 1.5 s deadline and a 0.4 s interval this
-    # test failed under a loaded full-suite run and passed alone; the headroom below
-    # keeps what it proves (the warning REPEATS) without depending on scheduling.
-    monkeypatch.setattr(pockets, "POLL_S", 0.05)
-    monkeypatch.setattr(pockets, "NO_WORKER_REPEAT_S", 0.2)
+    """The warning REPEATS while no worker answers, and the wait eventually gives up.
+
+    Both are wall-clock decisions taken inside a polling loop, so testing them against the
+    real clock measures how often a loaded machine schedules that loop rather than what the
+    loop decides. It failed twice that way -- under the full suite, passing alone -- first
+    at a 1.5 s deadline and again at 3.0 s. More headroom only moves the threshold.
+
+    So the clock is driven instead: every poll advances it by a fixed step and sleeps not
+    at all. The loop's arithmetic is exercised exactly, the timings are the ones it would
+    see in production, and nothing depends on the scheduler.
+    """
+    step, deadline, repeat = 1.0, 10.0, 3.0
+    clock = iter(i * step for i in range(10_000))
+    now = [0.0]
+
+    def fake_time():
+        return now[0]
+
+    def fake_sleep(_s):
+        now[0] = next(clock)
+
+    monkeypatch.setattr(pockets.time, "time", fake_time)
+    monkeypatch.setattr(pockets.time, "sleep", fake_sleep)
+    monkeypatch.setattr(pockets, "POLL_S", step)
+    monkeypatch.setattr(pockets, "NO_WORKER_REPEAT_S", repeat)
     layout = _model_run(tmp_path)
     jobs = pockets.enqueue(layout, "dogsite2")
     prog = Prog()
-    t0 = time.monotonic()
     with pytest.raises(RuntimeError, match="no DoGSiteScorer worker heartbeat for"):
-        pockets.wait_for_queue(layout, prog, worker_timeout=0.2, jobs=jobs,
-                               worker_dead_after=3.0)
-    assert 3.0 <= time.monotonic() - t0 < 12
-    assert len(prog.notes) >= 3                      # repeated, not once
+        pockets.wait_for_queue(layout, prog, worker_timeout=step, jobs=jobs,
+                               worker_dead_after=deadline)
+    # one warning per `repeat` of waiting, not one in total and not one per poll
+    assert len(prog.notes) == pytest.approx(deadline / repeat, abs=1), prog.notes
+    assert len(prog.notes) >= 3
     assert all(n[1] == WARNING and n[2] == 1 for n in prog.notes)
     assert not (layout.pockets / "queue" / "CLOSED").exists()
     assert sorted(n for n in os.listdir(layout.pockets / "queue")) == sorted(

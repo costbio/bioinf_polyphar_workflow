@@ -67,22 +67,34 @@ open({str(calls)!r}, "a").write(" ".join(argv) + "\\n")
 run_dir = Path(os.environ["POLYPHAR_RUN_DIR"])
 rel = argv[argv.index("--bundle") + 1]
 bundle = run_dir / rel
+# A unit already recorded in the run folder is never exported again. The real
+# dock-export re-plans what is outstanding, and the wrapper's recovery path depends on
+# it: after merging a stranded bundle the next export must carry only the rest.
+rec_file = run_dir / "recorded.json"
+def _recorded():
+    return set(json.loads(rec_file.read_text())) if rec_file.is_file() else set()
 if argv[0] == "dock-export":
+    outstanding = [u for u in {UNITS!r} if f"{{u[0]}}/r{{u[1]}}" not in _recorded()]
+    if not outstanding:
+        print("dock-export: 0 units (no work)")
+        sys.exit(0)
     (bundle / "results").mkdir(parents=True, exist_ok=True)
     (bundle / "receptors").mkdir(exist_ok=True)
     rows = ["label\\treplicate\\tseed\\tkey"]
-    for label, rep in {UNITS!r}:
+    for label, rep in outstanding:
         rows.append(f"{{label}}\\t{{rep}}\\t42\\tkey-{{label}}-{{rep}}")
     (bundle / "units.tsv").write_text("\\n".join(rows) + "\\n")
-    (bundle / "run_key.json").write_text(json.dumps({{"units": len({UNITS!r})}}))
+    (bundle / "run_key.json").write_text(json.dumps({{"units": len(outstanding)}}))
     (bundle / "library.sdf").write_text("$$$$\\n")
     sys.exit(0)
 if argv[0] == "dock-merge":
     done = sorted(str(p) for p in (bundle / "results").glob("*/replicates/*.done"))
+    ids = [Path(p).parent.parent.name + "/" + Path(p).stem for p in done]
+    recorded = set(ids) | _recorded()
+    rec_file.write_text(json.dumps(sorted(recorded)))
     (run_dir / "merged.json").write_text(json.dumps(
-        {{"merged": len(done), "units": [Path(p).parent.parent.name + "/" + Path(p).stem
-                                        for p in done]}}))
-    sys.exit(0 if len(done) == len({UNITS!r}) else 3)
+        {{"merged": len(done), "units": ids, "recorded": sorted(recorded)}}))
+    sys.exit(0 if len(recorded) == len({UNITS!r}) else 3)
 sys.exit(2)
 """)
     (bin_dir / "polyphar-docker").chmod(0o755)
@@ -119,11 +131,15 @@ def bundles(run_dir):
 
 
 def held(run_dir):
-    """Units pulled into the local bundle."""
-    out = []
+    """Units the HOST holds, across every bundle.
+
+    A unit can sit in a bundle stranded by an interruption and again in a later one; it
+    is still one unit, so this is a set.
+    """
+    out = set()
     for b in bundles(run_dir):
         for p in (b / "results").glob("*/replicates/*.done"):
-            out.append(f"{p.parent.parent.name}/{p.stem}")
+            out.add(f"{p.parent.parent.name}/{p.stem}")
     return sorted(out)
 
 
@@ -219,7 +235,7 @@ def test_rerunning_when_the_session_is_gone_merges_what_was_pulled(world):
     assert p.returncode == 0, p.stdout + p.stderr
     assert "merging" in p.stdout
     merged = json.loads((world.run_dir / "merged.json").read_text())
-    assert merged["units"] == pulled
+    assert set(pulled) <= set(merged["recorded"]), "the stranded units must be recorded"
     assert (bundles(world.run_dir)[0] / ".merged").exists()
 
 
@@ -469,3 +485,49 @@ def test_an_explicit_session_argument_still_wins_over_the_variable(world):
     assert p.returncode == 0, p.stdout + p.stderr
     calls = [c for c in colab_calls(world) if " -s " in c]
     assert calls and all("fromflag" in c for c in calls), calls
+
+
+def test_a_recovery_merge_carries_on_instead_of_telling_you_to_rerun(world):
+    """A stranded bundle leaves the run exactly where a fresh invocation would start.
+
+    On 2026-11-06 the first command of a session found a bundle left by a run killed
+    hours earlier, merged its 5 units and exited -- correct, but it read as "did nothing"
+    and the docking the user asked for had not begun. There is no decision in that step,
+    so the wrapper takes it: merge the stranded bundle, then export the next one.
+    """
+    # strand a bundle: pull some units, then lose the VM
+    with pytest.raises(subprocess.TimeoutExpired):
+        world.run(FAKE_COLAB_HANG_AFTER=2, _timeout=6)
+    stranded = held(world.run_dir)
+    assert stranded, "nothing was pulled before the interruption"
+    (world.vm / ".sessions" / "dock").unlink()
+
+    p = world.run()
+    assert p.returncode == 0, p.stdout + p.stderr
+    assert "merging" in p.stdout
+    assert "carrying on to the next one" in p.stdout, p.stdout
+    # it really exported again rather than stopping at the merge
+    assert len(bundles(world.run_dir)) == 2, [b.name for b in bundles(world.run_dir)]
+    assert held(world.run_dir) == ["A/r0", "A/r1", "B/r0", "B/r1"]
+
+
+def test_the_continuation_happens_once_and_cannot_spin(world):
+    """A run that keeps stranding bundles must stop and be looked at, not loop."""
+    with pytest.raises(subprocess.TimeoutExpired):
+        world.run(FAKE_COLAB_HANG_AFTER=2, _timeout=6)
+    (world.vm / ".sessions" / "dock").unlink()
+
+    p = world.run(POLYPHAR_COLAB_CONTINUED="1")
+    assert p.returncode == 0, p.stdout + p.stderr
+    assert "merging" in p.stdout
+    assert "carrying on to the next one" not in p.stdout, p.stdout
+    assert len(bundles(world.run_dir)) == 1, "it must not export again when already continued"
+
+
+def test_an_ordinary_run_does_not_announce_a_continuation(world):
+    """The continuation belongs to the recovery path only: a normal round trip ends when
+    its own bundle is merged."""
+    p = world.run()
+    assert p.returncode == 0, p.stdout + p.stderr
+    assert "carrying on to the next one" not in p.stdout, p.stdout
+    assert len(bundles(world.run_dir)) == 1

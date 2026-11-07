@@ -72,6 +72,7 @@ engine_version="${POLYPHAR_ENGINE_VERSION:-Uni-Dock v1.2.0}"
 # and --unit-timeout are part of the unit key. Dropping them did not fail -- it quietly
 # docked the defaults and reported success, the same shape as the --library bug.
 dock_args=()
+argv=("$@")          # kept for the continuation at the end; the loop shifts $@ away
 while [ $# -gt 0 ]; do
     case "$1" in
         --)          shift; dock_args=("$@"); break ;;
@@ -223,7 +224,7 @@ export_root="$run_dir/07_docking/export"
 # to the first: if the session is alive and holds this very bundle, skip straight to
 # polling, then pack, download and merge as usual. Nothing is re-exported or re-uploaded.
 attach=""
-merge_only=""
+merge_only=""; recovered=""
 fetch_every="${COLAB_FETCH_EVERY:-1}"
 max_fails="${COLAB_MAX_POLL_FAILS:-10}"
 session_lost=""
@@ -258,7 +259,7 @@ if [ "${#unmerged[@]}" = 1 ]; then
         # Since the pull became incremental this is the ORDINARY state after any
         # interruption: units were pulled, the session is gone, the merge never ran.
         # Refusing here would strand real results behind a manual command.
-        merge_only=1
+        merge_only=1; recovered=1
         bundle="$b"; rel="$brel"; name="${b##*/}"
         say "session '$session' is gone, but $(local_count) pulled unit(s) are here: merging them"
         push "dock: merging what was pulled" "Session gone; merging $(local_count) unit(s) already home."
@@ -475,3 +476,16 @@ rm -f ${tgz:+"$tgz"}
 
 push "dock: merged" "Bundle $name merged into the run folder. Re-run \`polyphar dock\` until nothing is outstanding."
 say "done: bundle $rel merged. Re-run until dock reports nothing outstanding."
+
+# A RECOVERY merge -- a bundle stranded by an earlier interruption -- leaves the run exactly
+# where a fresh invocation would start: that bundle is now merged and the outstanding units
+# have not moved. Printing "re-run" and exiting made the first command of a session look
+# like it had done nothing, which is how it read on 2026-11-06. There is no decision in
+# that step, so take it.
+#
+# Once only. A run that keeps stranding bundles must stop and be looked at rather than
+# spin, and `exec` keeps the process count flat however many times it legitimately happens.
+if [ -n "$recovered" ] && [ -z "${POLYPHAR_COLAB_CONTINUED:-}" ]; then
+    say "that bundle was stranded by an earlier run; carrying on to the next one"
+    POLYPHAR_COLAB_CONTINUED=1 exec "$0" ${argv[@]+"${argv[@]}"}
+fi
