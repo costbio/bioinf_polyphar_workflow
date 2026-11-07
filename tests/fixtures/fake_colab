@@ -19,6 +19,8 @@ Knobs (all optional):
   FAKE_COLAB_HANG_AFTER     the worker stops finishing units after this many polls
   FAKE_COLAB_FAIL_DOWNLOAD  comma-separated download attempt numbers that fail
   FAKE_COLAB_FAIL_EXEC      comma-separated fetch.py attempt numbers that fail
+  FAKE_COLAB_LINK_DOWN      every poll AND `sessions` fail: this host cannot reach Colab
+  FAKE_COLAB_POLL_DOWN      polls fail but `sessions` still answers: the VM is fine
   FAKE_COLAB_LAUNCH_REFUSES launch.py refuses but the CLI still exits 0
   FAKE_COLAB_SETUP_REFUSES  setup.py refuses but the CLI still exits 0
   FAKE_COLAB_SETUP_STALLS   seconds setup.py hangs for, after printing one line
@@ -158,6 +160,11 @@ def main(argv):
     session = opt(argv, "-s") or opt(argv, "--session")
 
     if cmd == "sessions":
+        if os.environ.get("FAKE_COLAB_LINK_DOWN"):
+            # what the real CLI does with no network: it cannot refresh its token and
+            # falls back to the interactive prompt, then fails
+            print("Enter the authorization code:", file=sys.stderr)
+            return 1
         for name in sorted(sessions()):
             print(f"[{name}] L4")
         return 0
@@ -198,6 +205,10 @@ def main(argv):
 
     if cmd == "exec":
         script = Path(opt(argv, "-f") or opt(argv, "--file") or "")
+        if (os.environ.get("FAKE_COLAB_LINK_DOWN")
+                or os.environ.get("FAKE_COLAB_POLL_DOWN")) and script.name == "poll.py":
+            print("Enter the authorization code:", file=sys.stderr)
+            return 1
         name = script.name
         env = {}
         for i, a in enumerate(argv):

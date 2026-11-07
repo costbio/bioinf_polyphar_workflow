@@ -224,7 +224,7 @@ export_root="$run_dir/07_docking/export"
 # to the first: if the session is alive and holds this very bundle, skip straight to
 # polling, then pack, download and merge as usual. Nothing is re-exported or re-uploaded.
 attach=""
-merge_only=""; recovered=""
+merge_only=""; recovered=""; link_lost=""
 fetch_every="${COLAB_FETCH_EVERY:-1}"
 max_fails="${COLAB_MAX_POLL_FAILS:-10}"
 session_lost=""
@@ -422,9 +422,39 @@ colab download /content/worker.log /tmp/w.log -s $session" 1
         # because nothing had been pulled anyway; now that every poll brings results
         # home, giving up and merging what is here is the right end to a lost VM.
         if [ "$fails" -ge "$max_fails" ]; then
-            note "giving up after $fails consecutive failed polls; merging what is here"
-            push "dock: session lost" \
-                 "$fails polls failed in a row. Merging the $(local_count) unit(s) already pulled." 1
+            # A failed poll says the CLIENT could not ask. It does NOT say the session
+            # died. On 2026-11-07 POSEIDON lost its network; the colab CLI, unable to
+            # refresh its token, fell back to an interactive "Enter the authorization
+            # code:" prompt nobody could answer, ten polls failed over 63 minutes, and
+            # the wrapper declared lost a session that was still docking at 52 %. Ask
+            # before concluding, and distinguish the three answers.
+            if sessions_out="$(timeout --foreground 120 colab sessions 2>&1)"; then
+                case "$sessions_out" in
+                    *"[$session]"*)
+                        note "the session is still there: these failures are this host's"
+                        note "           link to Colab, not the VM. Polling on."
+                        push "dock: link trouble, session alive" \
+                             "$fails polls failed but session '$session' is still up and the
+worker is detached. Polling continues; nothing is lost." 0
+                        fails=0
+                        continue ;;
+                esac
+                note "giving up: Colab answered and session '$session' is not there"
+                push "dock: session gone" \
+                     "Colab confirms session '$session' is gone. Merging the $(local_count)
+unit(s) already pulled." 1
+            else
+                # Colab itself is unreachable, so the session's fate is UNKNOWN. Merge what
+                # is home -- that is always safe -- but leave the bundle re-attachable and
+                # say the VM may still be running and billing.
+                link_lost=1
+                note "cannot reach Colab at all; the session may well still be running"
+                push "dock: cannot reach Colab" \
+                     "$fails polls failed and 'colab sessions' also failed, so session
+'$session' may still be up and billing. Merging the $(local_count) unit(s) pulled so far and
+leaving the bundle re-attachable: re-run \`polyphar dock\` once the link is back, or stop the
+session with \`colab stop -s $session\`." 1
+            fi
             session_lost=1
             break
         fi
@@ -464,9 +494,15 @@ merge_rc=0
 # this run merged its units and others remain outstanding. Treating it as failure would
 # make every intermediate round trip look broken and break `&&` chains. Anything else is
 # a real failure and the bundle is left unmerged so it can be retried.
+# `.merged` closes the bundle: the re-attach branch only considers an UNMERGED one. When
+# the link died and the session's fate is unknown, closing it is what stranded net3 on
+# 2026-11-07 -- its worker was alive at 52 % and the only way back was to move the marker
+# aside by hand. Re-merging is safe by design (a recorded draw is never replaced), so the
+# bundle is left open and the next run can re-attach or merge again, whichever is true.
+mark_merged() { [ -n "$link_lost" ] || touch "$bundle/.merged"; }
 case "$merge_rc" in
-    0) touch "$bundle/.merged" ;;
-    3) touch "$bundle/.merged"; say "merged; work still outstanding (exit 3 from dock-merge)" ;;
+    0) mark_merged ;;
+    3) mark_merged; say "merged; work still outstanding (exit 3 from dock-merge)" ;;
     *) die "dock-merge failed (exit $merge_rc). The bundle is kept at $rel; results are in
      $bundle/results. Fix the cause and re-run `polyphar-docker dock-merge --bundle $rel`." ;;
 esac
@@ -476,6 +512,11 @@ rm -f ${tgz:+"$tgz"}
 
 push "dock: merged" "Bundle $name merged into the run folder. Re-run \`polyphar dock\` until nothing is outstanding."
 say "done: bundle $rel merged. Re-run until dock reports nothing outstanding."
+if [ -n "$link_lost" ]; then
+    say "the bundle is left OPEN because Colab was unreachable: session '$session' may still
+     be running. Re-run \`polyphar dock\` to re-attach once the link is back, or stop it with
+     \`colab stop -s $session\`."
+fi
 
 # A RECOVERY merge -- a bundle stranded by an earlier interruption -- leaves the run exactly
 # where a fresh invocation would start: that bundle is now merged and the outstanding units

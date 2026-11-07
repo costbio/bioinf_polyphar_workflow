@@ -197,7 +197,9 @@ def test_a_lost_session_ends_the_run_instead_of_polling_for_ever(world):
     reclaimed VM is to stop and merge what is here."""
     p = world.run(FAKE_COLAB_DIE_AFTER=2, COLAB_MAX_POLL_FAILS=3, _timeout=60)
     assert p.returncode == 0, p.stdout + p.stderr
-    assert "giving up after" in p.stdout
+    # and it says WHY it concluded that: Colab was asked and answered
+    assert "giving up: Colab answered" in p.stdout, p.stdout
+    assert "is not there" in p.stdout, p.stdout
     pulled = held(world.run_dir)
     assert pulled, "the units drawn before the VM died should have been pulled"
     merged = json.loads((world.run_dir / "merged.json").read_text())
@@ -531,3 +533,55 @@ def test_an_ordinary_run_does_not_announce_a_continuation(world):
     assert p.returncode == 0, p.stdout + p.stderr
     assert "carrying on to the next one" not in p.stdout, p.stdout
     assert len(bundles(world.run_dir)) == 1
+
+
+# --- a failed poll is not a dead session ------------------------------------------------
+
+def test_polls_failing_while_the_session_lives_does_not_abandon_it(world):
+    """What happened on 2026-11-07.
+
+    POSEIDON lost its network. The colab CLI could not refresh its token and fell back to
+    an interactive `Enter the authorization code:` prompt nobody could answer, so every
+    poll failed. After ten the wrapper announced "the session is gone", merged, wrote
+    `.merged` and exited -- while that VM was still docking at 52 %, and the closed bundle
+    then blocked the re-attach that would have recovered it.
+
+    A failed poll says the CLIENT could not ask. Ask Colab before concluding.
+    """
+    # it must NOT end: a live session with a broken link is a reason to keep polling, so
+    # the run is bounded here rather than by the wrapper
+    with pytest.raises(subprocess.TimeoutExpired) as exc:
+        world.run(_timeout=25, FAKE_COLAB_POLL_DOWN="1", COLAB_MAX_POLL_FAILS="2",
+                  COLAB_POLL_SECONDS="0")
+    both = (exc.value.stdout or b"").decode() + (exc.value.stderr or b"").decode()
+    assert "the session is still there" in both, both
+    assert "is not there" not in both, both
+    assert "giving up" not in both, both
+    assert not (bundles(world.run_dir)[0] / ".merged").exists(), \
+        "it must not close the bundle while the session is alive"
+
+
+def test_when_colab_itself_is_unreachable_the_bundle_is_left_reattachable(world):
+    """If `colab sessions` fails too, the session's fate is UNKNOWN. Merge what is home --
+    always safe -- but do not close the bundle, because closing it is what made net3
+    unrecoverable without moving the marker aside by hand."""
+    p = world.run(_timeout=120, FAKE_COLAB_LINK_DOWN="1", COLAB_MAX_POLL_FAILS="2",
+                  COLAB_POLL_SECONDS="0")
+    both = p.stdout + p.stderr
+    assert "cannot reach Colab at all" in both, both
+    assert "left OPEN because Colab was unreachable" in both, both
+    assert "colab stop -s" in both, both       # the user is told it may still be billing
+    b = bundles(world.run_dir)[0]
+    assert not (b / ".merged").exists(), "the bundle must stay re-attachable"
+
+
+def test_a_session_colab_confirms_is_gone_is_closed_normally(world):
+    """The third case: Colab answers and the session really is absent. That is a genuine
+    loss, the bundle is closed, and the message says Colab confirmed it."""
+    with pytest.raises(subprocess.TimeoutExpired):
+        world.run(FAKE_COLAB_HANG_AFTER=2, _timeout=6)
+    (world.vm / ".sessions" / "dock").unlink()          # really gone
+    p = world.run()
+    assert p.returncode == 0, p.stdout + p.stderr
+    assert "cannot reach Colab at all" not in p.stdout
+    assert (bundles(world.run_dir)[0] / ".merged").exists()
