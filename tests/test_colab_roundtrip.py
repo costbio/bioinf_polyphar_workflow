@@ -76,6 +76,10 @@ def _recorded():
 if argv[0] == "dock-export":
     outstanding = [u for u in {UNITS!r} if f"{{u[0]}}/r{{u[1]}}" not in _recorded()]
     if not outstanding:
+        # the real dock-export still writes units.tsv, header only; the wrapper reads the
+        # row count to decide "nothing outstanding" and treats a MISSING file as a failure
+        bundle.mkdir(parents=True, exist_ok=True)
+        (bundle / "units.tsv").write_text("label\\treplicate\\tseed\\tkey\\n")
         print("dock-export: 0 units (no work)")
         sys.exit(0)
     (bundle / "results").mkdir(parents=True, exist_ok=True)
@@ -585,3 +589,44 @@ def test_a_session_colab_confirms_is_gone_is_closed_normally(world):
     assert p.returncode == 0, p.stdout + p.stderr
     assert "cannot reach Colab at all" not in p.stdout
     assert (bundles(world.run_dir)[0] / ".merged").exists()
+
+
+def test_an_empty_stranded_bundle_is_dropped_not_a_dead_end(world):
+    """An export whose session never started leaves a bundle with nothing in it.
+
+    On 2026-11-09 Colab answered `Service Unavailable` to net1's L4 assignment request.
+    The export had already written a 199-unit bundle, so the run folder was left with an
+    unmerged bundle holding zero results -- and every subsequent `polyphar dock` died on
+    the unmerged-bundle guard, telling the user to delete it by hand. There is nothing in
+    it to lose and export re-plans from what is recorded, so it is dropped, exactly as the
+    "nothing outstanding" case already does.
+    """
+    world.run()                                     # a normal round trip, bundle merged
+    first = held(world.run_dir)
+    assert first
+
+    # a later export that never got a VM: a bundle with units.tsv and no results
+    stranded = world.run_dir / "07_docking" / "export" / "20990101T000000"
+    (stranded / "results").mkdir(parents=True)
+    (stranded / "units.tsv").write_text("label\treplicate\tseed\tkey\nZ\t0\t42\tkey-Z-0\n")
+    (stranded / "run_key.json").write_text('{"units": 1}')
+
+    p = world.run()
+    assert p.returncode == 0, p.stdout + p.stderr
+    assert "has no results (its session never started); dropping it" in p.stdout, p.stdout
+    assert not stranded.exists(), "the empty bundle must be gone"
+    assert held(world.run_dir) == first, "nothing recorded may be disturbed"
+
+
+def test_a_stranded_bundle_WITH_results_is_still_never_dropped(world):
+    """The drop is for empty bundles only: one holding real draws is merged, never
+    deleted, because those draws cost GPU time and cannot be re-created."""
+    with pytest.raises(subprocess.TimeoutExpired):
+        world.run(FAKE_COLAB_HANG_AFTER=2, _timeout=6)
+    pulled = held(world.run_dir)
+    assert pulled
+    (world.vm / ".sessions" / "dock").unlink()
+    p = world.run()
+    assert p.returncode == 0, p.stdout + p.stderr
+    assert "dropping it" not in p.stdout, p.stdout
+    assert set(pulled) <= set(held(world.run_dir))

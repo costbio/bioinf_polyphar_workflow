@@ -264,10 +264,15 @@ if [ "${#unmerged[@]}" = 1 ]; then
         say "session '$session' is gone, but $(local_count) pulled unit(s) are here: merging them"
         push "dock: merging what was pulled" "Session gone; merging $(local_count) unit(s) already home."
     else
-        die "bundle $brel is unmerged and Colab session '$session' does not hold it
-     (session gone, or a different bundle${remote:+: $remote}). If you used another
-     session name, re-run with --session NAME. If the VM is really gone its work is lost:
-     delete the bundle and re-run; export re-plans only what is still outstanding."
+        # An EMPTY unmerged bundle holds nothing to lose. It is what an export followed by
+        # a failed session leaves behind: on 2026-11-09 Colab answered `Service
+        # Unavailable` to the L4 assignment, so net1 got a 199-unit bundle and no VM, and
+        # every later run then died on a guard demanding the bundle be deleted by
+        # hand. Export re-plans from what is recorded, so dropping it costs nothing --
+        # the same reasoning as the "nothing outstanding" case, which already does this.
+        # (A bundle either holds results -- merged above -- or holds none: no third case.)
+        say "bundle $brel has no results (its session never started); dropping it"
+        rm -rf "$b"
     fi
 fi
 
