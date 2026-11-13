@@ -183,7 +183,7 @@ PREREGISTERED_LIBRARY = "e-Drug3D_2083 (1,960 records surviving the dockability 
 # are updated together (tests/test_stage_stats.py::
 # test_the_preregistration_is_the_one_this_code_was_written_against).
 PREREGISTRATION = "data/preregistration.md"
-PREREGISTRATION_SHA256 = "cd7cef81ea4157df96a6e59b6934c6cc3ce9c8bd9bf2353aff7b31c99fbc980f"
+PREREGISTRATION_SHA256 = "7e9c40bc1ff34ca33732a458b9b36047c50ae0179a6fe48989075a9404fcb082"
 # A ligand must be scored on at least this share of the panel's proteins AND of the panel's
 # targets to carry an M. 0.98, not 0.9: under informative missingness -- a ligand failing
 # where it fits worst, which is the realistic direction -- M is biased by up to

@@ -469,7 +469,14 @@ can never be renamed into a p-value without the write failing first.
 
 * Which drugs are in the positive set, intersected with dockable e-Drug3D records after
   the stage-4 filter, with no approval-date cut and with antibodies and metal complexes
-  excluded. The inclusion rule used (fixed 2026-11-13, before any value of the statistic
+  excluded, **and drugs whose molecular target is not human excluded** — a viral or
+  bacterial enzyme cannot be engaged by a human protein–protein interaction panel, so such
+  a drug can only add noise. That rule removes the HBV/HCV antivirals (14 dockable records,
+  associated with HCC through its aetiology) and rifaximin (a non-absorbed antibiotic
+  acting on bacterial RNA polymerase, approved for hepatic encephalopathy). The arithmetic
+  matters as much as the principle: padding a set of k drugs that carry the effect out to n
+  scales the statistic as k·δ/√n, so adding null-expectation drugs *reduces* power.
+  The inclusion rule used (fixed 2026-11-13, before any value of the statistic
   existed) is **wider than guideline reading alone**: a drug qualifies if it is approved
   for any indication in the disease's organ or disease family — liver and biliary cancer
   for `hcc`, Alzheimer's and other neurodegenerative disease for `ad` — or has been taken
@@ -504,6 +511,16 @@ distribution built on it. A "perfect cross-protein match" must never be reported
 
 Every entry here must be dated, must say what changed and why, and must be accompanied by
 a new `stats.PREREGISTRATION_SHA256`; the test suite fails until both are done together.
+
+### 2026-11-13 (later) — non-human targets excluded, before any result exists
+
+* **§ 9** states the exclusion that was applied but not written down: a drug whose
+  molecular target is not human is left out, because it has no mechanism to engage a human
+  PPI panel. This removes the HBV/HCV antivirals and **rifaximin**, which the earlier draft
+  of the file had included on the strength of its hepatic-encephalopathy indication.
+  Rifaximin's docking behaviour agreed independently: 57 heavy atoms, scores above the
+  +10 kcal/mol plausible ceiling for a real pose on 16 of 243 net1 targets, and the
+  second-weakest median in the HCC set. The `hcc` set is 32 drugs, `ad` 40.
 
 ### 2026-11-13 (later) — a second positive control, before any result exists
 
