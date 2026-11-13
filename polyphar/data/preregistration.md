@@ -397,6 +397,50 @@ calibrates the `score_threshold x min_targets` surface of § 8.
 
 It is a sanity check, not an optimisation target.
 
+## 6b. Second positive control: known-target recovery
+
+The control in § 6 asks whether the pipeline can reproduce a pose it already knows. This
+one asks the question the statistic actually rests on: **can the screen rank a drug highly
+at a protein it is known to bind, among 1,954 competitors?** A pipeline that cannot do that
+cannot support an inference drawn from within-target percentiles, however good its
+redocking RMSD.
+
+**Panel.** The **212** UniProt accessions that are annotated mechanism-of-action targets of
+the drugs in `inputs/positive_sets.csv` (Open Targets, curated mechanism rows; 317
+drug-target pairs over 63 of the 73 drugs; 172 accessions have experimental PDB entries and
+40 are AlphaFold-only). Ten drugs contribute no target because they have no protein
+mechanism record -- mostly cytotoxics and chelators -- and are simply absent from this
+control.
+
+**Binding site.** The **known site only**: for each target, the pocket holding the
+co-crystallised drug-like ligand, by the same labelling rule § 6 uses. A target with no
+such pocket contributes no expectation and is reported, not silently dropped.
+
+**Readout.** For each (drug, its own target) pair, the drug's within-target percentile
+among the prepared library, computed exactly as § 2 computes it. Reported as the
+distribution over pairs, with the fraction in the top decile and the median percentile.
+Three replicates, best of draws, as everywhere else.
+
+**This control is DESCRIPTIVE and gates nothing.** Unlike § 6 it has no pass threshold,
+because no threshold can be set honestly before seeing how a GPU docking screen ranks known
+pharmacology, and a threshold invented afterwards would be worthless. It is reported beside
+the primary result so a reader can judge the screen's sensitivity, and a poor result is
+stated rather than explained away.
+
+**Why it is not circular.** These 212 targets are **not** the panels. Measured: of the 463
+proteins across all seven subtype panels, **6** are annotated targets of a positive-set
+drug -- TOP2A (net1/net2/net3), RRM2 and EPHA5 (net1), EPHB2 (net3), RET and EPHA8
+(Cluster1). 1.3 %. The primary test therefore measures off-target binding almost entirely,
+which is the premise of the study.
+
+**Those 6 get a pre-registered sensitivity analysis.** The primary arms are repeated with
+those proteins removed from the panel. Two are pointed: TOP2A is the actual target of
+doxorubicin and idarubicin (and of mitoxantrone in the `ad` set) and sits in all three HCC
+panels, inside the `cytotoxic` subgroup arm; RET is a target of sorafenib, regorafenib,
+sunitinib and vandetanib -- all `hcc` drugs -- and sits in Cluster1, which is a control
+panel for the contrast arm. Both the full and the reduced result are reported, and the full
+one remains primary.
+
 ## 7. Replicate spread (no analytic standard error)
 
 `M` is recomputed **separately per replicate** (r0, r1, r2) from each replicate's own raw
@@ -423,9 +467,19 @@ can never be renamed into a p-value without the write failing first.
 
 ## 9. What is deliberately NOT pre-registered
 
-* Which drugs are in the positive set. That is clinical-guideline reading (EASL / NCCN /
-  ESMO), intersected with dockable e-Drug3D records after the stage-4 filter, with no
-  approval-date cut and with antibodies and metal complexes excluded. It is supplied to
+* Which drugs are in the positive set, intersected with dockable e-Drug3D records after
+  the stage-4 filter, with no approval-date cut and with antibodies and metal complexes
+  excluded. The inclusion rule used (fixed 2026-11-13, before any value of the statistic
+  existed) is **wider than guideline reading alone**: a drug qualifies if it is approved
+  for any indication in the disease's organ or disease family — liver and biliary cancer
+  for `hcc`, Alzheimer's and other neurodegenerative disease for `ad` — or has been taken
+  to a late-phase trial in that disease. Guideline agents are a subset. The reason is
+  arithmetic, not ambition: restricted to guideline-approved *and* dockable agents the
+  sets are n=7 and n=4, which cannot populate the 15 size strata, and the AD arm could not
+  reach significance under any true effect. e-Drug3D's metabolite records (the `M ` name
+  prefix, 134 of the kept library) are refused: they are not drugs and would double-count
+  their parent. Where a drug appears twice in e-Drug3D as identical records, the lower ID
+  is taken. It is supplied to
   the stage as `inputs/positive_sets.csv`, and both counts are recorded: the guideline set
   size and how many survived the dockability intersection. **Every guideline drug dropped
   is named** in `failed.tsv` and in `summary.md` — whether it was dropped for
@@ -450,6 +504,40 @@ distribution built on it. A "perfect cross-protein match" must never be reported
 
 Every entry here must be dated, must say what changed and why, and must be accompanied by
 a new `stats.PREREGISTRATION_SHA256`; the test suite fails until both are done together.
+
+### 2026-11-13 (later) — a second positive control, before any result exists
+
+No `08_stats` or `08_control` exists in any run folder; the validation panel's own docking
+has not started. Nothing here was chosen after seeing a number.
+
+* **§ 6b** adds a descriptive known-target-recovery control on the 212 annotated targets of
+  the positive-set drugs, at the known binding site only, gating nothing.
+* **§ 6b** adds a pre-registered sensitivity analysis dropping the 6 panel proteins that
+  are themselves annotated targets of positive-set drugs. Those 6 were found by measurement
+  rather than assumed absent, and the measurement is what justifies calling the primary
+  test off-target.
+
+### 2026-11-13 — the positive set's inclusion rule, before any result exists
+
+No `08_stats` or `08_control` directory exists in any run folder, so no value of the
+statistic existed when this was written.
+
+§ 9 already placed the positive set's *membership* outside the pre-registration, but
+described its basis as clinical-guideline reading. The rule actually used is wider, and
+§ 9 now states it rather than leaving the document and the file disagreeing: approval for
+any indication in the disease's organ or disease family, or a late-phase trial in that
+disease.
+
+The reason is that the narrow rule is not analysable. Guideline-approved *and* dockable
+gives n=7 for HCC and n=4 for AD, because every antibody — which is most of modern
+first-line HCC therapy and both anti-amyloid agents — is absent from e-Drug3D and would
+fail the MW filter regardless. Four positives cannot populate 15 size strata.
+
+The set as supplied: **22 HCC** (16 targeted, 6 cytotoxic) and **28 AD**, each spanning 8
+of the 15 strata, every stratum holding 32–337 available controls and none holding
+positives alone. The two sets sit in opposite halves of the size space — HCC 18/22 at
+>= 27 heavy atoms, AD 20/28 at <= 22 — which is what the size-matched comparison exists
+to handle.
 
 ### 2026-11-06 — the estimator, before any result exists
 
