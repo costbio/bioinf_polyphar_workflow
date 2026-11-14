@@ -210,3 +210,44 @@ def test_defaults_come_from_the_module_not_from_test_literals():
     o = panel.Options()
     assert (o.volume_min, o.volume_max, o.plddt_min, o.per_protein) == (
         panel.VOLUME_MIN, panel.VOLUME_MAX, panel.PLDDT_MIN, panel.PER_PROTEIN)
+
+
+# --- the workable grid ceiling ----------------------------------------------------------
+
+def test_the_grid_guard_stops_below_what_unidock_formally_accepts():
+    """Uni-Dock accepts a box just under its own 531,441-point limit and then crawls.
+
+    On net3 a unit at ~530k points took 2 h 17 min against the ~10 min a normal one takes,
+    so one such unit consumed an entire Colab session and the rest of the bundle was never
+    drawn -- `incomplete_targets` could not reach zero and "re-run until nothing is
+    outstanding" never terminated. Measured over 212 net3 targets: of the 197 that
+    completed, the largest grid was 508,518 points; of the 15 that never finished, 7 were
+    above it.
+    """
+    from polyphar import panel
+
+    assert panel.WORKABLE_POINTS < panel.MAX_POINTS, "the point is that it stops EARLIER"
+    assert panel.WORKABLE_POINTS == 508518
+
+    # a box in the band between the two: legal to the engine, refused by us
+    spacing = panel.SPACING
+    side = 508518 ** (1 / 3)
+    big = tuple(((side + 2) - 1) * spacing for _ in range(3))     # ~520k points
+    n = [int(b / spacing) + 1 for b in big]
+    assert panel.MAX_POINTS >= n[0] * n[1] * n[2] > panel.WORKABLE_POINTS, n
+    assert not panel.grid_legal(big), "a box in the unusable band must be refused"
+    # ...and the engine's own question can still be asked explicitly
+    assert panel.grid_legal(big, limit=panel.MAX_POINTS)
+
+    # an ordinary drug-site box is unaffected
+    assert panel.grid_legal((20.0, 20.0, 20.0))
+
+
+def test_the_grid_rejection_says_what_it_means():
+    """It is no longer "exceeds Uni-Dock's grid limits": the box is inside those limits
+    and still undockable, and a reader chasing the reason must not be sent to the wrong
+    constant."""
+    from polyphar import panel
+
+    assert "Uni-Dock" not in panel.STEP_REASON["grid"]
+    assert "workable" in panel.STEP_REASON["grid"]

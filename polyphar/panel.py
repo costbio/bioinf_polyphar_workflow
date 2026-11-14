@@ -65,7 +65,23 @@ PLDDT_MIN = 70.0
 TM_OVERLAP_MAX = 0.10
 SPACING = 0.375
 MAX_AXIS = 128
-MAX_POINTS = 531441
+MAX_POINTS = 531441       # what Uni-Dock formally refuses: 81^3
+# What it can actually WORK. Uni-Dock accepts a box just under its own limit and then
+# crawls: on net3 a unit at ~530k points took 2 h 17 min against the ~10 min a normal one
+# takes, so a single such unit consumed a whole Colab session and the rest of the bundle
+# was never drawn. `incomplete_targets` could therefore never reach zero and "re-run until
+# nothing is outstanding" never terminated. Measured over 212 net3 targets: of the 197 that
+# COMPLETED, the largest grid was 508,518 points; of the 15 that never finished, 7 were
+# above it. The separation is clean, and the 4 % margin below MAX_POINTS is where it sits.
+#
+# The performance is the symptom. These boxes are 26-40 A per axis, against 10-15 A for a
+# drug site: the pockets have twice the lining residues of a normal one (46 vs 25) in as
+# many as 8 disconnected sequence segments, so they are surface grooves, not cavities. The
+# volume filter does not catch them because DoGSite's volume is the CAVITY (1,028 A^3
+# median, inside the 300-1500 range) while the docking box is the bounding box of the
+# lining residues -- a different quantity, and until now an unconstrained one. A
+# within-pocket percentile over a 30 A cube does not mean what the statistic assumes.
+WORKABLE_POINTS = 508518
 TM_POLICIES = ("A", "B", "C")
 PER_PROTEIN = 2   # pockets docked per protein, best drugScore first
 
@@ -78,7 +94,7 @@ STEP_REASON = {
     "subpocket_parent": "subpocket of a parent above the volume ceiling",
     "plddt": "AlphaFold pocket pLDDT below the floor",
     "tm": "rejected by the transmembrane policy",
-    "grid": "docking box exceeds Uni-Dock's grid limits",
+    "grid": "docking box too large to dock (over the workable grid ceiling)",
 }
 
 
@@ -118,9 +134,14 @@ def _f(value, default=None):
         return default
 
 
-def grid_legal(size, spacing: float = SPACING) -> bool:
+def grid_legal(size, spacing: float = SPACING, limit: int = WORKABLE_POINTS) -> bool:
+    """Whether a box of this size can be docked in practice, not merely accepted.
+
+    `limit` defaults to WORKABLE_POINTS, not MAX_POINTS: a box between the two is legal to
+    Uni-Dock and unusable to us. Pass MAX_POINTS to ask the engine's own question.
+    """
     n = [math.floor(s / spacing) + 1 for s in size]
-    return max(n) <= MAX_AXIS and n[0] * n[1] * n[2] <= MAX_POINTS
+    return max(n) <= MAX_AXIS and n[0] * n[1] * n[2] <= limit
 
 
 def tm_reject(is_af, tm_segments, residues, opts) -> bool:
