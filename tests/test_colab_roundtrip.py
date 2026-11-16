@@ -13,6 +13,7 @@ runs inside the fake, so the selection logic under test is the shipped one.
 
 import json
 import os
+import shlex
 import shutil
 import subprocess
 from pathlib import Path
@@ -630,3 +631,53 @@ def test_a_stranded_bundle_WITH_results_is_still_never_dropped(world):
     assert p.returncode == 0, p.stdout + p.stderr
     assert "dropping it" not in p.stdout, p.stdout
     assert set(pulled) <= set(held(world.run_dir))
+
+
+def _stream(tmp_path, budget, script):
+    """Run the wrapper's own stream() against `script`, nothing else of the wrapper.
+
+    stream() is the one piece every remote step goes through, and its failure modes are
+    about time rather than data, so it is cheaper to exercise directly than through a
+    whole round trip."""
+    harness = tmp_path / "stream.sh"
+    harness.write_text(
+        "set -euo pipefail\n"
+        f'eval "$(sed -n \'/^DEAD_LINK=/,/^dead_link/p\' {WRAPPER})"\n'
+        f'eval "$(sed -n \'/^stream() {{/,/^}}$/p\' {WRAPPER})"\n'
+        f"stream {budget} bash -c {shlex.quote(script)}\n"
+        'printf "rc=%s\\n---\\n%s" "$captured_rc" "$captured"\n'
+    )
+    p = subprocess.run(["bash", str(harness)], capture_output=True, text=True, timeout=120)
+    assert p.returncode == 0, p.stdout + p.stderr
+    rc, _, captured = p.stdout.partition("\n---\n")
+    return int(rc.rsplit("rc=", 1)[1]), captured
+
+
+def test_a_dead_link_ends_the_wait_instead_of_burning_the_budget(tmp_path):
+    """colab_cli prints "RuntimeError: Connection was lost" and then waits on a socket
+    that will never answer, so the failure is on screen within seconds but the client
+    never exits. Before this, the whole budget was spent on it -- twice, once per setup
+    attempt: on 2026-11-16 net3 held an L4 for an hour over a failure visible at second
+    five. 125 marks the early stop; 124 still means the budget genuinely ran out."""
+    import time
+    t0 = time.monotonic()
+    rc, captured = _stream(tmp_path, 600, 'echo "RuntimeError: Connection was lost"; sleep 600')
+    assert time.monotonic() - t0 < 30, "waited on a client that had already given up"
+    assert rc == 125, rc
+    assert "Connection was lost" in captured, "the client's own words must survive"
+
+
+def test_a_budget_that_really_runs_out_still_reports_124(tmp_path):
+    """gave_up() reads 124 to say "we stopped waiting"; the early stop must not take it
+    over, or a slow VM and a dead one would read the same in the log."""
+    rc, _ = _stream(tmp_path, 2, 'echo working; sleep 30')
+    assert rc == 124, rc
+
+
+def test_a_slow_step_that_keeps_talking_is_left_alone(tmp_path):
+    """The budget exists for a slow micromamba. Only the dead-link line cuts it short --
+    output alone, however long it goes on, never does."""
+    rc, captured = _stream(
+        tmp_path, 60, 'for i in 1 2 3; do echo "installing step $i"; sleep 1; done; echo "setup: ready"')
+    assert rc == 0, rc
+    assert "setup: ready" in captured, captured

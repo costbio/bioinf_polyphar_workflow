@@ -98,23 +98,65 @@ note() { printf '%s  %s\n' "$(date +%H:%M:%S)" "$*"; }
 # way to know which it was. Same defect as the swallowed poll failure below -- silence
 # meaning two things. tee: the terminal sees it live, `captured` still proves it worked.
 captured=""; captured_rc=0
+
+# A dropped websocket is terminal for the client, but it is not loud and it is not quick:
+# colab_cli prints "RuntimeError: Connection was lost", then waits on a socket that will
+# never answer again. The budget exists to pay for a slow micromamba, not for that, so the
+# wait ends as soon as the client has said the link is gone. Until this was added, a wedged
+# VM cost the WHOLE budget twice -- once per setup attempt -- and on 2026-11-16 net3 held an
+# L4 for an hour over a failure that was on screen at second five.
+# Matched against the client's own words; a cell that merely prints this text cannot reach
+# here, because the cell's output arrives through the client that would have to be alive.
+DEAD_LINK='RuntimeError: Connection was lost'
+dead_link() { grep -qF "$DEAD_LINK" "$1" 2>/dev/null; }
+
 stream() {                       # stream <client seconds> <command...>
-    local secs="$1" tmp; shift
+    local secs="$1" tmp job tailer st; shift
     tmp="$(mktemp "${TMPDIR:-/tmp}/polyphar-colab.XXXXXX")"
     captured_rc=0
-    # `|| captured_rc=$?`: under `set -e` + `pipefail` a timeout here would end the script
-    # on the spot, and the caller's diagnostic -- the whole reason the step is checked --
-    # would never print. A 3 s budget exited silently until this was added.
-    timeout --foreground "$secs" "$@" 2>&1 | tr -d '\000' | tee "$tmp" \
-        | sed 's/^/           /' || captured_rc=$?
-    captured="$(cat "$tmp")"
+    : >"$tmp"
+    # The client writes STRAIGHT to the file, with no tee in between. tee block-buffers
+    # when its output is not a terminal, so the one line this function has to react to
+    # would sit in tee's buffer until 4 KiB had piled up behind it -- which is why the
+    # old shape could only read the file once the whole pipeline had ended.
+    timeout --foreground "$secs" "$@" >"$tmp" 2>&1 &
+    job=$!
+    # `--pid` is what makes this honest: tail exits once the client is gone, but only
+    # AFTER reading what is left, so the terminal still sees the last thing the VM said.
+    # setup.py prints each install command before running it, and that output is what
+    # tells a slow micromamba from a reclaimed VM.
+    tail -n +1 -f -s 0.2 --pid="$job" "$tmp" 2>/dev/null | sed 's/^/           /' &
+    tailer=$!
+    while kill -0 "$job" 2>/dev/null; do
+        if dead_link "$tmp"; then
+            kill "$job" 2>/dev/null
+            captured_rc=125          # not 124: we stopped early, the budget did not run out
+            break
+        fi
+        sleep 2
+    done
+    # `$?` inside an `||` block is the BLOCK's status, not wait's, so it has to be taken
+    # first. A real timeout must keep reporting 124 -- gave_up() reads it.
+    st=0
+    wait "$job" 2>/dev/null || st=$?
+    [ "$captured_rc" = 0 ] && captured_rc=$st || :
+    wait "$tailer" 2>/dev/null || :   # --pid: it ends on its own, having flushed
+    captured="$(tr -d '\000' <"$tmp")"
     rm -f "$tmp"
     return 0
 }
 
-# `timeout` reports 124 when it had to kill the client. Saying so turns "it did not work"
-# into "we stopped waiting", which is a different thing to go and look at.
-gave_up() { [ "$captured_rc" = 124 ] && printf ' after %ss (COLAB_%s_TIMEOUT)' "$1" "$2"; return 0; }
+# `timeout` reports 124 when it had to kill the client, and stream() reports 125 when it
+# cut the wait short because the client said the link was gone. Saying which turns "it did
+# not work" into either "we stopped waiting" or "the VM stopped answering" -- different
+# things to go and look at, and only one of them is worth a longer budget.
+gave_up() {
+    case "$captured_rc" in
+        124) printf ' after %ss (COLAB_%s_TIMEOUT)' "$1" "$2" ;;
+        125) printf ' -- the VM stopped answering, so the rest of the %ss budget was not waited out' "$1" ;;
+    esac
+    return 0
+}
 
 # the remote cell gets a little less than the client, so a cell that overruns reports
 # itself rather than being cut off at the socket with nothing to show for it
