@@ -49,6 +49,16 @@ def _repo_files_ok() -> bool:
     return (root / "docs").is_dir() and (root / "bin").is_dir()
 
 
+def _colab_ok() -> bool:
+    """colab-cli writes token.json once the account has authorized it. Without it the
+    CLI does not fail -- it PROMPTS ("Enter the authorization code:") and aborts, which
+    surfaces as an ordinary non-zero exit from the dock stage. A test that cannot tell
+    that apart from a real regression is worse than no test, so an unauthorized host
+    skips, the way a host without openbabel does."""
+    cfg = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+    return (cfg / "colab-cli" / "token.json").is_file()
+
+
 def _docker_ok() -> bool:
     if shutil.which("docker") is None:
         return False
@@ -65,6 +75,7 @@ _REQUIREMENTS = {
     "pocketmatch": (lambda: bool(os.environ.get("PM_BIN_DIR")), "env PM_BIN_DIR not set"),
     "docking": (lambda: shutil.which("smina") is not None, "smina not on PATH"),
     "docker": (_docker_ok, "docker CLI not available"),
+    "colab": (_colab_ok, "colab-cli is not authorized on this host (no token.json)"),
     "rdkit": (_rdkit_ok, "rdkit not importable"),
     "openbabel": (_openbabel_ok, "openbabel not importable"),
     "repo_files": (_repo_files_ok, "docs/ and bin/ are not in the image, only a checkout"),

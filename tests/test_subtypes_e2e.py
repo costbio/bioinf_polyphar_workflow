@@ -112,6 +112,7 @@ def _image_or_skip():
 @pytest.mark.network
 @pytest.mark.dogsite
 @pytest.mark.docker
+@pytest.mark.colab
 @pytest.mark.parametrize("subtype", sorted(SUBTYPES))
 def test_a_subtype_runs_end_to_end(subtype, tmp_path, home):
     _image_or_skip()
